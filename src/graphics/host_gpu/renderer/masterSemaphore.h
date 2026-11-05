@@ -30,6 +30,9 @@ public:
 
 	void Refresh();
 	void Wait(uint64_t tick);
+	// A failed vkQueueSubmit: the same device-loss report (checkpoints, fault address) as a failed
+	// wait, so a loss first seen by the submit is named too.
+	void ReportFault(vk::Result result);
 
 private:
 	GraphicContext&       m_graphics;

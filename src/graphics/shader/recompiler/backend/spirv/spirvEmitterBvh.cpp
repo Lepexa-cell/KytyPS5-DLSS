@@ -1,4 +1,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#include "common/switches.h"
+
+#include <cstdlib>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -19,8 +23,8 @@ uint32_t Vector(EmitterState& s, uint32_t type, std::span<const uint32_t> compon
 
 uint32_t NodeWord(EmitterState& s, uint32_t block, uint32_t word) {
 	const auto offset = Binary(s, spv::OpShiftLeftLogical, TypeU32(s), word, ConstantU32(s, 2));
-	const auto address =
-	    Binary(s, spv::OpIAdd, TypeU64(s), block, Unary(s, spv::OpUConvert, TypeU64(s), offset));
+	const auto address = Binary(s, spv::OpIAdd, TypeScalarU64(s), block,
+	                            Unary(s, spv::OpUConvert, TypeScalarU64(s), offset));
 	const auto pointer = Unary(s, spv::OpConvertUToPtr, TypePhysicalU32Pointer(s), address);
 	const auto result = s.builder.AllocateId();
 	s.builder.AddFunction(spv::OpLoad, TypeU32(s), result, pointer, spv::MemoryAccessAlignedMask, 4u);
@@ -236,8 +240,8 @@ uint32_t Boxes(EmitterState& s, uint32_t first, uint32_t second, uint32_t half,
 } // namespace
 
 void DefineBvhIntersect(EmitterState& s) {
-	if (!s.program.info.bvh) return;
-	const auto u = TypeU32(s), f = TypeF32(s), b = TypeBool(s), wide = TypeU64(s);
+	if (!s.requirements.bvh) return;
+	const auto u = TypeU32(s), f = TypeF32(s), b = TypeBool(s), wide = TypeScalarU64(s);
 	const auto vec4 = TypeU32Vector(s, 4), vec3 = TypeF32Vector(s, 3);
 	const auto signature = s.builder.Type(spv::OpTypeFunction, vec4, vec4, wide, f, vec3, vec3, vec3);
 	s.bvh_intersect_function = s.builder.AllocateId();
@@ -273,24 +277,24 @@ void DefineBvhIntersect(EmitterState& s) {
 	const auto bary = Binary(s, spv::OpINotEqual, b, and_bits(words[3], 0x01000000), ConstantU32(s, 0));
 	const auto sort = Binary(s, spv::OpINotEqual, b, and_bits(words[1], 0x80000000), ConstantU32(s, 0));
 	const auto grow = and_bits(shr(words[1], 23), 0xff);
-	const auto base  = Binary(s, spv::OpShiftLeftLogical, wide,
-	                          PackU64(s, words[0], and_bits(words[1], 0xff)), ConstantU32(s, 8));
-	const auto index = Binary(s, spv::OpShiftRightLogical, wide, node, ConstantU32(s, 3));
+	const auto base = Binary(s, spv::OpShiftLeftLogical, wide,
+	    DeviceAddressFromWords(s, words[0], and_bits(words[1], 0xff)), ConstantDeviceAddress(s, 8));
+	const auto index = Binary(s, spv::OpShiftRightLogical, wide, node, ConstantDeviceAddress(s, 3));
 	const auto last_index = Binary(s, spv::OpIAdd, wide, index,
-	                               Select(s, wide, full, ConstantU64(s, 1), ConstantU64(s, 0)));
+	    Select(s, wide, full, ConstantDeviceAddress(s, 1), ConstantDeviceAddress(s, 0)));
 	const auto address = Binary(s, spv::OpIAdd, wide, base,
-	                            Binary(s, spv::OpShiftLeftLogical, wide, index, ConstantU32(s, 6)));
-	const auto last_address =
-	    Binary(s, spv::OpIAdd, wide, base,
-	           Binary(s, spv::OpShiftLeftLogical, wide, last_index, ConstantU32(s, 6)));
+	    Binary(s, spv::OpShiftLeftLogical, wide, index, ConstantDeviceAddress(s, 6)));
+	const auto last_address = Binary(s, spv::OpIAdd, wide, base,
+	    Binary(s, spv::OpShiftLeftLogical, wide, last_index, ConstantDeviceAddress(s, 6)));
 	auto valid = Binary(s, spv::OpIEqual, b, shr(words[3], 28), ConstantU32(s, 8));
+	std::vector<uint32_t> checks {valid};
 	const auto require = [&](uint32_t condition) {
+		checks.push_back(condition);
 		valid = Binary(s, spv::OpLogicalAnd, b, valid, condition);
 	};
 	require(Binary(s, spv::OpULessThanEqual, b, kind, ConstantU32(s, 5)));
-	require(Binary(s, spv::OpULessThanEqual, b, last_index,
-	               PackU64(s, words[2], and_bits(words[3], 0x3ff))));
-	require(Binary(s, spv::OpULessThan, b, last_address, ConstantU64(s, uint64_t {1} << 48)));
+	require(Binary(s, spv::OpULessThanEqual, b, last_index, DeviceAddressFromWords(s, words[2], and_bits(words[3], 0x3ff))));
+	require(Binary(s, spv::OpULessThan, b, last_address, ConstantDeviceAddress(s, uint64_t{1} << 48)));
 	require(Unary(s, spv::OpLogicalNot, b, Unary(s, spv::OpIsNan, b, extent)));
 	for (uint32_t i = 0; i < 3; ++i) {
 		for (const auto value: {origin[i], direction[i], inverse[i]})
@@ -307,13 +311,13 @@ void DefineBvhIntersect(EmitterState& s) {
 	const auto invalid = Vector(s, vec4, invalid_words);
 	const auto result = EmitValueOrDefaultIfCondition(s, valid, vec4, invalid, [&] {
 		const auto first = GetBdaPointer(s, address);
-		const auto second  = EmitValueOrDefaultIfCondition(s, full, wide, ConstantU64(s, 0), [&] {
-			return GetBdaPointer(s, Binary(s, spv::OpIAdd, wide, address, ConstantU64(s, 64)));
+		const auto second = EmitValueOrDefaultIfCondition(s, full, wide, ConstantDeviceAddress(s, 0), [&] {
+			return GetBdaPointer(s, Binary(s, spv::OpIAdd, wide, address, ConstantDeviceAddress(s, 64)));
 		});
-		const auto present = Binary(
-		    s, spv::OpLogicalAnd, b, Binary(s, spv::OpINotEqual, b, first, ConstantU64(s, 0)),
+		const auto present = Binary(s, spv::OpLogicalAnd, b,
+		    Binary(s, spv::OpINotEqual, b, first, ConstantDeviceAddress(s, 0)),
 		    Binary(s, spv::OpLogicalOr, b, Unary(s, spv::OpLogicalNot, b, full),
-		           Binary(s, spv::OpINotEqual, b, second, ConstantU64(s, 0))));
+		        Binary(s, spv::OpINotEqual, b, second, ConstantDeviceAddress(s, 0))));
 		return EmitValueOrDefaultIfCondition(s, present, vec4, invalid, [&] {
 			const auto tri_label = s.builder.AllocateId(), box_label = s.builder.AllocateId();
 			const auto merge = s.builder.AllocateId();
@@ -333,6 +337,58 @@ void DefineBvhIntersect(EmitterState& s) {
 			return value;
 		});
 	});
+	// KYTY_DEBUG_BVH_REASON=1: the first result word is a bit per validity check (in order), bit
+	// 17 the node's page being present and bits 18-21 the four result words differing from -1.
+	static const int reason_mode = [] {
+		const char* text = KYTY_GETENV("KYTY_DEBUG_BVH_REASON");
+		return text != nullptr ? std::atoi(text) : 0;
+	}();
+	const bool reason = reason_mode == 1;
+	// 2: the ray origin and extent, 3: its direction and inverse x, 4: its inverse and node id.
+	if (reason_mode >= 2) {
+		const auto bits = [&](uint32_t value) { return Unary(s, spv::OpBitcast, u, value); };
+		// Word 0 stays -1 ("no child"), so the traversal ends there instead of following these.
+		const auto none = ConstantU32(s, ~0u);
+		if (reason_mode == 6) {
+			// What the GPU reads of the node: child word 0 (as a number) and box floats 4 and 5.
+			const auto pointer = GetBdaPointer(s, address);
+			const auto there = Binary(s, spv::OpINotEqual, b, pointer, ConstantDeviceAddress(s, 0));
+			const std::array absent {none, ConstantU32(s, 0xc2c80000u), ConstantU32(s, 0xc2c80000u),
+			                         ConstantU32(s, 0xc2c80000u)};
+			const auto read = EmitValueOrDefaultIfCondition(s, there, vec4, Vector(s, vec4, absent), [&] {
+				const std::array seen {none,
+				    bits(Unary(s, spv::OpConvertUToF, f, NodeWord(s, pointer, ConstantU32(s, 0)))),
+				    NodeWord(s, pointer, ConstantU32(s, 4)), NodeWord(s, pointer, ConstantU32(s, 5))};
+				return Vector(s, vec4, seen);
+			});
+			s.builder.AddFunction(spv::OpReturnValue, read);
+			s.builder.AddFunction(spv::OpFunctionEnd);
+			return;
+		}
+		const std::array<uint32_t, 4> words2 =
+		    reason_mode == 2 ? std::array {none, bits(origin[0]), bits(origin[1]), bits(origin[2])}
+		    : reason_mode == 3 ? std::array {none, bits(direction[0]), bits(direction[1]), bits(direction[2])}
+		    : reason_mode == 4 ? std::array {none, bits(inverse[0]), bits(inverse[1]), bits(inverse[2])}
+		                       : std::array {none, bits(extent), bits(Unary(s, spv::OpConvertUToF, f, node)), none};
+		s.builder.AddFunction(spv::OpReturnValue, Vector(s, vec4, words2));
+		s.builder.AddFunction(spv::OpFunctionEnd);
+		return;
+	}
+	if (reason) {
+		auto code = ConstantU32(s, 0);
+		const auto add = [&](uint32_t condition, uint32_t bit) {
+			code = Binary(s, spv::OpBitwiseOr, u, code,
+			              Select(s, u, condition, ConstantU32(s, 1u << bit), ConstantU32(s, 0)));
+		};
+		for (uint32_t i = 0; i < checks.size() && i < 17u; i++) add(checks[i], i);
+		add(Binary(s, spv::OpINotEqual, b, GetBdaPointer(s, address), ConstantDeviceAddress(s, 0)), 17);
+		for (uint32_t i = 0; i < 4; i++)
+			add(Binary(s, spv::OpINotEqual, b, Extract(s, u, result, i), ConstantU32(s, ~0u)), 18 + i);
+		const std::array debug_words {code, ConstantU32(s, ~0u), ConstantU32(s, ~0u), ConstantU32(s, ~0u)};
+		s.builder.AddFunction(spv::OpReturnValue, Vector(s, vec4, debug_words));
+		s.builder.AddFunction(spv::OpFunctionEnd);
+		return;
+	}
 	s.builder.AddFunction(spv::OpReturnValue, result);
 	s.builder.AddFunction(spv::OpFunctionEnd);
 }
@@ -351,8 +407,9 @@ uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return Vector(s, TypeF32Vector(s, 3), values);
 	};
 	const auto descriptor = ctx.Arg(inst, 0);
-	const auto node   = node_words == 2u ? PackU64(s, ctx.Arg(*ray, 0), ctx.Arg(*ray, 1))
-	                                     : Unary(s, spv::OpUConvert, TypeU64(s), ctx.Arg(*ray, 0));
+	const auto node = node_words == 2u
+	                      ? DeviceAddressFromWords(s, ctx.Arg(*ray, 0), ctx.Arg(*ray, 1))
+	                      : Unary(s, spv::OpUConvert, TypeScalarU64(s), ctx.Arg(*ray, 0));
 	const auto extent = Unary(s, spv::OpBitcast, TypeF32(s), ctx.Arg(*ray, node_words));
 	const auto origin = vector(node_words + 1u), direction = vector(node_words + 4u),
 	           inverse = vector(node_words + 7u);

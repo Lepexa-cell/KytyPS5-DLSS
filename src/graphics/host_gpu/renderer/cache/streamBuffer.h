@@ -2,7 +2,6 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_STREAMBUFFER_H_
 
 #include "common/abi.h"
-#include "common/assert.h"
 #include "common/common.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
@@ -39,7 +38,7 @@ inline constexpr vk::BufferUsageFlags AllFlags =
 class Buffer {
 public:
 	Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size);
+	       uint64_t cpu_address, vk::BufferUsageFlags flags, uint64_t size, bool host_cached = false);
 	~Buffer();
 	KYTY_CLASS_NO_COPY(Buffer);
 
@@ -47,31 +46,44 @@ public:
 	[[nodiscard]] uint64_t           Size() const noexcept { return m_size; }
 	[[nodiscard]] std::span<uint8_t> Mapped() const noexcept { return m_mapped; }
 	[[nodiscard]] bool               IsCoherent() const noexcept { return m_coherent; }
+	// The Vulkan memory property flags of the allocation.
+	[[nodiscard]] uint32_t           MemoryProperties() const noexcept;
 	[[nodiscard]] MemoryUsage        Usage() const noexcept { return m_usage; }
 	[[nodiscard]] uint64_t           CpuAddress() const noexcept { return m_cpu_address; }
-	[[nodiscard]] vk::DeviceAddress  BufferDeviceAddress() const noexcept {
-		EXIT_IF(m_device_address == 0);
-		return m_device_address;
-	}
+	[[nodiscard]] vk::DeviceAddress BufferDeviceAddress() const noexcept;
+	[[nodiscard]] bool HasDeviceAddress() const noexcept { return m_device_address != 0; }
 	[[nodiscard]] uint64_t           Offset(uint64_t address) const noexcept {
 		return address - m_cpu_address;
 	}
-	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept {
-		return address >= m_cpu_address && size <= Size() &&
-		       address - m_cpu_address <= Size() - size;
-	}
+	[[nodiscard]] bool IsInBounds(uint64_t address, uint64_t size) const noexcept;
 	void               IncreaseStreamScore(int score) noexcept { stream_score += score; }
 	[[nodiscard]] int  StreamScore() const noexcept { return stream_score; }
 	void               Flush(uint64_t offset, uint64_t size);
 	void               Invalidate(uint64_t offset, uint64_t size);
 	void CopyFrom(CommandBuffer& command, const Buffer& source, uint64_t source_offset,
-	              uint64_t destination_offset, uint64_t size);
+	              uint64_t destination_offset, uint64_t size,
+	              vk::AccessFlags source_before      = vk::AccessFlagBits::eMemoryWrite,
+	              vk::AccessFlags destination_before = vk::AccessFlagBits::eMemoryRead |
+	                                                   vk::AccessFlagBits::eMemoryWrite,
+	              vk::AccessFlags source_after       = LaterAccessOr(LaterSite::CopyFrom,
+	                                                                 vk::AccessFlagBits::eMemoryRead |
+	                                                                     vk::AccessFlagBits::eMemoryWrite),
+	              vk::AccessFlags destination_after  = LaterAccessOr(LaterSite::CopyFrom,
+	                                                                 vk::AccessFlagBits::eMemoryRead |
+	                                                                     vk::AccessFlagBits::eMemoryWrite));
 	void Fill(uint64_t offset, uint64_t size, uint32_t value);
 
 	// BufferCache state lives directly on the resource.
 	bool   is_deleted   = false;
 	int    stream_score = 0;
 	size_t lru_id       = 0;
+	// The GC tick the LRU entry last received (see Image::lru_tick).
+	mutable uint64_t lru_tick = 0;
+	// The GC tick of the last binding served from the stream ring (upload-age counter).
+	uint64_t stream_tick = 0;
+	// Recreated after a shader faulted on it through the BDA page table: never released for
+	// being unbound, since BDA reads do not refresh residency (KYTY_RELEASE_UNBOUND).
+	bool bda_pinned = false;
 
 protected:
 	[[nodiscard]] GraphicContext&   Graphics() const noexcept { return *m_graphics; }
@@ -97,7 +109,8 @@ private:
 class StreamBuffer final: public Buffer {
 public:
 	StreamBuffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsage usage,
-	             uint64_t size);
+	             uint64_t size, vk::BufferUsageFlags extra_flags = {},
+	             bool host_cached = false);
 
 	[[nodiscard]] std::pair<uint8_t*, uint64_t> Map(uint64_t size, uint64_t alignment = 0,
 	                                                bool allow_wait = true);

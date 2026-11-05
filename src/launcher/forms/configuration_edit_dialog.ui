@@ -151,6 +151,18 @@
               <property name="value"><number>60</number></property>
              </widget>
             </item>
+            <!--
+            <item row="3" column="0">
+             <widget class="QLabel" name="label_shader_optimization">
+              <property name="text"><string>Shader optimization:</string></property>
+             </widget>
+            </item>
+            <item row="3" column="1">
+             <widget class="QComboBox" name="comboBox_shader_optimization_type">
+              <property name="toolTip"><string>Optimize shaders for code size or performance</string></property>
+             </widget>
+            </item>
+            -->
             <item row="4" column="0">
              <widget class="QLabel" name="label_gpu">
               <property name="text"><string>GPU:</string></property>
@@ -244,8 +256,8 @@
            <layout class="QVBoxLayout" name="generalLayout">
             <item>
              <widget class="QCheckBox" name="checkBox_pro">
-              <property name="toolTip"><string>Enable PS5 Pro mode for supported games. PSSR uses linear scaling. Disabled by default.</string></property>
-              <property name="text"><string>PS5 Pro mode (experimental)</string></property>
+              <property name="toolTip"><string>Tell the game it runs on a PS5 Pro (KYTY_TRINITY_MODE).</string></property>
+              <property name="text"><string>Pro mode (experimental)</string></property>
              </widget>
             </item>
             <item>
@@ -390,6 +402,12 @@
           <item row="3" column="1">
            <widget class="QComboBox" name="comboBox_keyboard_player">
             <property name="toolTip"><string>Gamepads fill the remaining players in connection order. Every player uses the same input mapping.</string></property>
+           </widget>
+          </item>
+          <item row="4" column="1">
+           <widget class="QCheckBox" name="checkBox_dualsense_support">
+            <property name="toolTip"><string>Vibration, adaptive triggers and the controller speaker on the DualSense</string></property>
+            <property name="text"><string>DualSense support</string></property>
            </widget>
           </item>
          </layout>

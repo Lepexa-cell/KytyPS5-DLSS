@@ -57,6 +57,8 @@ constexpr char SETTINGS_MAIN_LAST_GEOMETRY[] = "geometry";
 constexpr char SETTINGS_CHECK_UPDATES[]      = "check_updates_on_startup";
 constexpr char SETTINGS_CLOSE_TERMINAL[]     = "close_terminal";
 constexpr char SETTINGS_THEME[]              = "theme";
+// This fork never checks for or installs upstream releases: an update would replace its emulator.
+constexpr bool UPDATES_ENABLED = false;
 
 class MainDialogPrivate: public QObject {
 	Q_OBJECT
@@ -128,8 +130,8 @@ void MainDialogPrivate::Setup(MainDialog* main_dialog) {
 	m_ui->close_terminal->setChecked(g_close_terminal);
 	m_ui->theme_combo->setCurrentIndex(g_theme);
 	ApplyTheme(g_theme);
-	m_ui->check_updates_link->setVisible(UpdateChecker::IsSupported());
-	m_ui->check_updates_on_startup->setVisible(UpdateChecker::IsSupported());
+	m_ui->check_updates_link->setVisible(UPDATES_ENABLED && UpdateChecker::IsSupported());
+	m_ui->check_updates_on_startup->setVisible(UPDATES_ENABLED && UpdateChecker::IsSupported());
 #if defined(__APPLE__)
 	m_ui->close_terminal->setVisible(false); // The emulator runs without a terminal.
 #endif
@@ -191,6 +193,18 @@ void MainDialogPrivate::FindInterpreter() {
 		search_dir.cdUp();
 		m_interpreter = search_dir.absoluteFilePath(EMULATOR_EXE);
 	}
+	// launcher_emulator.txt beside the launcher names another emulator executable there (first
+	// line), so several builds can share one install folder.
+	{
+		const QDir launcher_dir(QApplication::applicationDirPath());
+		QFile      choice(launcher_dir.absoluteFilePath(QStringLiteral("launcher_emulator.txt")));
+		if (choice.open(QIODevice::ReadOnly | QIODevice::Text)) {
+			const auto name = QString::fromUtf8(choice.readLine()).trimmed();
+			if (!name.isEmpty() && QFile::exists(launcher_dir.absoluteFilePath(name))) {
+				m_interpreter = launcher_dir.absoluteFilePath(name);
+			}
+		}
+	}
 
 	bool found = QFile::exists(m_interpreter);
 	m_ui->widget->SetRuntimeDirectory(QFileInfo(m_interpreter).absolutePath());
@@ -228,7 +242,7 @@ void MainDialogPrivate::FindInterpreter() {
 	m_ui->label_settings_file->setText(tr("Settings file: ") + m_ui->widget->GetSettingsFile());
 
 	Update();
-	if (m_ui->check_updates_on_startup->isChecked()) {
+	if (UPDATES_ENABLED && m_ui->check_updates_on_startup->isChecked()) {
 		m_update_checker->Check(false);
 	}
 }
@@ -237,6 +251,15 @@ static void AddFlag(QStringList& args, bool enabled, const char* name) {
 	if (enabled) {
 		args << name;
 	}
+}
+
+// This emulator reads some booleans as
+// "--name true|false" and know no --trinity, --guest-tsc, --stretch, --keyboard-player,
+// --trophy-duration, --occlusion-queries, --shader-cache, --emulate-psn, --readback-tiled-images
+// or --addcont*; these dialog fields are disabled (ConfigurationEditDialog). The PS5 Pro answer
+// comes from KYTY_TRINITY_MODE (CreateEmulatorEnvironment).
+static void AddBool(QStringList& args, bool value, const char* name) {
+	args << name << (value ? QStringLiteral("true") : QStringLiteral("false"));
 }
 
 static QStringList CreateEmulatorArgs(const Configuration& info) {
@@ -259,7 +282,10 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 	args << "--controller-volume" << QString::number(info.controller.speaker_volume);
 	args << "--controller-vibration" << QString::number(info.controller.vibration_intensity);
-	args << "--keyboard-player" << QString::number(info.controller.keyboard_player);
+	args << "--audio-master-volume" << QString::number(info.controller.audio_master);
+	args << "--audio-main-volume" << QString::number(info.controller.audio_main);
+	args << "--audio-music-volume" << QString::number(info.controller.audio_music);
+	args << "--audio-pad-speaker-volume" << QString::number(info.controller.audio_pad_speaker);
 	args << "--present-mode" << EnumToText(info.present_mode);
 	if (info.gpu_index >= 0) {
 		args << "--gpu" << QString::number(info.gpu_index);
@@ -267,38 +293,48 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	AddFlag(args, info.fullscreen_enabled, "--fullscreen");
 	AddFlag(args, info.hdr_enabled, "--hdr");
 	AddFlag(args, info.hide_cursor_enabled, "--hide-cursor");
-	AddFlag(args, info.stretch_enabled, "--stretch");
-	AddFlag(args, info.readback_linear_images, "--readback-linear-images");
-	AddFlag(args, info.readback_tiled_images, "--readback-tiled-images");
-	AddFlag(args, info.sync_raw_image_buffers, "--sync-raw-image-buffers");
-	AddFlag(args, !info.trophy_enabled, "--no-trophy-notifications");
-	args << "--trophy-duration" << QString::number(info.trophy_duration_seconds);
-	AddFlag(args, info.perf_overlay_enabled, "--perf-overlay");
-	AddFlag(args, info.skip_notice_screen, "--skip-notice-screen");
-	AddFlag(args, info.network_connected, "--network-connected");
-	AddFlag(args, info.psn_emulation_enabled, "--emulate-psn");
+	AddBool(args, info.readback_linear_images, "--readback-linear-images");
+	// Passed only when on, as the earlier local launcher did not pass them at all.
+	if (info.sync_raw_image_buffers) {
+		AddBool(args, true, "--sync-raw-image-buffers");
+	}
+	AddBool(args, info.trophy_enabled, "--trophy-notifications");
+	if (info.perf_overlay_enabled) {
+		AddBool(args, true, "--perf-overlay");
+	}
+	if (info.skip_notice_screen) {
+		AddBool(args, true, "--skip-notice-screen");
+	}
+	if (info.network_connected) {
+		AddBool(args, true, "--network-connected");
+	}
 	AddFlag(args, info.tessellation_enabled, "--tessellation");
-	AddFlag(args, info.occlusion_queries_enabled, "--occlusion-queries");
-	AddFlag(args, info.shader_cache_enabled, "--shader-cache");
 	args << "--vblank-frequency" << QString::number(info.vblank_frequency);
 	args << "--console-language" << QString::number(info.console_language);
-	AddFlag(args, info.vulkan_validation_enabled, "--vulkan-validation");
-	AddFlag(args, info.shader_validation_enabled, "--shader-validation");
+	AddBool(args, info.vulkan_validation_enabled, "--vulkan-validation");
+	AddBool(args, info.shader_validation_enabled, "--shader-validation");
+	args << "--shader-optimization-type" << EnumToText(info.shader_optimization_type);
 	args << "--shader-log-direction" << EnumToText(info.shader_log_direction);
 	args << "--shader-log-folder" << info.shader_log_folder;
-	AddFlag(args, info.command_buffer_dump_enabled, "--command-buffer-dump");
+	AddBool(args, info.command_buffer_dump_enabled, "--command-buffer-dump");
 	args << "--command-buffer-dump-folder" << info.command_buffer_dump_folder;
 	args << "--printf-direction" << EnumToText(info.printf_direction);
 	args << "--printf-output-file" << info.printf_output_file;
 	AddFlag(args, info.profiler_enabled, "--profile");
-	AddFlag(args, info.pro_enabled, "--trinity");
+	AddBool(args, false, "--spirv-debug-printf");
 	AddFlag(args, info.amd_cpu_enabled, "--amd-cpu");
-	AddFlag(args, info.guest_tsc_enabled, "--guest-tsc");
+	AddFlag(args, info.controller.dualsense_fix, "--dualsense-fix");
 #if defined(_WIN32)
 	AddFlag(args, info.red_zone_protection_enabled, "--redzone");
 #endif
+	// The emulator stops on gamepad remaps, disabled devices, touch and gyro options (its input
+	// map knows only keyboard and mouse bindings and the mouse sensitivity).
+	static const QRegularExpression local_unknown_binding(
+	    QStringLiteral("^(Pad:|Keyboard=|Pad=|TouchParticleSkin=|TouchCursorImage=|TouchPadMode=|GyroToggle=)"));
 	for (const auto& binding: info.host_input_mapping) {
-		args << "--keymap" << binding;
+		if (!local_unknown_binding.match(binding).hasMatch()) {
+			args << "--keymap" << binding;
+		}
 	}
 	AddFlag(args, info.renderdoc_enabled, "--rd");
 
@@ -307,12 +343,6 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 		game = QDir(info.basedir).filePath(info.elf);
 	}
 	args << "--game" << game;
-	if (!info.addons_dir.isEmpty()) {
-		args << "--addcont-dir" << info.addons_dir;
-	}
-	for (const auto& entry: info.addcont) {
-		args << "--addcont" << entry;
-	}
 
 	const auto patch_plan = Cheats::PlanPath(info.title_id);
 	if (QFileInfo::exists(patch_plan)) {
@@ -320,6 +350,18 @@ static QStringList CreateEmulatorArgs(const Configuration& info) {
 	}
 
 	return args;
+}
+
+// The launcher's environment (KYTY_* switches reach the emulator), plus the PS5 Pro answer:
+// KYTY_TRINITY_MODE follows the PS5 Pro check box. KYTY_CONSOLE_COLORS stays on unless set.
+static QProcessEnvironment CreateEmulatorEnvironment(const Configuration& info) {
+	auto env = QProcessEnvironment::systemEnvironment();
+	env.insert(QStringLiteral("KYTY_TRINITY_MODE"),
+	           info.pro_enabled ? QStringLiteral("1") : QStringLiteral("0"));
+	if (!env.contains(QStringLiteral("KYTY_CONSOLE_COLORS"))) {
+		env.insert(QStringLiteral("KYTY_CONSOLE_COLORS"), QStringLiteral("1"));
+	}
+	return env;
 }
 
 #ifdef __linux__
@@ -436,6 +478,7 @@ void MainDialog::RunInterpreter(QProcess* process, const Configuration& info, bo
 	    CmdCommand(QDir::toNativeSeparators(interpreter), args, close_terminal));
 #endif
 	process->setWorkingDirectory(QFileInfo(interpreter).absolutePath());
+	process->setProcessEnvironment(CreateEmulatorEnvironment(info));
 #if defined(_WIN32)
 	process->setCreateProcessArgumentsModifier([](QProcess::CreateProcessArguments* args) {
 		args->flags |= static_cast<uint32_t>(CREATE_NEW_CONSOLE);

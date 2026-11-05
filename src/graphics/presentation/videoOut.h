@@ -36,6 +36,7 @@ public:
 	                       int64_t flip_arg, uint64_t& request_id);
 	void PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer);
 	void CompleteFlip(uint64_t request_id);
+	void SubmitFlipPreparation(uint64_t request_id);
 	void WaitForSubmitSlot(int handle);
 	void WaitFlipDone(int handle, int index);
 

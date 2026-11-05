@@ -7,6 +7,7 @@
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/switches.h"
 #include "kernel/pthread.h"
 #include "libs/dualSenseHaptics.h"
 #include "libs/errno.h"
@@ -16,21 +17,24 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <mutex>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
-#include <memory>
 #include <vector>
 
 namespace Libs::Controller {
 
 LIB_NAME("Pad", "Pad");
 
-constexpr int PAD_PORT_TYPE_STANDARD = 0;
-constexpr int PAD_PORT_TYPE_SPECIAL  = 2;
-
-constexpr int PAD_HANDLE         = 1;
-constexpr int PAD_HANDLE_SPECIAL = PAD_HANDLE + Config::MAX_PLAYERS;
-static_assert(PAD_HANDLE_SPECIAL + Config::MAX_PLAYERS <= PAD_HANDLE_VR_LEFT);
+constexpr int PAD_ERROR_INVALID_ARG     = -2137915391; /* 0x80920001 */
+constexpr int PAD_ERROR_INVALID_HANDLE  = -2137915389; /* 0x80920003 */
+constexpr int PAD_ERROR_ALREADY_OPENED  = -2137915388; /* 0x80920004 */
+constexpr int PAD_ERROR_NOT_INITIALIZED = -2137915387; /* 0x80920005 */
+constexpr int PAD_ERROR_NO_HANDLE       = -2137915384; /* 0x80920008 */
+constexpr int PAD_HANDLE                = 1;
 
 constexpr uint32_t RUMBLE_DURATION_MS = 0xffff;
 constexpr uint32_t RELEASE_FLUSH_MS   = 50;
@@ -72,10 +76,6 @@ struct PadTriggerEffectParam {
 	PadTriggerEffectCommand command[2];
 };
 
-struct PadTriggerEffectStateInformation {
-	int32_t state[2];
-};
-
 static_assert(sizeof(PadTriggerEffectCommand) == 56);
 static_assert(sizeof(PadTriggerEffectParam) == 120);
 static_assert(sizeof(PadTriggerEffectStateInformation) == 8);
@@ -108,13 +108,9 @@ struct ControllerState {
 
 class GameController {
 public:
-	GameController(int player, int type): m_player(player), m_type(type) {}
+	GameController() = default;
 
 	KYTY_CLASS_NO_COPY(GameController);
-
-	[[nodiscard]] int Handle() const {
-		return (m_type == PAD_PORT_TYPE_SPECIAL ? PAD_HANDLE_SPECIAL : PAD_HANDLE) + m_player;
-	}
 
 	int InitPort();
 	int OpenPort(int user_id, int type, int index);
@@ -122,7 +118,8 @@ public:
 	int ClosePort(int handle);
 	int CheckPortHandle(int handle);
 
-	void SetDevices(int active_id);
+	void Connect(int id);
+	void Disconnect(int id);
 	void Button(int id, uint32_t button, bool down);
 	void Axis(int id, Axis axis, int value);
 	void RightStick(int id, int x, int y);
@@ -130,8 +127,8 @@ public:
 	void Motion(int id, Sensor sensor, const float* data, uint64_t time_us);
 	void SetMotionSensorState(bool enable);
 	void ResetOrientation();
-	void ToggleGyroEmulation(int id);
 	void ResetInputState();
+	void ReleaseHostPads();
 	void GetConnectionInfo(bool* flag, int* count);
 	void SetVibration(uint8_t large_motor, uint8_t small_motor);
 	int  GetActiveControllerId();
@@ -148,14 +145,9 @@ private:
 	enum class PortState { Uninitialized, Closed, Open };
 
 	int CheckPortHandleLocked(int handle) const;
-	[[nodiscard]] bool PadOpenArgsAreValid(int user_id, int type, int index) const;
 
-	const int m_player;
-	const int m_type;
-
+	void CheckActive();
 	void AddState();
-	// Emulated tilt: the right stick drives pitch and roll instead of the stick axes.
-	void UpdateEmulatedTilt();
 	// Apply cached output without changing its game-requested lifetime; caller holds m_mutex.
 	void ApplyVibration();
 	bool SendTriggerEffect(const PadTriggerEffectParam& param);
@@ -163,14 +155,12 @@ private:
 
 	Common::Mutex    m_mutex;
 	PortState        m_port_state      = PortState::Uninitialized;
+	std::vector<int> m_connected_ids;
 	int              m_active_id       = -1;
 	bool             m_connected       = false;
 	int              m_connected_count = 0;
 	bool             m_motion_enabled  = true;
 	uint64_t         m_gyro_time       = 0;
-	bool             m_gyro_emulation  = false;
-	uint64_t         m_emulated_time   = 0;
-	std::array<int, 2> m_emulated_stick {128, 128};
 	// Accelerometer gravity direction in the reset frame.
 	std::array<float, 3> m_up_reference {0.0f, 1.0f, 0.0f};
 	bool                 m_up_reference_valid = false;
@@ -189,53 +179,12 @@ private:
 	std::array<std::atomic<uint32_t>, 3> m_setting_steps {};
 };
 
-static std::array<std::unique_ptr<GameController>, Config::MAX_PLAYERS> g_players;
-// Each player's special port (wheels, guitars, ...); no host device feeds it.
-static std::array<std::unique_ptr<GameController>, Config::MAX_PLAYERS> g_special_ports;
+static GameController* g_controller = nullptr;
 
-// Maps host gamepads to players; the keyboard follows the configured keyboard player.
-static Common::Mutex g_router_mutex;
-static std::vector<std::pair<int, int>> g_pad_players;
-
-static uint32_t g_keyboard_player = 0;
-
-static void RefreshPlayers();
-static void StopHostPad(SDL_Gamepad* pad);
-
-// A mono LED cannot show the colour, and on Switch pads each write waits for the pad's reply.
-static void SetHostPadLED(SDL_Gamepad* pad, uint8_t r, uint8_t g, uint8_t b) {
-	if (!SDL_GetBooleanProperty(SDL_GetGamepadProperties(pad),
-	                            SDL_PROP_GAMEPAD_CAP_MONO_LED_BOOLEAN, false)) {
-		(void)SDL_SetGamepadLED(pad, r, g, b);
-	}
-}
-
-static int KeyboardPlayer() {
-	return g_keyboard_player == 0 ? 0 : static_cast<int>(g_keyboard_player) - 1;
-}
-
-// Caller holds g_router_mutex.
-static GameController* PlayerForDevice(int id) {
-	if (id == HOST_INPUT_CONTROLLER_ID) {
-		return g_players[KeyboardPlayer()].get();
-	}
-	for (const auto& [pad, player]: g_pad_players) {
-		if (pad == id) {
-			return player >= 0 ? g_players[player].get() : nullptr;
-		}
-	}
-	return nullptr;
-}
-
-static GameController* PlayerForHandle(int handle) {
-	if (handle >= PAD_HANDLE && handle < PAD_HANDLE_SPECIAL) {
-		return g_players[handle - PAD_HANDLE].get();
-	}
-	if (handle >= PAD_HANDLE_SPECIAL && handle < PAD_HANDLE_SPECIAL + Config::MAX_PLAYERS) {
-		return g_special_ports[handle - PAD_HANDLE_SPECIAL].get();
-	}
-	// The Sense controller ports belong to the initial user.
-	return PadVrHand(handle) >= 0 ? g_players[0].get() : nullptr;
+// KYTY_DEBUG_PAD_TRIGGERS=1 prints the trigger effects the game sets and the trigger values.
+static bool PadTriggerDebug() {
+	static const bool enabled = KYTY_GETENV("KYTY_DEBUG_PAD_TRIGGERS") != nullptr;
+	return enabled;
 }
 
 static void pad_fill_data(PadData* data, const ControllerState& state, bool connected,
@@ -245,12 +194,162 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 	std::memset(data, 0, sizeof(*data));
 
 	data->buttons           = state.buttons;
+	// KYTY_DEBUG_PAD_AUTOPRESS=<seconds>: holds Cross for 150 ms every <seconds> (from 15 s on),
+	// so an unattended test run gets past the title screen.
+	static const double auto_period = [] {
+		const char* text = KYTY_GETENV("KYTY_DEBUG_PAD_AUTOPRESS");
+		return text != nullptr ? std::atof(text) : 0.0;
+	}();
+	if (auto_period > 0.0) {
+		static const auto start = std::chrono::steady_clock::now();
+		const double seconds =
+		    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+		// KYTY_DEBUG_PAD_AUTOPRESS_BUTTON=<hex pad button mask> presses that instead of Cross.
+		static const uint32_t auto_button = [] {
+			const char* text = KYTY_GETENV("KYTY_DEBUG_PAD_AUTOPRESS_BUTTON");
+			return text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 16))
+			                       : PAD_BUTTON_CROSS;
+		}();
+		// KYTY_DEBUG_PAD_AUTOPRESS_STOP_FILE=<path>: no presses while that file exists (a watcher
+		// creates it when a cutscene starts, so the presses do not skip it, and removes it after).
+		static const char* stop_file = KYTY_GETENV("KYTY_DEBUG_PAD_AUTOPRESS_STOP_FILE");
+		static bool        paused    = false;
+		if (seconds > 15.0 && std::fmod(seconds, auto_period) < 0.15) {
+			bool pause = false;
+			if (stop_file != nullptr) {
+				if (auto* file = std::fopen(stop_file, "rb"); file != nullptr) {
+					std::fclose(file);
+					pause = true;
+				}
+			}
+			if (pause != paused) {
+				paused = pause;
+				std::printf("pad: autopress %s (%s)\n", pause ? "paused" : "resumed", stop_file);
+				std::fflush(stdout);
+			}
+			if (!pause) {
+				data->buttons |= auto_button;
+			}
+		}
+	}
 	data->left_stick_x      = state.axes[static_cast<int>(Axis::LeftX)];
 	data->left_stick_y      = state.axes[static_cast<int>(Axis::LeftY)];
 	data->right_stick_x     = state.axes[static_cast<int>(Axis::RightX)];
 	data->right_stick_y     = state.axes[static_cast<int>(Axis::RightY)];
 	data->analog_buttons_l2 = state.axes[static_cast<int>(Axis::TriggerLeft)];
 	data->analog_buttons_r2 = state.axes[static_cast<int>(Axis::TriggerRight)];
+	// KYTY_DEBUG_PAD_RECORD=<file> writes every change of buttons, sticks and triggers with its
+	// time since the first pad read; KYTY_DEBUG_PAD_REPLAY=<file> plays such a file back in place
+	// of the controller (until its last entry), so a test run can reach a level unattended.
+	{
+		struct PadEvent {
+			double   time;
+			uint32_t buttons;
+			int      values[6];
+		};
+		static const auto  pad_start = std::chrono::steady_clock::now();
+		const double       now =
+		    std::chrono::duration<double>(std::chrono::steady_clock::now() - pad_start).count();
+		static std::mutex  pad_mutex;
+		const std::lock_guard pad_lock(pad_mutex);
+		static const std::vector<PadEvent> replay = [] {
+			std::vector<PadEvent> list;
+			const char*           path = KYTY_GETENV("KYTY_DEBUG_PAD_REPLAY");
+			if (auto* file = path != nullptr ? std::fopen(path, "r") : nullptr; file != nullptr) {
+				PadEvent event {};
+				while (std::fscanf(file, "%lf %x %d %d %d %d %d %d", &event.time, &event.buttons,
+				                   &event.values[0], &event.values[1], &event.values[2],
+				                   &event.values[3], &event.values[4], &event.values[5]) == 8) {
+					list.push_back(event);
+				}
+				std::fclose(file);
+			}
+			return list;
+		}();
+		// KYTY_DEBUG_PAD_REPLAY_START_FILE=<path>: the replay clock starts only once that file exists
+		// (checked twice a second), so a benchmark script can start the route when a scene has loaded.
+		static const char* replay_start_file = KYTY_GETENV("KYTY_DEBUG_PAD_REPLAY_START_FILE");
+		static double      replay_origin     = replay_start_file == nullptr ? 0.0 : -1.0;
+		if (replay_origin < 0.0 && !replay.empty()) {
+			static double next_check = 0.0;
+			if (now >= next_check) {
+				next_check = now + 0.5;
+				if (auto* file = std::fopen(replay_start_file, "r"); file != nullptr) {
+					std::fclose(file);
+					replay_origin = now;
+					std::printf("pad replay: started at %.2f s\n", now);
+					std::fflush(stdout);
+				}
+			}
+		}
+		const double replay_now = now - replay_origin;
+		if (!replay.empty() && replay_origin >= 0.0 && replay_now <= replay.back().time + 0.5) {
+			static size_t cursor = 0;
+			while (cursor + 1 < replay.size() && replay[cursor + 1].time <= replay_now) {
+				cursor++;
+			}
+			const auto& event = replay[cursor];
+			if (event.time <= replay_now) {
+				data->buttons           = event.buttons;
+				data->left_stick_x      = static_cast<uint8_t>(event.values[0]);
+				data->left_stick_y      = static_cast<uint8_t>(event.values[1]);
+				data->right_stick_x     = static_cast<uint8_t>(event.values[2]);
+				data->right_stick_y     = static_cast<uint8_t>(event.values[3]);
+				data->analog_buttons_l2 = static_cast<uint8_t>(event.values[4]);
+				data->analog_buttons_r2 = static_cast<uint8_t>(event.values[5]);
+			}
+		}
+		// KYTY_DEBUG_PAD_LIVE=<file>: while the file holds "<buttons hex> <lx> <ly> <rx> <ry> <l2>
+		// <r2>", it replaces the controller (read every 50 ms), so a test can be steered from
+		// outside by rewriting the file.
+		static const char* live_path = KYTY_GETENV("KYTY_DEBUG_PAD_LIVE");
+		if (live_path != nullptr) {
+			static PadEvent live {};
+			static bool     live_valid = false;
+			static double   live_read  = -1.0;
+			if (now - live_read >= 0.05) {
+				live_read  = now;
+				live_valid = false;
+				if (auto* file = std::fopen(live_path, "r"); file != nullptr) {
+					live_valid = std::fscanf(file, "%x %d %d %d %d %d %d", &live.buttons,
+					                         &live.values[0], &live.values[1], &live.values[2],
+					                         &live.values[3], &live.values[4], &live.values[5]) == 7;
+					std::fclose(file);
+				}
+			}
+			if (live_valid) {
+				data->buttons           = live.buttons;
+				data->left_stick_x      = static_cast<uint8_t>(live.values[0]);
+				data->left_stick_y      = static_cast<uint8_t>(live.values[1]);
+				data->right_stick_x     = static_cast<uint8_t>(live.values[2]);
+				data->right_stick_y     = static_cast<uint8_t>(live.values[3]);
+				data->analog_buttons_l2 = static_cast<uint8_t>(live.values[4]);
+				data->analog_buttons_r2 = static_cast<uint8_t>(live.values[5]);
+			}
+		}
+		static std::FILE* record = [] {
+			const char* path = KYTY_GETENV("KYTY_DEBUG_PAD_RECORD");
+			return path != nullptr ? std::fopen(path, "w") : nullptr;
+		}();
+		if (record != nullptr) {
+			static PadEvent last {-1.0, 0, {}};
+			PadEvent        event {now, data->buttons,
+			                       {data->left_stick_x, data->left_stick_y, data->right_stick_x,
+			                        data->right_stick_y, data->analog_buttons_l2,
+			                        data->analog_buttons_r2}};
+			bool changed = last.time < 0.0 || event.buttons != last.buttons;
+			for (int i = 0; i < 6; i++) {
+				changed |= std::abs(event.values[i] - last.values[i]) > 6;
+			}
+			if (changed) {
+				std::fprintf(record, "%.3f %x %d %d %d %d %d %d\n", event.time, event.buttons,
+				             event.values[0], event.values[1], event.values[2], event.values[3],
+				             event.values[4], event.values[5]);
+				std::fflush(record);
+				last = event;
+			}
+		}
+	}
 	data->acceleration_x     = state.accel[0];
 	data->acceleration_y     = state.accel[1];
 	data->acceleration_z     = state.accel[2];
@@ -269,6 +368,39 @@ static void pad_fill_data(PadData* data, const ControllerState& state, bool conn
 			output.id    = touch.id;
 		}
 	}
+	// KYTY_DEBUG_PAD_AUTOSWIPE=<seconds>: from 15 s on, a finger swipes across the
+	// touchpad during the first 1.5 s of every <seconds>, for unattended runs of touch scenes.
+	static const double swipe_period = [] {
+		const char* text = KYTY_GETENV("KYTY_DEBUG_PAD_AUTOSWIPE");
+		return text != nullptr ? std::atof(text) : 0.0;
+	}();
+	if (swipe_period > 0.0 && data->touch_data.touch_num == 0) {
+		static const auto start = std::chrono::steady_clock::now();
+		const double seconds =
+		    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+		const double phase = std::fmod(seconds, swipe_period);
+		if (seconds > 15.0 && phase < 1.5) {
+			// Each swipe takes the next of eight directions (calligraphy strokes follow guides that
+			// run across, down or diagonally): from (x0, y0) to (x1, y1) in touchpad units.
+			static constexpr std::array<std::array<double, 4>, 8> STROKES = {{
+			    {200, 450, 1700, 600},  // left to right
+			    {950, 100, 950, 950},   // top to bottom
+			    {300, 150, 1600, 900},  // diagonal down-right
+			    {1600, 150, 300, 900},  // diagonal down-left
+			    {1700, 600, 200, 450},  // right to left
+			    {950, 950, 950, 100},   // bottom to top
+			    {1600, 900, 300, 150},  // diagonal up-left
+			    {300, 900, 1600, 150},  // diagonal up-right
+			}};
+			const auto  swipe  = static_cast<int>(seconds / swipe_period);
+			const auto& stroke = STROKES[static_cast<size_t>(swipe) % STROKES.size()];
+			const auto  t      = phase / 1.5;
+			auto&       output = data->touch_data.touch[data->touch_data.touch_num++];
+			output.x           = static_cast<uint16_t>(stroke[0] + t * (stroke[2] - stroke[0]));
+			output.y           = static_cast<uint16_t>(stroke[1] + t * (stroke[3] - stroke[1]));
+			output.id          = static_cast<uint8_t>(1 + swipe % 120);
+		}
+	}
 	data->connected              = connected;
 	data->timestamp              = state.time;
 	data->connected_count        = static_cast<uint8_t>(std::min(connected_count, 255));
@@ -280,15 +412,13 @@ constexpr std::array SPEAKER_VOLUME = {1.0f, 0.0f, 0.02f, 0.12f, 0.42f};
 constexpr std::array INTENSITY      = {1.0f, 0.0f, 0.33f, 0.66f};
 
 void CycleSetting(Setting setting) {
-	for (const auto& player: g_players) {
-		if (player != nullptr) {
-			player->CycleSetting(setting);
-		}
+	if (g_controller != nullptr) {
+		g_controller->CycleSetting(setting);
 	}
 }
 
 float GetSettingScale(Setting setting) {
-	return g_players[0] != nullptr ? g_players[0]->GetSettingScale(setting) : 1.0f;
+	return g_controller != nullptr ? g_controller->GetSettingScale(setting) : 1.0f;
 }
 
 void GameController::CycleSetting(Setting setting) {
@@ -458,56 +588,38 @@ static int32_t TriggerEffectState(const PadTriggerEffectCommand& command, int va
 }
 
 void Initialize() {
-	EXIT_IF(g_players[0] != nullptr);
+	EXIT_IF(g_controller != nullptr);
 
-	for (int i = 0; i < Config::MAX_PLAYERS; i++) {
-		g_players[i]       = std::make_unique<GameController>(i, PAD_PORT_TYPE_STANDARD);
-		g_special_ports[i] = std::make_unique<GameController>(i, PAD_PORT_TYPE_SPECIAL);
-	}
-	g_keyboard_player = Config::GetKeyboardPlayer();
-	RefreshPlayers();
+	g_controller = new GameController;
+	g_controller->Connect(HOST_INPUT_CONTROLLER_ID);
 }
 
 void Shutdown() {
 	EmergencyShutdown();
-	g_players       = {};
-	g_special_ports = {};
+	delete g_controller;
+	g_controller = nullptr;
 }
 
 void EmergencyShutdown() {
-	Common::LockGuard lock(g_router_mutex);
-	DualSenseHaptics::Shutdown();
-	std::vector<SDL_Gamepad*> pads;
-	for (const auto& [id, player]: g_pad_players) {
-		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id))) {
-			StopHostPad(pad);
-			pads.push_back(pad);
-		}
-	}
-	if (!pads.empty()) {
-		SDL_Delay(RELEASE_FLUSH_MS);
-		for (auto* pad: pads) {
-			SDL_CloseGamepad(pad);
-		}
-	}
-	g_pad_players.clear();
-	for (const auto& player: g_players) {
-		if (player != nullptr) {
-			player->SetDevices(-1);
-		}
+	if (g_controller != nullptr) {
+		g_controller->ReleaseHostPads();
 	}
 }
 
-void GameController::SetDevices(int active_id) {
+void GameController::Connect(int id) {
 	Common::LockGuard lock(m_mutex);
-	if (m_active_id == active_id) {
+
+	if (std::find(m_connected_ids.begin(), m_connected_ids.end(), id) != m_connected_ids.end()) {
 		return;
 	}
-	if (active_id != HOST_INPUT_CONTROLLER_ID && active_id != -1) {
-		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(active_id));
+
+	m_connected_ids.push_back(id);
+
+	if (id != HOST_INPUT_CONTROLLER_ID) {
+		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id));
 		    pad != nullptr) {
 			if (const auto& color = Config::GetControllerColor()) {
-				SetHostPadLED(pad, (*color)[0], (*color)[1], (*color)[2]);
+				(void)SDL_SetGamepadLED(pad, (*color)[0], (*color)[1], (*color)[2]);
 			}
 			for (auto sensor: {SDL_SENSOR_ACCEL, SDL_SENSOR_GYRO}) {
 				if (SDL_GamepadHasSensor(pad, sensor) &&
@@ -518,17 +630,45 @@ void GameController::SetDevices(int active_id) {
 		}
 	}
 
-	const bool new_connected = active_id != -1;
+	CheckActive();
+}
+
+void GameController::Disconnect(int id) {
+	Common::LockGuard lock(m_mutex);
+
+	const auto it = std::find(m_connected_ids.begin(), m_connected_ids.end(), id);
+	EXIT_IF(it == m_connected_ids.end());
+
+	m_connected_ids.erase(it);
+
+	CheckActive();
+}
+
+void GameController::CheckActive() {
+	int  new_active_id = -1;
+	bool new_connected = false;
+
+	if (!m_connected_ids.empty()) {
+		new_active_id = m_connected_ids[0];
+		for (const auto id: m_connected_ids) {
+			if (id != HOST_INPUT_CONTROLLER_ID) {
+				new_active_id = id;
+				break;
+			}
+		}
+		new_connected = true;
+	}
+
+	if (m_connected == new_connected && m_active_id == new_active_id) {
+		return;
+	}
 	if (!m_connected && new_connected) {
 		m_connected_count++;
 	}
-	m_active_id     = active_id;
+	m_active_id     = new_active_id;
 	m_connected     = new_connected;
 	m_state         = {};
 	m_gyro_time     = 0;
-	m_gyro_emulation = false;
-	m_emulated_time  = 0;
-	m_emulated_stick = {128, 128};
 	m_up_reference_valid = false;
 	m_states_num    = 0;
 	m_first_state   = 0;
@@ -539,20 +679,7 @@ void GameController::SetDevices(int active_id) {
 	m_trigger_state      = {};
 }
 
-// Input that changes no button or touch contact updates the newest unread sample, so a burst of
-// stick or sensor events between two reads cannot push unread button or touch changes out.
 void GameController::AddState() {
-	if (m_states_num != 0) {
-		const auto newest = (m_first_state + m_states_num - 1) % STATES_MAX;
-		auto&      last   = m_states[newest];
-		if (!m_obtained[newest] && last.buttons == m_state.buttons &&
-		    last.touch[0].down == m_state.touch[0].down &&
-		    last.touch[1].down == m_state.touch[1].down) {
-			last = m_state;
-			return;
-		}
-	}
-
 	if (m_states_num >= STATES_MAX) {
 		m_states_num  = STATES_MAX - 1;
 		m_first_state = (m_first_state + 1) % STATES_MAX;
@@ -567,7 +694,7 @@ void GameController::AddState() {
 void GameController::Button(int id, uint32_t button, bool down) {
 	Common::LockGuard lock(m_mutex);
 
-	// Keyboard events are routed to the configured player's port.
+	// The keyboard shares the player-1 pad with the active gamepad.
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
 		m_state.time = LibKernel::KernelGetProcessTime();
 
@@ -587,12 +714,6 @@ void GameController::Axis(int id, Controller::Axis axis, int value) {
 
 		EXIT_IF(axis_id < 0 || axis_id >= static_cast<int>(Controller::Axis::AxisMax));
 
-		if (m_gyro_emulation && (axis == Controller::Axis::RightX || axis == Controller::Axis::RightY)) {
-			m_emulated_stick[axis == Controller::Axis::RightY ? 1 : 0] = value;
-			UpdateEmulatedTilt();
-			return;
-		}
-
 		m_state.axes[axis_id] = value;
 
 		uint32_t trigger = 0;
@@ -603,6 +724,16 @@ void GameController::Axis(int id, Controller::Axis axis, int value) {
 		}
 		if (trigger != 0) {
 			m_state.buttons = value > 0 ? m_state.buttons | trigger : m_state.buttons & ~trigger;
+			if (PadTriggerDebug()) [[unlikely]] {
+				static int last[2] = {-100, -100};
+				auto&      previous = last[trigger == PAD_BUTTON_L2 ? 0 : 1];
+				if (std::abs(value - previous) >= 32 || ((value == 0 || value == 255) && value != previous)) {
+					std::printf("pad-trigger: t=%.2f %s value=%d\n",
+					            static_cast<double>(LibKernel::KernelGetProcessTime()) / 1e6,
+					            trigger == PAD_BUTTON_L2 ? "L2" : "R2", value);
+					previous = value;
+				}
+			}
 			UpdateTriggerEffectState();
 		}
 
@@ -614,12 +745,7 @@ void GameController::RightStick(int id, int x, int y) {
 	Common::LockGuard lock(m_mutex);
 
 	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
-		m_state.time = LibKernel::KernelGetProcessTime();
-		if (m_gyro_emulation) {
-			m_emulated_stick = {x, y};
-			UpdateEmulatedTilt();
-			return;
-		}
+		m_state.time                                 = LibKernel::KernelGetProcessTime();
 		m_state.axes[static_cast<int>(Axis::RightX)] = x;
 		m_state.axes[static_cast<int>(Axis::RightY)] = y;
 		AddState();
@@ -632,7 +758,7 @@ void GameController::TouchPad(int id, int finger, bool down, float x, float y) {
 	}
 
 	Common::LockGuard lock(m_mutex);
-	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID) {
+	if (m_active_id == id || id == HOST_INPUT_CONTROLLER_ID || id == HOST_MOUSE_TOUCH_ID) {
 		auto& touch  = m_state.touch[finger];
 		m_state.time = LibKernel::KernelGetProcessTime();
 		if (down && !touch.down) {
@@ -751,82 +877,6 @@ void GameController::SetMotionSensorState(bool enable) {
 	}
 }
 
-static Quat QuatMultiply(const Quat& a, const Quat& b) {
-	return {a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
-	        a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
-	        a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
-	        a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]};
-}
-
-void GameController::UpdateEmulatedTilt() {
-	constexpr float max_angle = 0.7853982f; // 45 degrees at full stick deflection
-	const auto      angle     = [](int value) {
-        return std::clamp((value - 128) / 127.0f, -1.0f, 1.0f) * max_angle;
-	};
-	const float roll  = angle(m_emulated_stick[0]);
-	const float pitch = angle(m_emulated_stick[1]);
-
-	const Quat q_pitch {std::sin(pitch * 0.5f), 0.0f, 0.0f, std::cos(pitch * 0.5f)};
-	const Quat q_roll {0.0f, 0.0f, std::sin(-roll * 0.5f), std::cos(-roll * 0.5f)};
-	Quat       q = QuatMultiply(q_roll, q_pitch);
-
-	const uint64_t now = LibKernel::KernelGetProcessTime();
-	Vec3           rate {};
-	if (m_emulated_time != 0 && now > m_emulated_time) {
-		const float dt = std::clamp(static_cast<float>(now - m_emulated_time) * 0.000001f,
-		                            0.001f, 0.1f);
-		auto delta = QuatMultiply(QuatConjugate(m_state.orientation), q);
-		if (delta[3] < 0.0f) {
-			for (auto& v: delta) {
-				v = -v;
-			}
-		}
-		rate = {2.0f * delta[0] / dt, 2.0f * delta[1] / dt, 2.0f * delta[2] / dt};
-	}
-	m_emulated_time = now;
-
-	m_state.time        = now;
-	m_state.orientation = q;
-	m_state.accel       = QuatRotate(QuatConjugate(q), {0.0f, 1.0f, 0.0f});
-	m_state.gyro        = rate;
-	AddState();
-	// Angular velocity is only nonzero while the tilt changes.
-	m_state.gyro = {};
-}
-
-void GameController::ToggleGyroEmulation(int id) {
-	Common::LockGuard lock(m_mutex);
-	if (id != HOST_INPUT_CONTROLLER_ID && id != m_active_id) {
-		return;
-	}
-	// Pads with a real gyroscope report it directly.
-	if (m_active_id != HOST_INPUT_CONTROLLER_ID) {
-		auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
-		if (pad != nullptr && SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO)) {
-			return;
-		}
-	}
-
-	m_gyro_emulation = !m_gyro_emulation;
-	m_emulated_time  = 0;
-	m_state.time     = LibKernel::KernelGetProcessTime();
-	if (m_gyro_emulation) {
-		m_emulated_stick = {m_state.axes[static_cast<int>(Axis::RightX)],
-		                    m_state.axes[static_cast<int>(Axis::RightY)]};
-		m_state.axes[static_cast<int>(Axis::RightX)] = 128;
-		m_state.axes[static_cast<int>(Axis::RightY)] = 128;
-		UpdateEmulatedTilt();
-	} else {
-		m_state.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
-		m_state.accel       = {0.0f, 1.0f, 0.0f};
-		m_state.gyro        = {};
-		m_state.axes[static_cast<int>(Axis::RightX)] = m_emulated_stick[0];
-		m_state.axes[static_cast<int>(Axis::RightY)] = m_emulated_stick[1];
-		AddState();
-	}
-	LOGF("Emulated gyro tilt: %s\n", m_gyro_emulation ? "enabled" : "disabled");
-}
-
 void GameController::ResetOrientation() {
 	Common::LockGuard lock(m_mutex);
 	m_state.orientation  = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -852,16 +902,39 @@ void GameController::ResetInputState() {
 	AddState();
 }
 
-static void StopHostPad(SDL_Gamepad* pad) {
-	if (SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
-		DualSenseEffects effect {};
-		effect.enable_bits     = 0x0c;
-		effect.right_trigger[0] = 0x05;
-		effect.left_trigger[0]  = 0x05;
-		(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
+void GameController::ReleaseHostPads() {
+	Common::LockGuard lock(m_mutex);
+	DualSenseHaptics::Shutdown();
+
+	std::vector<SDL_Gamepad*> pads;
+	for (const auto id: m_connected_ids) {
+		if (id == HOST_INPUT_CONTROLLER_ID) {
+			continue;
+		}
+		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(id));
+		    pad != nullptr) {
+			if (SDL_GetGamepadType(pad) == SDL_GAMEPAD_TYPE_PS5) {
+				DualSenseEffects effect {};
+				effect.enable_bits     = 0x0c;
+				effect.right_trigger[0] = 0x05;
+				effect.left_trigger[0]  = 0x05;
+				(void)SDL_SendGamepadEffect(pad, &effect, sizeof(effect));
+			}
+			(void)SDL_RumbleGamepad(pad, 0, 0, 0);
+			(void)SDL_SetGamepadLED(pad, 0, 0, 0);
+			pads.push_back(pad);
+		}
 	}
-	(void)SDL_RumbleGamepad(pad, 0, 0, 0);
-	SetHostPadLED(pad, 0, 0, 0);
+
+	if (!pads.empty()) {
+		SDL_Delay(RELEASE_FLUSH_MS);
+		for (auto* pad: pads) {
+			SDL_CloseGamepad(pad);
+		}
+	}
+
+	m_connected_ids.clear();
+	CheckActive();
 }
 
 void GameController::SetVibration(uint8_t large_motor, uint8_t small_motor) {
@@ -875,12 +948,16 @@ void GameController::ApplyVibration() {
 	const auto now = SDL_GetTicks();
 	const auto duration =
 	    m_vibration_until > now ? static_cast<uint32_t>(m_vibration_until - now) : 0;
-	const auto scale       = duration != 0 ? GetSettingScale(Setting::VibrationIntensity) : 0.0f;
+	// KYTY_PAD_VIBRATION=0: no rumble either (see AudioOutOpen for the haptic ports).
+	static const bool enabled = [] {
+		const char* text = KYTY_GETENV("KYTY_PAD_VIBRATION");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	const auto scale =
+	    duration != 0 && enabled ? GetSettingScale(Setting::VibrationIntensity) : 0.0f;
 	const auto large_motor = Scale(m_vibration[0], scale);
 	const auto small_motor = Scale(m_vibration[1], scale);
-	// The DualSense haptics backend drives a single pad, so only player 1 uses it.
-	if (m_player == 0 &&
-	    DualSenseHaptics::SetVibration(m_active_id, large_motor, small_motor, duration)) {
+	if (DualSenseHaptics::SetVibration(m_active_id, large_motor, small_motor, duration)) {
 		return;
 	}
 
@@ -914,13 +991,28 @@ void GameController::SetLightBar(uint8_t r, uint8_t g, uint8_t b) {
 	}
 	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
 	    pad != nullptr) {
-		SetHostPadLED(pad, r, g, b);
+		(void)SDL_SetGamepadLED(pad, r, g, b);
 	}
 }
 
 bool GameController::SetTriggerEffect(const PadTriggerEffectParam& param) {
 	Common::LockGuard lock(m_mutex);
-	if (!SendTriggerEffect(param)) {
+	const bool sent = SendTriggerEffect(param);
+	if (PadTriggerDebug()) [[unlikely]] {
+		for (int i = 0; i < 2; i++) {
+			if ((param.trigger_mask & (1u << i)) == 0) {
+				continue;
+			}
+			const auto& command = param.command[i];
+			std::printf("pad-trigger: t=%.2f %s mode=%u data=", static_cast<double>(LibKernel::KernelGetProcessTime()) / 1e6,
+			            i == 0 ? "L2" : "R2", command.mode);
+			for (int b = 0; b < 12; b++) {
+				std::printf("%02x", command.data[b]);
+			}
+			std::printf(" sent=%d\n", sent ? 1 : 0);
+		}
+	}
+	if (!sent) {
 		return false;
 	}
 	for (int i = 0; i < 2; i++) {
@@ -969,6 +1061,16 @@ bool GameController::SendTriggerEffect(const PadTriggerEffectParam& param) {
 	}
 	if (effect.enable_bits == 0) {
 		return true;
+	}
+	// KYTY_PAD_TRIGGERS=0 (DualSense Fix off): the triggers get the "off" effect (mode 0) instead,
+	// so they never resist; the game still sees the effect state it set.
+	static const bool triggers = [] {
+		const char* text = KYTY_GETENV("KYTY_PAD_TRIGGERS");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	if (!triggers) {
+		std::memset(&effect.left_trigger, 0, sizeof(effect.left_trigger));
+		std::memset(&effect.right_trigger, 0, sizeof(effect.right_trigger));
 	}
 
 	auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(m_active_id));
@@ -1032,148 +1134,45 @@ int GameController::ReadStates(ControllerState* states, int states_num, bool* fl
 	return ret_num;
 }
 
-// Keep every opened pad, including those waiting for a free player slot.
-// Caller holds g_router_mutex.
-static void RefreshPlayers() {
-	std::array<bool, Config::MAX_PLAYERS> taken {};
-	const int keyboard = KeyboardPlayer();
-	if (g_keyboard_player != 0) {
-		taken[keyboard] = true;
-	}
-	for (auto& [id, player]: g_pad_players) {
-		if (g_keyboard_player != 0 && player == keyboard) {
-			player = -1;
-		}
-		if (player >= 0) {
-			taken[player] = true;
-		}
-	}
-	for (auto& [id, player]: g_pad_players) {
-		if (player >= 0) {
-			continue;
-		}
-		const auto free = std::find(taken.begin(), taken.end(), false);
-		if (free != taken.end()) {
-			player = static_cast<int>(free - taken.begin());
-			*free  = true;
-			LOGF("Controller %d assigned to player %d\n", id, player + 1);
-		}
-	}
-	std::array<int, Config::MAX_PLAYERS> active;
-	active.fill(-1);
-	active[keyboard] = HOST_INPUT_CONTROLLER_ID;
-	for (const auto& [id, player]: g_pad_players) {
-		if (player >= 0) {
-			active[player] = id;
-		}
-	}
-	// Stop old owners before configuring new owners of the same physical pad.
-	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
-		const int previous = g_players[player]->GetActiveControllerId();
-		if (previous != active[player]) {
-			if (player == 0) {
-				(void)DualSenseHaptics::SetVibration(previous, 0, 0, 0);
-			}
-			if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(previous))) {
-				StopHostPad(pad);
-			}
-		}
-	}
-	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
-		g_players[player]->SetDevices(active[player]);
-	}
-}
-
 void Connect(int id) {
-	Common::LockGuard lock(g_router_mutex);
-	if (std::any_of(g_pad_players.begin(), g_pad_players.end(),
-	                [id](const auto& pad) { return pad.first == id; })) {
-		return;
-	}
-	g_pad_players.emplace_back(id, -1);
-	RefreshPlayers();
+	g_controller->Connect(id);
 }
 
 void Disconnect(int id) {
-	Common::LockGuard lock(g_router_mutex);
-	std::erase_if(g_pad_players, [id](const auto& pad) { return pad.first == id; });
-	RefreshPlayers();
-}
-
-void CycleKeyboardPlayer() {
-	Common::LockGuard lock(g_router_mutex);
-	g_keyboard_player = (g_keyboard_player + 1) % (Config::MAX_PLAYERS + 1);
-	RefreshPlayers();
-	if (g_keyboard_player == 0) {
-		LOGF("Keyboard shared with player 1\n");
-	} else {
-		LOGF("Keyboard assigned to player %u\n", g_keyboard_player);
-	}
+	g_controller->Disconnect(id);
 }
 
 void SetButton(int id, uint32_t button, bool down) {
-	Common::LockGuard lock(g_router_mutex);
-	if (auto* player = PlayerForDevice(id)) {
-		player->Button(id, button, down);
-	}
+	g_controller->Button(id, button, down);
 }
 
 void SetAxis(int id, Axis axis, int value) {
-	Common::LockGuard lock(g_router_mutex);
-	if (auto* player = PlayerForDevice(id)) {
-		player->Axis(id, axis, value);
-	}
+	g_controller->Axis(id, axis, value);
 }
 
 void SetRightStick(int id, int x, int y) {
-	Common::LockGuard lock(g_router_mutex);
-	if (auto* player = PlayerForDevice(id)) {
-		player->RightStick(id, x, y);
-	}
+	g_controller->RightStick(id, x, y);
 }
 
 void SetTouchPad(int id, int finger, bool down, float x, float y) {
-	Common::LockGuard lock(g_router_mutex);
-	if (auto* player = PlayerForDevice(id)) {
-		player->TouchPad(id, finger, down, x, y);
-	}
+	g_controller->TouchPad(id, finger, down, x, y);
 }
 
 void SetSensor(int id, Sensor sensor, const float* data, uint64_t time_us) {
-	Common::LockGuard lock(g_router_mutex);
-	if (auto* player = PlayerForDevice(id)) {
-		player->Motion(id, sensor, data, time_us);
-	}
-}
-
-void ToggleGyroEmulation(int id) {
-	Common::LockGuard lock(g_router_mutex);
-	if (auto* player = PlayerForDevice(id)) {
-		player->ToggleGyroEmulation(id);
-	}
+	g_controller->Motion(id, sensor, data, time_us);
 }
 
 void ResetInputState() {
-	for (const auto& player: g_players) {
-		if (player != nullptr) {
-			player->ResetInputState();
-		}
-	}
+	g_controller->ResetInputState();
 }
 
 int GetActiveControllerId() {
-	return g_players[0] != nullptr ? g_players[0]->GetActiveControllerId() : -1;
+	return g_controller != nullptr ? g_controller->GetActiveControllerId() : -1;
 }
 
-bool IsPlayerConnected(int player) {
-	if (player < 0 || player >= Config::MAX_PLAYERS || g_players[player] == nullptr) {
-		return false;
-	}
-	return g_players[player]->GetActiveControllerId() != -1;
-}
-
-bool GameController::PadOpenArgsAreValid(int user_id, int type, int index) const {
-	return user_id == Config::GetPlayerUserId(m_player) && type == m_type && index == 0;
+static bool PadOpenArgsAreValid(int user_id, int type, int index) {
+	// The host keyboard and gamepad feed one standard port for the configured user.
+	return user_id == Config::GetUserId() && type == 0 && index == 0;
 }
 
 int GameController::InitPort() {
@@ -1196,7 +1195,7 @@ int GameController::OpenPort(int user_id, int type, int index) {
 		return PAD_ERROR_ALREADY_OPENED;
 	}
 	m_port_state = PortState::Open;
-	return Handle();
+	return PAD_HANDLE;
 }
 
 int GameController::GetPortHandle(int user_id, int type, int index) {
@@ -1204,16 +1203,15 @@ int GameController::GetPortHandle(int user_id, int type, int index) {
 	if (m_port_state == PortState::Uninitialized) {
 		return PAD_ERROR_NOT_INITIALIZED;
 	}
-	return m_port_state == PortState::Open && PadOpenArgsAreValid(user_id, type, index)
-	           ? Handle()
-	           : PAD_ERROR_NO_HANDLE;
+	return m_port_state == PortState::Open && PadOpenArgsAreValid(user_id, type, index) ? PAD_HANDLE
+	                                                                               : PAD_ERROR_NO_HANDLE;
 }
 
 int GameController::CheckPortHandleLocked(int handle) const {
 	if (m_port_state == PortState::Uninitialized) {
 		return PAD_ERROR_NOT_INITIALIZED;
 	}
-	return m_port_state == PortState::Open && handle == Handle() ? OK : PAD_ERROR_INVALID_HANDLE;
+	return m_port_state == PortState::Open && handle == PAD_HANDLE ? OK : PAD_ERROR_INVALID_HANDLE;
 }
 
 int GameController::CheckPortHandle(int handle) {
@@ -1231,33 +1229,12 @@ int GameController::ClosePort(int handle) {
 }
 
 int PadCheckHandle(int handle) {
-	if (g_players[0] == nullptr) {
-		return PAD_ERROR_NOT_INITIALIZED;
-	}
-	if (PadVrHand(handle) >= 0) {
-		return PadVrCheckHandle(handle);
-	}
-	auto* player = PlayerForHandle(handle);
-	return player != nullptr ? player->CheckPortHandle(handle) : PAD_ERROR_INVALID_HANDLE;
-}
-
-// Handle 0 is never valid, so this only reports whether scePadInit has run.
-bool PadInitialized() {
-	return g_players[0] != nullptr && g_players[0]->CheckPortHandle(0) != PAD_ERROR_NOT_INITIALIZED;
+	return g_controller->CheckPortHandle(handle);
 }
 
 int KYTY_SYSV_ABI PadInit() {
 	PRINT_NAME();
-	for (int i = 0; i < Config::MAX_PLAYERS; i++) {
-		(void)g_players[i]->InitPort();
-		(void)g_special_ports[i]->InitPort();
-	}
-	return OK;
-}
-
-// Unsupported port types reach the standard port, which rejects them.
-static GameController* PortForType(int player, int type) {
-	return (type == PAD_PORT_TYPE_SPECIAL ? g_special_ports : g_players)[player].get();
+	return g_controller->InitPort();
 }
 
 int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param) {
@@ -1269,25 +1246,7 @@ int KYTY_SYSV_ABI PadOpen(int user_id, int type, int index, const void* param) {
 	     "\t param   = 0x%016" PRIx64 "\n",
 	     user_id, type, index, reinterpret_cast<uint64_t>(param));
 
-	if (const int hand = PadVrPortHand(type); hand >= 0) {
-		return PadVrPort(user_id, hand, index, true);
-	}
-	const int player = Config::GetPlayerFromUserId(user_id);
-	return player >= 0 ? PortForType(player, type)->OpenPort(user_id, type, index)
-	                   : PAD_ERROR_INVALID_ARG;
-}
-
-// Opens the port of a third-party controller chosen by vendor and product; none is ever connected.
-int KYTY_SYSV_ABI PadOpenExt(int user_id, int type, int index, const void* param) {
-	PRINT_NAME();
-
-	LOGF("\t user_id = %d\n"
-	     "\t type    = %d\n"
-	     "\t index   = %d\n"
-	     "\t param   = 0x%016" PRIx64 "\n",
-	     user_id, type, index, reinterpret_cast<uint64_t>(param));
-
-	return PAD_ERROR_DEVICE_NOT_CONNECTED;
+	return g_controller->OpenPort(user_id, type, index);
 }
 
 int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index) {
@@ -1298,25 +1257,13 @@ int KYTY_SYSV_ABI PadGetHandle(int user_id, int type, int index) {
 	     "\t index   = %d\n",
 	     user_id, type, index);
 
-	if (const int hand = PadVrPortHand(type); hand >= 0) {
-		return PadVrPort(user_id, hand, index, false);
-	}
-	const int player = Config::GetPlayerFromUserId(user_id);
-	return player >= 0 ? PortForType(player, type)->GetPortHandle(user_id, type, index)
-	                   : PAD_ERROR_NO_HANDLE;
+	return g_controller->GetPortHandle(user_id, type, index);
 }
 
 int KYTY_SYSV_ABI PadClose(int handle) {
 	PRINT_NAME();
 	LOGF("\t handle = %d\n", handle);
-	if (PadVrHand(handle) >= 0) {
-		return PadVrClose(handle);
-	}
-	auto* player = PlayerForHandle(handle);
-	if (player == nullptr) {
-		return PAD_ERROR_INVALID_HANDLE;
-	}
-	return player->ClosePort(handle);
+	return g_controller->ClosePort(handle);
 }
 
 int KYTY_SYSV_ABI PadSetMotionSensorState(int handle, bool enable) {
@@ -1327,7 +1274,7 @@ int KYTY_SYSV_ABI PadSetMotionSensorState(int handle, bool enable) {
 	}
 
 	LOGF("\t enable = %s\n", (enable ? "true" : "false"));
-	PlayerForHandle(handle)->SetMotionSensorState(enable);
+	g_controller->SetMotionSensorState(enable);
 
 	return OK;
 }
@@ -1351,7 +1298,7 @@ int KYTY_SYSV_ABI PadResetOrientation(int handle) {
 		return error;
 	}
 
-	PlayerForHandle(handle)->ResetOrientation();
+	g_controller->ResetOrientation();
 	return OK;
 }
 
@@ -1367,7 +1314,7 @@ int KYTY_SYSV_ABI PadGetControllerInformation(int handle, PadControllerInformati
 
 	int  connected_count = 0;
 	bool connected       = false;
-	PlayerForHandle(handle)->GetConnectionInfo(&connected, &connected_count);
+	g_controller->GetConnectionInfo(&connected, &connected_count);
 
 	std::memset(info, 0, sizeof(*info));
 
@@ -1412,7 +1359,7 @@ int KYTY_SYSV_ABI PadReadState(int handle, PadData* data) {
 	bool            connected       = false;
 	ControllerState state;
 
-	PlayerForHandle(handle)->ReadState(&state, &connected, &connected_count);
+	g_controller->ReadState(&state, &connected, &connected_count);
 
 	pad_fill_data(data, state, connected, connected_count);
 
@@ -1436,12 +1383,11 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 	bool            connected       = false;
 	ControllerState states[64]      = {};
 
-	auto* player  = PlayerForHandle(handle);
-	int   ret_num = player->ReadStates(states, num, &connected, &connected_count);
+	int ret_num = g_controller->ReadStates(states, num, &connected, &connected_count);
 
 	if (!connected || ret_num == 0) {
 		if (connected) {
-			player->ReadState(&states[0], &connected, &connected_count);
+			g_controller->ReadState(&states[0], &connected, &connected_count);
 		}
 		ret_num = 1;
 	}
@@ -1455,7 +1401,6 @@ int KYTY_SYSV_ABI PadRead(int handle, PadData* data, int num) {
 
 int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param) {
 	PRINT_NAME();
-	Common::LockGuard lock(g_router_mutex);
 
 	if (const auto error = PadCheckHandle(handle); error != OK) {
 		return error;
@@ -1468,7 +1413,7 @@ int KYTY_SYSV_ABI PadSetVibration(int handle, const PadVibrationParam* param) {
 	     "\t small_motor = %d\n",
 	     static_cast<int>(param->large_motor), static_cast<int>(param->small_motor));
 
-	PlayerForHandle(handle)->SetVibration(param->large_motor, param->small_motor);
+	g_controller->SetVibration(param->large_motor, param->small_motor);
 
 	return OK;
 }
@@ -1485,7 +1430,6 @@ int KYTY_SYSV_ABI PadResetLightBar(int handle) {
 
 int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param) {
 	PRINT_NAME();
-	Common::LockGuard lock(g_router_mutex);
 
 	if (const auto error = PadCheckHandle(handle); error != OK) {
 		return error;
@@ -1494,14 +1438,13 @@ int KYTY_SYSV_ABI PadSetLightBar(int handle, const PadLightBarParam* param) {
 		return PAD_ERROR_INVALID_ARG;
 	}
 
-	PlayerForHandle(handle)->SetLightBar(param->r, param->g, param->b);
+	g_controller->SetLightBar(param->r, param->g, param->b);
 
 	return OK;
 }
 
 int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* param) {
 	PRINT_NAME();
-	Common::LockGuard lock(g_router_mutex);
 
 	if (const auto error = PadCheckHandle(handle); error != OK) {
 		return error;
@@ -1510,7 +1453,7 @@ int KYTY_SYSV_ABI PadSetTriggerEffect(int handle, const PadTriggerEffectParam* p
 		return PAD_ERROR_INVALID_ARG;
 	}
 
-	return PlayerForHandle(handle)->SetTriggerEffect(*param) ? OK : PAD_ERROR_INVALID_ARG;
+	return g_controller->SetTriggerEffect(*param) ? OK : PAD_ERROR_INVALID_ARG;
 }
 
 int KYTY_SYSV_ABI PadGetTriggerEffectState(int handle, PadTriggerEffectStateInformation* info) {
@@ -1525,7 +1468,7 @@ int KYTY_SYSV_ABI PadGetTriggerEffectState(int handle, PadTriggerEffectStateInfo
 		return PAD_ERROR_INVALID_ARG;
 	}
 
-	PlayerForHandle(handle)->GetTriggerEffectState(info);
+	g_controller->GetTriggerEffectState(info);
 
 	return OK;
 }

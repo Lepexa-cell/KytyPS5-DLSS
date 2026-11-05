@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include "common/switches.h"
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t TypeBvh8Result(EmitterState& s) {
@@ -15,7 +17,7 @@ using Vec3 = std::array<uint32_t, 3>;
 
 struct Bvh8Emitter {
 	EmitterState& s;
-	const uint32_t u = TypeU32(s), f = TypeF32(s), b = TypeBool(s), w = TypeU64(s);
+	const uint32_t u = TypeU32(s), f = TypeF32(s), b = TypeBool(s), w = TypeScalarU64(s);
 	const uint32_t v4 = TypeU32Vector(s, 4), v3 = TypeF32Vector(s, 3);
 	uint32_t triangle_function = 0, boxes_function = 0, decompress_function = 0;
 
@@ -241,8 +243,15 @@ void Bvh8Emitter::DefineBoxes() {
 	const auto node = Choose(compressed, Or(Shl(prefix, 3), kind), direct_node);
 	const auto child_flags = Choose(compressed,
 	    And(packed(Add(C(41), Shl(child, 2)), 4), Choose(Eq(child, C(3)), C(7), C(15))), C(0));
-	const auto step = Choose(Eq(kind, C(2)), C(4),
-	    Choose(Either(Either(Eq(kind, C(3)), Eq(kind, C(5))), Eq(kind, C(6))), C(2), C(1)));
+	// GPURT DecodeHighPrecisionBoxNode (RTIP3): kind 2 (INVALID_TYPE_OF_HP) is an empty child that
+	// still takes one 64-byte slot; HP64x2 boxes (3) and instances (6) take two, all others one.
+	// KYTY_BVH8_HP_STEP_LEGACY=1: the earlier guess (kind 2 a valid child of four slots, 5 of two).
+	static const bool legacy_step = KYTY_GETENV("KYTY_BVH8_HP_STEP_LEGACY") != nullptr;
+	const auto step = legacy_step
+	    ? Choose(Eq(kind, C(2)), C(4),
+	          Choose(Either(Either(Eq(kind, C(3)), Eq(kind, C(5))), Eq(kind, C(6))), C(2), C(1)))
+	    : Choose(Either(Eq(kind, C(3)), Eq(kind, C(6))), C(2), C(1));
+	const auto hp_invalid = legacy_step ? ConstantBool(s, false) : Both(compressed, Eq(kind, C(2)));
 	const auto next_prefix = Add(prefix, step);
 	const auto bounds_type = s.builder.Type(spv::OpTypeStruct, v3, v3);
 	const auto box = EmitIndexSwitch(s, format, 3, bounds_type, [&](uint32_t encoding) {
@@ -274,7 +283,7 @@ void Bvh8Emitter::DefineBoxes() {
 	});
 	const auto lo_bound = Unpack3(Extract(v3, box, 0)), hi_bound = Unpack3(Extract(v3, box, 1));
 	Vec3 near, far;
-	auto valid = Not(Eq(And(child_flags, C(3)), C(3)));
+	auto valid = Both(Not(hp_invalid), Not(Eq(And(child_flags, C(3)), C(3))));
 	for (uint32_t axis = 0; axis < 3; ++axis) {
 		valid = Both(valid, Fcmp(spv::OpFOrdLessThanEqual, lo_bound[axis], hi_bound[axis]));
 		const auto lo = Fop(spv::OpFMul, Fop(spv::OpFSub, lo_bound[axis], org[axis]), inverse[axis]);
@@ -341,13 +350,13 @@ void Bvh8Emitter::DefineIntersect() {
 	const auto compressed = Both(Not(full), Bit(d[3], 20));
 	const auto flags = NormalizeFlags(Choose(Bit(d[3], 23),
 	    Unary(s, spv::OpUConvert, u, Binary(s, spv::OpShiftRightLogical, w, encoded_base, C(54))), C(0)));
-	const auto base = Binary(s, spv::OpShiftLeftLogical, w, PackU64(s, d[0], And(d[1], C(255))), C(8));
+	const auto base = Binary(s, spv::OpShiftLeftLogical, w, DeviceAddressFromWords(s, d[0], And(d[1], C(255))), C(8));
 	const auto lane_base = Binary(s, spv::OpShiftLeftLogical, w,
-	    Binary(s, spv::OpBitwiseAnd, w, encoded_base, ConstantU64(s, (uint64_t{1} << 54) - 1)), C(3));
+	    Binary(s, spv::OpBitwiseAnd, w, encoded_base, ConstantDeviceAddress(s, (uint64_t{1} << 54) - 1)), C(3));
 	const auto offset = Binary(s, spv::OpShiftLeftLogical, w, Unary(s, spv::OpUConvert, w, Shr(node, 3)), C(6));
 	const auto address = Binary(s, spv::OpIAdd, w, base, Binary(s, spv::OpIAdd, w, lane_base, offset));
 	const auto capacity = Binary(s, spv::OpIAdd, w,
-	    PackU64(s, d[2], And(d[3], C(0x3ff))), ConstantU64(s, 1));
+	    DeviceAddressFromWords(s, d[2], And(d[3], C(0x3ff))), ConstantDeviceAddress(s, 1));
 	const auto limit = Binary(s, spv::OpIAdd, w, base,
 	    Binary(s, spv::OpShiftLeftLogical, w, capacity, C(6)));
 	auto valid = Both(Eq(Shr(d[3], 28), C(8)),
@@ -361,19 +370,19 @@ void Bvh8Emitter::DefineIntersect() {
 	const auto opaque = Bit(flags, 0), nonopaque = Bit(flags, 1);
 	valid = Both(valid, Not(Either(Either(Both(opaque, Bit(flags, 6)), Both(nonopaque, Bit(flags, 7))),
 	    Both(Bit(flags, 6), Bit(flags, 7)))));
-	const auto fetch_size = Select(s, w, full, ConstantU64(s, 128), ConstantU64(s, 64));
+	const auto fetch_size = Select(s, w, full, ConstantDeviceAddress(s, 128), ConstantDeviceAddress(s, 64));
 	const auto fetch = [&](uint32_t at, uint32_t enabled) {
 		const auto end = Binary(s, spv::OpIAdd, w, at, fetch_size);
 		const auto in_bounds = Both(Binary(s, spv::OpULessThanEqual, b, end, limit),
-		    Binary(s, spv::OpULessThanEqual, b, end, ConstantU64(s, (uint64_t{1} << 48) - 1)));
+		    Binary(s, spv::OpULessThanEqual, b, end, ConstantDeviceAddress(s, (uint64_t{1} << 48) - 1)));
 		return EmitValueOrDefaultIfCondition(s, Both(Both(valid, enabled), in_bounds), w,
-		    ConstantU64(s, 0), [&] { return GetBdaPointer(s, at); });
+		    ConstantDeviceAddress(s, 0), [&] { return GetBdaPointer(s, at); });
 	};
 	const auto first = fetch(address, ConstantBool(s, true));
-	const auto present = [&](uint32_t pointer) { return Not(Binary(s, spv::OpIEqual, b, pointer, ConstantU64(s, 0))); };
+	const auto present = [&](uint32_t pointer) { return Not(Binary(s, spv::OpIEqual, b, pointer, ConstantDeviceAddress(s, 0))); };
 	const auto tail = [&](uint32_t at, uint32_t pointer) {
-		return EmitValueOrDefaultIfCondition(s, Both(full, present(pointer)), w, ConstantU64(s, 0), [&] {
-			return GetBdaPointer(s, Binary(s, spv::OpIAdd, w, at, ConstantU64(s, 64)));
+		return EmitValueOrDefaultIfCondition(s, Both(full, present(pointer)), w, ConstantDeviceAddress(s, 0), [&] {
+			return GetBdaPointer(s, Binary(s, spv::OpIAdd, w, at, ConstantDeviceAddress(s, 64)));
 		});
 	};
 	const auto second = tail(address, first);
@@ -468,7 +477,7 @@ void Bvh8Emitter::DefineIntersect() {
 } // namespace
 
 void DefineTrinityBvhIntersect(EmitterState& s) {
-	if (!s.program.info.bvh8) return;
+	if (!s.requirements.bvh8) return;
 	Bvh8Emitter e {s};
 	e.DefineDecompress();
 	e.DefineTriangle();
@@ -499,7 +508,7 @@ uint32_t EmitBvh8Intersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return e.Make(e.v3, Vec3{e.Float(ctx.Arg(*ray, first)), e.Float(ctx.Arg(*ray, first + 1)),
 		    e.Float(ctx.Arg(*ray, first + 2))});
 	};
-	const std::array args {ctx.Arg(inst, 0), PackU64(s, ctx.Arg(*ray, 0), ctx.Arg(*ray, 1)),
+	const std::array args {ctx.Arg(inst, 0), DeviceAddressFromWords(s, ctx.Arg(*ray, 0), ctx.Arg(*ray, 1)),
 	    ctx.Arg(*ray, 10), e.Float(ctx.Arg(*ray, 2)), ctx.Arg(*ray, 3), vector(4), vector(7)};
 	const auto type = TypeBvh8Result(s);
 	return EmitValueOrDefaultIfCondition(s, ctx.Arg(inst, 2), type,

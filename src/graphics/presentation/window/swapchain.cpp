@@ -4,14 +4,17 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/switches.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
+#include "gpu_blit_shaders/gpu_video_out_downscale_spv.h"
+#include "gpu_blit_shaders/gpu_video_out_fxaa_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
-#include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
@@ -20,9 +23,14 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cstdio>
+#include <deque>
 #include <atomic>
 #include <limits>
 #include <memory>
+#include <span>
+#include <string_view>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -33,6 +41,8 @@ namespace Libs::Graphics {
 struct Presenter::Frame {
 	VulkanImage   image;
 	vk::ImageView view         = nullptr;
+	// Every mip level, for the filtered presentation downscale (see PresentFilter).
+	vk::ImageView mips_view    = nullptr;
 	uint64_t      present_tick = 0;
 	bool          busy         = false;
 	bool          hdr          = false;
@@ -52,6 +62,7 @@ public:
 		m_scheduler.Wait(m_scheduler.CurrentTick() - 1);
 		for (auto& frame: m_frames) {
 			m_window.graphic_ctx.device.destroyImageView(frame->view, nullptr);
+			m_window.graphic_ctx.device.destroyImageView(frame->mips_view, nullptr);
 			if (frame->image.image != nullptr) {
 				m_window.graphic_ctx.DeleteImage(frame->image);
 			}
@@ -60,7 +71,13 @@ public:
 	KYTY_CLASS_NO_COPY(FramePool);
 
 	void Initialize(uint32_t count, vk::Format format) {
+		if (count == 0 || format == vk::Format::eUndefined) {
+			EXIT("prepared-frame pool requires at least one frame\n");
+		}
 		Common::LockGuard lock(m_mutex);
+		if (!m_frames.empty()) {
+			EXIT("prepared-frame pool was initialized twice\n");
+		}
 		m_format = format;
 		m_frames.reserve(count);
 		m_free.reserve(count);
@@ -72,17 +89,26 @@ public:
 	}
 
 	void SetFormat(vk::Format format) {
+		if (format == vk::Format::eUndefined) {
+			EXIT("prepared-frame pool requires a presentation format\n");
+		}
 		Common::LockGuard lock(m_mutex);
 		m_format = format;
 	}
 
 	vk::Format GetFormat() {
 		Common::LockGuard lock(m_mutex);
+		if (m_format == vk::Format::eUndefined) {
+			EXIT("prepared-frame pool has no presentation format\n");
+		}
 		return m_format;
 	}
 
 	Presenter::Frame* Acquire(vk::Extent2D extent, vk::Format format) {
 		m_mutex.Lock();
+		if (m_frames.empty()) {
+			EXIT("prepared-frame pool was used before swapchain initialization\n");
+		}
 		// A synchronized flip may need more frames than the swapchain has images.
 		// Queue capacity bounds growth; waiting here can prevent its master from recording.
 		if (m_free.empty()) {
@@ -99,14 +125,27 @@ public:
 			*compatible = m_free.back();
 		}
 		m_free.pop_back();
+		if (frame->busy) {
+			EXIT("prepared-frame pool returned an invalid frame\n");
+		}
 		frame->busy = true;
 		m_mutex.Unlock();
 
-		m_scheduler.Wait(frame->present_tick);
+		WaitForFrame(*frame);
 		return frame;
 	}
 
+	void ValidateForPresent(Presenter::Frame* frame) {
+		Common::LockGuard lock(m_mutex);
+		if (frame == nullptr || !frame->busy) {
+			EXIT("prepared frame has invalid presentation ownership\n");
+		}
+	}
+
 	void Release(Presenter::Frame* frame) {
+		if (frame == nullptr) {
+			EXIT("cannot release a null prepared frame\n");
+		}
 		Common::LockGuard lock(m_mutex);
 		if (!frame->busy) {
 			EXIT("prepared frame was released twice\n");
@@ -116,6 +155,11 @@ public:
 	}
 
 private:
+	void WaitForFrame(Presenter::Frame& frame) {
+		DrainStats::ReasonScope reason(DrainStats::Reason::PresentFrame);
+		m_scheduler.Wait(frame.present_tick);
+	}
+
 	WindowContext&                                 m_window;
 	CommandScheduler&                              m_scheduler;
 	Common::Mutex                                  m_mutex;
@@ -148,15 +192,21 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 
 	if (dst.image != nullptr) {
 		graphics.device.destroyImageView(view, nullptr);
-		view = nullptr;
+		graphics.device.destroyImageView(mips_view, nullptr);
+		view      = nullptr;
+		mips_view = nullptr;
 		graphics.DeleteImage(dst);
 	}
 
+	// The mip chain lets presentation shrink the frame without aliasing (see
+	// PresentSourceLevel). Without blit-destination support, frames present from level 0 only.
+	const bool mips = static_cast<bool>(features & vk::FormatFeatureFlagBits::eBlitDst);
 	vk::ImageCreateInfo create {};
 	create.sType         = vk::StructureType::eImageCreateInfo;
 	create.imageType     = vk::ImageType::e2D;
 	create.extent        = {extent.width, extent.height, 1};
-	create.mipLevels     = 1;
+	create.mipLevels =
+	    mips ? static_cast<uint32_t>(std::bit_width(std::max(extent.width, extent.height))) : 1u;
 	create.arrayLayers   = 1;
 	create.format        = format;
 	create.tiling        = vk::ImageTiling::eOptimal;
@@ -203,6 +253,7 @@ void Presenter::Frame::Transit(vk::CommandBuffer command, vk::ImageLayout layout
 	dependency.pImageMemoryBarriers    = &barrier;
 	command.pipelineBarrier2(dependency);
 	image.state = {stage, access, layout};
+	image.subresource_states.clear();
 }
 
 void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
@@ -219,6 +270,278 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
 	                  vk::ImageLayout::eTransferDstOptimal, copy);
+}
+
+static vk::Extent2D MipExtent(vk::Extent2D extent, uint32_t level) {
+	return {std::max(extent.width >> level, 1u), std::max(extent.height >> level, 1u)};
+}
+
+uint32_t PresentSourceLevel(vk::Extent2D source, vk::Extent2D target, uint32_t levels) noexcept {
+	uint32_t level = 0;
+	for (; level + 1 < levels; level++) {
+		const auto extent = MipExtent(source, level);
+		if (extent.width <= 2ull * target.width && extent.height <= 2ull * target.height) {
+			break;
+		}
+	}
+	return level;
+}
+
+vk::Rect2D PresentRect(vk::Extent2D source, vk::Extent2D target) noexcept {
+	// KYTY_PRESENT_STRETCH=1 fills the window like before (the frame's aspect ratio is lost).
+	static const bool stretch = [] {
+		const char* value = KYTY_GETENV("KYTY_PRESENT_STRETCH");
+		return value != nullptr && std::string_view(value) != "0";
+	}();
+	if (stretch || source.width == 0 || source.height == 0 || target.width == 0 ||
+	    target.height == 0) {
+		return {{0, 0}, target};
+	}
+	const uint64_t sw = source.width, sh = source.height, tw = target.width, th = target.height;
+	vk::Extent2D   fit = target;
+	if (sw * th >= tw * sh) {
+		// Wider than the window: full width, bars above and below.
+		fit.height = static_cast<uint32_t>(std::max<uint64_t>(1, (tw * sh + sw / 2) / sw));
+	} else {
+		fit.width = static_cast<uint32_t>(std::max<uint64_t>(1, (th * sw + sh / 2) / sh));
+	}
+	return {{static_cast<int32_t>((target.width - fit.width) / 2),
+	         static_cast<int32_t>((target.height - fit.height) / 2)},
+	        fit};
+}
+
+void RecordPresentDownscale(vk::CommandBuffer command, vk::Image image, vk::Extent2D extent,
+                            uint32_t level) {
+	for (uint32_t mip = 1; mip <= level; mip++) {
+		// Undefined discards the level; the transfer-stage source scope orders this write after
+		// an earlier presentation's read of it.
+		vk::ImageMemoryBarrier2 barrier {};
+		barrier.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+		barrier.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+		barrier.oldLayout           = vk::ImageLayout::eUndefined;
+		barrier.newLayout           = vk::ImageLayout::eTransferDstOptimal;
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.image               = image;
+		barrier.subresourceRange    = {vk::ImageAspectFlagBits::eColor, mip, 1, 0, 1};
+		vk::DependencyInfo dependency {};
+		dependency.imageMemoryBarrierCount = 1;
+		dependency.pImageMemoryBarriers    = &barrier;
+		command.pipelineBarrier2(dependency);
+
+		const auto  source      = MipExtent(extent, mip - 1);
+		const auto  destination = MipExtent(extent, mip);
+		vk::ImageBlit region {};
+		region.srcSubresource = {vk::ImageAspectFlagBits::eColor, mip - 1, 0, 1};
+		region.srcOffsets[1]  = vk::Offset3D {static_cast<int32_t>(source.width),
+		                                      static_cast<int32_t>(source.height), 1};
+		region.dstSubresource = {vk::ImageAspectFlagBits::eColor, mip, 0, 1};
+		region.dstOffsets[1]  = vk::Offset3D {static_cast<int32_t>(destination.width),
+		                                      static_cast<int32_t>(destination.height), 1};
+		command.blitImage(image, vk::ImageLayout::eTransferSrcOptimal, image,
+		                  vk::ImageLayout::eTransferDstOptimal, 1, &region, vk::Filter::eLinear);
+
+		barrier.srcAccessMask = vk::AccessFlagBits2::eTransferWrite;
+		barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+		barrier.oldLayout     = vk::ImageLayout::eTransferDstOptimal;
+		barrier.newLayout     = vk::ImageLayout::eTransferSrcOptimal;
+		command.pipelineBarrier2(dependency);
+	}
+}
+
+// A pipeline that draws the fullscreen triangle with `fragment` into one `format` attachment,
+// optionally blending premultiplied alpha over it.
+static vk::Pipeline CreateFullscreenPipeline(vk::Device device, vk::PipelineLayout layout,
+                                             std::span<const uint32_t> fragment_code,
+                                             vk::Format format, bool blend_over) {
+	const auto vertex   = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, device);
+	const auto fragment = CompileSPV(fragment_code, device);
+	std::array<vk::PipelineShaderStageCreateInfo, 2> stages {};
+	stages[0].stage  = vk::ShaderStageFlagBits::eVertex;
+	stages[0].module = vertex;
+	stages[0].pName  = "main";
+	stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
+	stages[1].module = fragment;
+	stages[1].pName  = "main";
+	vk::PipelineVertexInputStateCreateInfo   vertex_input {};
+	vk::PipelineInputAssemblyStateCreateInfo assembly {};
+	assembly.topology = vk::PrimitiveTopology::eTriangleList;
+	vk::PipelineViewportStateCreateInfo viewport {};
+	viewport.viewportCount = 1;
+	viewport.scissorCount  = 1;
+	vk::PipelineRasterizationStateCreateInfo rasterization {};
+	rasterization.lineWidth = 1.0f;
+	vk::PipelineMultisampleStateCreateInfo multisample {};
+	multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
+	vk::PipelineColorBlendAttachmentState attachment {};
+	attachment.blendEnable         = blend_over ? VK_TRUE : VK_FALSE;
+	attachment.srcColorBlendFactor = vk::BlendFactor::eOne;
+	attachment.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+	attachment.srcAlphaBlendFactor = vk::BlendFactor::eOne;
+	attachment.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+	attachment.colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+	                            vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+	vk::PipelineColorBlendStateCreateInfo blend {};
+	blend.attachmentCount = 1;
+	blend.pAttachments    = &attachment;
+	const std::array dynamic_states {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+	vk::PipelineDynamicStateCreateInfo dynamic {};
+	dynamic.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
+	dynamic.pDynamicStates    = dynamic_states.data();
+	vk::PipelineRenderingCreateInfo rendering {};
+	rendering.colorAttachmentCount    = 1;
+	rendering.pColorAttachmentFormats = &format;
+	vk::GraphicsPipelineCreateInfo create {};
+	create.pNext               = &rendering;
+	create.stageCount          = static_cast<uint32_t>(stages.size());
+	create.pStages             = stages.data();
+	create.pVertexInputState   = &vertex_input;
+	create.pInputAssemblyState = &assembly;
+	create.pViewportState      = &viewport;
+	create.pRasterizationState = &rasterization;
+	create.pMultisampleState   = &multisample;
+	create.pColorBlendState    = &blend;
+	create.pDynamicState       = &dynamic;
+	create.layout              = layout;
+	vk::Pipeline pipeline      = nullptr;
+	RequireVulkanSuccess(device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &pipeline),
+	                     "create video-out fullscreen pipeline");
+	device.destroyShaderModule(fragment, nullptr);
+	device.destroyShaderModule(vertex, nullptr);
+	return pipeline;
+}
+
+// A combined image sampler at binding 0, pushed per draw.
+static vk::DescriptorSetLayout CreatePushedSamplerLayout(vk::Device device) {
+	const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eCombinedImageSampler, 1,
+	                                              vk::ShaderStageFlagBits::eFragment};
+	vk::DescriptorSetLayoutCreateInfo    descriptors {};
+	descriptors.flags              = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
+	descriptors.bindingCount       = 1;
+	descriptors.pBindings          = &binding;
+	vk::DescriptorSetLayout layout = nullptr;
+	RequireVulkanSuccess(device.createDescriptorSetLayout(&descriptors, nullptr, &layout),
+	                     "create video-out descriptor layout");
+	return layout;
+}
+
+bool PresentNeedsFilter(vk::Extent2D source, vk::Extent2D target) noexcept {
+	const bool shrinks = source.width > target.width || source.height > target.height;
+	const bool halves =
+	    source.width == 2ull * target.width && source.height == 2ull * target.height;
+	return shrinks && !halves && source.width <= 2ull * target.width &&
+	       source.height <= 2ull * target.height;
+}
+
+void PresentFilter::Record(vk::Device device, vk::CommandBuffer command, vk::ImageView source_view,
+                           uint32_t level, vk::Extent2D source, vk::ImageView target_view,
+                           vk::Format target_format, vk::Extent2D target_extent,
+                           vk::Rect2D target, bool fxaa) {
+	struct Constants {
+		int32_t  size[2];
+		float    scale[2];
+		uint32_t level;
+		uint32_t pad;
+		int32_t  offset[2];
+	};
+	static_assert(sizeof(Constants) == 32);
+	if (m_layout == nullptr) {
+		vk::SamplerCreateInfo sampler {};
+		sampler.magFilter    = vk::Filter::eLinear;
+		sampler.minFilter    = vk::Filter::eLinear;
+		sampler.mipmapMode   = vk::SamplerMipmapMode::eNearest;
+		sampler.addressModeU = vk::SamplerAddressMode::eClampToEdge;
+		sampler.addressModeV = vk::SamplerAddressMode::eClampToEdge;
+		sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
+		sampler.maxLod       = VK_LOD_CLAMP_NONE;
+		RequireVulkanSuccess(device.createSampler(&sampler, nullptr, &m_sampler),
+		                     "create video-out downscale sampler");
+		m_descriptors = CreatePushedSamplerLayout(device);
+		const vk::PushConstantRange  constants {vk::ShaderStageFlagBits::eFragment, 0,
+		                                        sizeof(Constants)};
+		vk::PipelineLayoutCreateInfo layout {};
+		layout.setLayoutCount         = 1;
+		layout.pSetLayouts            = &m_descriptors;
+		layout.pushConstantRangeCount = 1;
+		layout.pPushConstantRanges    = &constants;
+		RequireVulkanSuccess(device.createPipelineLayout(&layout, nullptr, &m_layout),
+		                     "create video-out downscale pipeline layout");
+	}
+	if (m_format != target_format) {
+		device.destroyPipeline(m_pipeline, nullptr);
+		device.destroyPipeline(m_fxaa, nullptr);
+		m_pipeline = nullptr;
+		m_fxaa     = nullptr;
+		m_format   = target_format;
+	}
+	auto& pipeline = fxaa ? m_fxaa : m_pipeline;
+	if (pipeline == nullptr) {
+		pipeline = CreateFullscreenPipeline(
+		    device, m_layout,
+		    fxaa ? std::span<const uint32_t>(GPU_VIDEO_OUT_FXAA_SPV)
+		         : std::span<const uint32_t>(GPU_VIDEO_OUT_DOWNSCALE_SPV),
+		    target_format, false);
+	}
+
+	const vk::DescriptorImageInfo image {m_sampler, source_view,
+	                                     vk::ImageLayout::eShaderReadOnlyOptimal};
+	vk::WriteDescriptorSet        write {};
+	write.dstBinding      = 0;
+	write.descriptorCount = 1;
+	write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
+	write.pImageInfo      = &image;
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_layout, 0, 1, &write);
+	const Constants constants {
+	    {static_cast<int32_t>(source.width), static_cast<int32_t>(source.height)},
+	    {static_cast<float>(source.width) / static_cast<float>(target.extent.width),
+		 static_cast<float>(source.height) / static_cast<float>(target.extent.height)},
+	    level,
+	    0,
+	    {target.offset.x, target.offset.y}};
+	command.pushConstants(m_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(constants),
+	                      &constants);
+	command.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+	vk::RenderingAttachmentInfo attachment {};
+	attachment.imageView   = target_view;
+	attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	// A letterboxed frame clears the bars: the render area is the whole image, the draw is
+	// scissored to the frame.
+	const bool clear = target.offset.x != 0 || target.offset.y != 0 ||
+	                   target.extent.width != target_extent.width ||
+	                   target.extent.height != target_extent.height;
+	attachment.loadOp      = clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eDontCare;
+	attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+	attachment.clearValue.color = vk::ClearColorValue {};
+	vk::RenderingInfo rendering {};
+	rendering.renderArea.extent    = target_extent;
+	rendering.layerCount           = 1;
+	rendering.colorAttachmentCount = 1;
+	rendering.pColorAttachments    = &attachment;
+	command.beginRendering(&rendering);
+	const vk::Viewport viewport {
+	    static_cast<float>(target.offset.x),     static_cast<float>(target.offset.y),
+	    static_cast<float>(target.extent.width), static_cast<float>(target.extent.height),
+	    0.0f,                                    1.0f};
+	const vk::Rect2D scissor = target;
+	command.setViewport(0, 1, &viewport);
+	command.setScissor(0, 1, &scissor);
+	command.draw(3, 1, 0, 0);
+	command.endRendering();
+}
+
+void PresentFilter::Release(vk::Device device) {
+	device.destroyPipeline(m_pipeline, nullptr);
+	device.destroyPipeline(m_fxaa, nullptr);
+	device.destroyPipelineLayout(m_layout, nullptr);
+	device.destroyDescriptorSetLayout(m_descriptors, nullptr);
+	device.destroySampler(m_sampler, nullptr);
+	m_pipeline    = nullptr;
+	m_fxaa        = nullptr;
+	m_layout      = nullptr;
+	m_descriptors = nullptr;
+	m_sampler     = nullptr;
+	m_format      = vk::Format::eUndefined;
 }
 
 void Presenter::Frame::Clear(CommandBuffer& command_buffer, const vk::ClearColorValue& color) {
@@ -261,8 +584,7 @@ public:
 private:
 	vk::SurfaceFormatKHR SelectFormat();
 	void Destroy();
-	void DrawLayer(vk::CommandBuffer command, const Presenter::Layer& layer,
-	               const vk::Rect2D& rect);
+	void DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer, vk::Rect2D target);
 
 	WindowContext&   m_window;
 	vk::SwapchainKHR m_handle = nullptr;
@@ -283,7 +605,8 @@ private:
 	vk::PipelineLayout             m_overlay_layout      = nullptr;
 	vk::Pipeline                   m_overlay_pipeline    = nullptr;
 	vk::Sampler                    m_overlay_sampler     = nullptr;
-	uint32_t                       m_image_index         = 0;
+	PresentFilter                  m_filter;
+	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
 };
 
@@ -291,6 +614,7 @@ struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
+		EXIT_IF(owner.render_context == nullptr);
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
 	}
@@ -323,7 +647,8 @@ struct Presenter::Impl {
 		cache.UpdateImage(image_id);
 		return image;
 	}
-	void Present();
+	// new_frame is false when the last frame is shown again (the title counts only new ones).
+	void Present(bool new_frame = true);
 
 	RenderContext&        renderer;
 	WindowContext&        window;
@@ -487,6 +812,8 @@ void Swapchain::Create() {
 		    graphics.device.createSemaphore(&semaphore_info, nullptr, &m_render_complete[i]),
 		    "create swapchain render-complete semaphore");
 	}
+	m_image_index = static_cast<uint32_t>(-1);
+	m_frame_index = 0;
 }
 
 Swapchain::~Swapchain() {
@@ -515,6 +842,7 @@ void Swapchain::Destroy() {
 	m_overlay_layout      = nullptr;
 	m_overlay_descriptors = nullptr;
 	m_overlay_sampler     = nullptr;
+	m_filter.Release(graphics.device);
 
 	for (const auto semaphore: m_image_acquired) {
 		if (semaphore != nullptr) {
@@ -539,6 +867,7 @@ void Swapchain::Destroy() {
 	m_format        = vk::Format::eUndefined;
 	m_extent        = {};
 	m_window_extent = {};
+	m_image_index   = static_cast<uint32_t>(-1);
 	m_frame_index   = 0;
 	m_images.clear();
 	m_image_views.clear();
@@ -570,9 +899,11 @@ bool Swapchain::NeedsResize() const {
 }
 
 Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
+	EXIT_IF(m_handle == nullptr || m_frame_index >= m_image_acquired.size());
 	// Repeated frames can wrap the semaphore ring without acquiring a new source frame.
 	// Wait for the submission that consumed this slot before signaling it again.
 	scheduler.Wait(m_image_acquired_ticks[m_frame_index]);
+	m_image_index     = static_cast<uint32_t>(-1);
 	const auto result = m_window.graphic_ctx.device.acquireNextImageKHR(
 	    m_handle, std::numeric_limits<uint64_t>::max(), m_image_acquired[m_frame_index], nullptr,
 	    &m_image_index);
@@ -592,6 +923,7 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 			return Status::SurfaceLost;
 		default: EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
 	}
+	EXIT_IF(m_image_index >= m_images.size());
 	return Status::Success;
 }
 
@@ -602,23 +934,8 @@ bool Swapchain::PrepareSystemOverlay() {
 	return m_system_overlay->PrepareFrame(m_extent, m_format, ImageCount());
 }
 
-static vk::Rect2D FitAspect(const vk::Extent3D& source, const vk::Extent2D& target) {
-	const uint64_t src_w = std::max(source.width, 1u);
-	const uint64_t src_h = std::max(source.height, 1u);
-	uint32_t       w     = target.width;
-	uint32_t       h     = target.height;
-	if (src_w * h > src_h * w) {
-		h = std::max<uint32_t>(1, static_cast<uint32_t>(src_h * w / src_w));
-	} else {
-		w = std::max<uint32_t>(1, static_cast<uint32_t>(src_w * h / src_h));
-	}
-	return {{static_cast<int32_t>((target.width - w) / 2),
-	         static_cast<int32_t>((target.height - h) / 2)},
-	        {w, h}};
-}
-
-void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& layer,
-                          const vk::Rect2D& rect) {
+void Swapchain::DrawOverlay(vk::CommandBuffer command, const Presenter::Layer& layer,
+                            vk::Rect2D target) {
 	auto device = m_window.graphic_ctx.device;
 	if (m_overlay_pipeline == nullptr) {
 		vk::SamplerCreateInfo sampler {};
@@ -629,15 +946,7 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 		sampler.addressModeW = vk::SamplerAddressMode::eClampToEdge;
 		RequireVulkanSuccess(device.createSampler(&sampler, nullptr, &m_overlay_sampler),
 		                     "create video-out overlay sampler");
-		const vk::DescriptorSetLayoutBinding binding {0, vk::DescriptorType::eCombinedImageSampler,
-		                                              1, vk::ShaderStageFlagBits::eFragment};
-		vk::DescriptorSetLayoutCreateInfo    descriptors {};
-		descriptors.flags        = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR;
-		descriptors.bindingCount = 1;
-		descriptors.pBindings    = &binding;
-		RequireVulkanSuccess(
-		    device.createDescriptorSetLayout(&descriptors, nullptr, &m_overlay_descriptors),
-		    "create video-out overlay descriptor layout");
+		m_overlay_descriptors = CreatePushedSamplerLayout(device);
 		const vk::PushConstantRange alpha {vk::ShaderStageFlagBits::eFragment, 0, sizeof(uint32_t)};
 		vk::PipelineLayoutCreateInfo layout {};
 		layout.setLayoutCount         = 1;
@@ -646,61 +955,8 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 		layout.pPushConstantRanges    = &alpha;
 		RequireVulkanSuccess(device.createPipelineLayout(&layout, nullptr, &m_overlay_layout),
 		                     "create video-out overlay pipeline layout");
-		const auto vertex   = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, device);
-		const auto fragment = CompileSPV(GPU_VIDEO_OUT_OVERLAY_SPV, device);
-		std::array<vk::PipelineShaderStageCreateInfo, 2> stages {};
-		stages[0].stage  = vk::ShaderStageFlagBits::eVertex;
-		stages[0].module = vertex;
-		stages[0].pName  = "main";
-		stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
-		stages[1].module = fragment;
-		stages[1].pName  = "main";
-		vk::PipelineVertexInputStateCreateInfo   vertex_input {};
-		vk::PipelineInputAssemblyStateCreateInfo assembly {};
-		assembly.topology = vk::PrimitiveTopology::eTriangleList;
-		vk::PipelineViewportStateCreateInfo viewport {};
-		viewport.viewportCount = 1;
-		viewport.scissorCount  = 1;
-		vk::PipelineRasterizationStateCreateInfo rasterization {};
-		rasterization.lineWidth = 1.0f;
-		vk::PipelineMultisampleStateCreateInfo multisample {};
-		multisample.rasterizationSamples = vk::SampleCountFlagBits::e1;
-		vk::PipelineColorBlendAttachmentState attachment {};
-		attachment.blendEnable         = VK_TRUE;
-		attachment.srcColorBlendFactor = vk::BlendFactor::eOne;
-		attachment.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
-		attachment.srcAlphaBlendFactor = vk::BlendFactor::eOne;
-		attachment.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
-		attachment.colorWriteMask = vk::ColorComponentFlagBits::eR |
-		                            vk::ColorComponentFlagBits::eG |
-		                            vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
-		vk::PipelineColorBlendStateCreateInfo blend {};
-		blend.attachmentCount = 1;
-		blend.pAttachments    = &attachment;
-		const std::array dynamic_states {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
-		vk::PipelineDynamicStateCreateInfo dynamic {};
-		dynamic.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
-		dynamic.pDynamicStates    = dynamic_states.data();
-		vk::PipelineRenderingCreateInfo rendering {};
-		rendering.colorAttachmentCount    = 1;
-		rendering.pColorAttachmentFormats = &m_format;
-		vk::GraphicsPipelineCreateInfo create {};
-		create.pNext               = &rendering;
-		create.stageCount          = static_cast<uint32_t>(stages.size());
-		create.pStages             = stages.data();
-		create.pVertexInputState   = &vertex_input;
-		create.pInputAssemblyState = &assembly;
-		create.pViewportState      = &viewport;
-		create.pRasterizationState = &rasterization;
-		create.pMultisampleState   = &multisample;
-		create.pColorBlendState    = &blend;
-		create.pDynamicState       = &dynamic;
-		create.layout              = m_overlay_layout;
-		RequireVulkanSuccess(
-		    device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &m_overlay_pipeline),
-		    "create video-out overlay pipeline");
-		device.destroyShaderModule(fragment, nullptr);
-		device.destroyShaderModule(vertex, nullptr);
+		m_overlay_pipeline = CreateFullscreenPipeline(device, m_overlay_layout,
+		                                              GPU_VIDEO_OUT_OVERLAY_SPV, m_format, true);
 	}
 	auto& frame = *layer.frame;
 	if (frame.view == nullptr) {
@@ -720,11 +976,9 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 	write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
 	write.pImageInfo      = &image;
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_overlay_layout, 0, 1, &write);
-	// The main bus ignores alpha.
-	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) | (m_hdr_active ? 2u : 0u) |
-	                       (frame.hdr ? 4u : 0u) |
-	                       (frame.image.format == vk::Format::eR16G16B16A16Sfloat ? 8u : 0u) |
-	                       (layer.bus == 0 ? 16u : 0u);
+	const uint32_t flags = (layer.premultiplied_alpha ? 1u : 0u) |
+	                       (m_hdr_active ? 2u : 0u) | (frame.hdr ? 4u : 0u) |
+	                       (frame.image.format == vk::Format::eR16G16B16A16Sfloat ? 8u : 0u);
 	command.pushConstants(m_overlay_layout, vk::ShaderStageFlagBits::eFragment, 0,
 	                      sizeof(flags), &flags);
 	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_overlay_pipeline);
@@ -739,43 +993,99 @@ void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& lay
 	rendering.colorAttachmentCount = 1;
 	rendering.pColorAttachments    = &attachment;
 	command.beginRendering(&rendering);
-	const vk::Viewport viewport {static_cast<float>(rect.offset.x),
-	                             static_cast<float>(rect.offset.y),
-	                             static_cast<float>(rect.extent.width),
-	                             static_cast<float>(rect.extent.height),
-	                             0.0f,
-	                             1.0f};
+	// The overlay layer covers the same letterboxed rectangle as the frame.
+	const vk::Viewport viewport {
+	    static_cast<float>(target.offset.x),     static_cast<float>(target.offset.y),
+	    static_cast<float>(target.extent.width), static_cast<float>(target.extent.height),
+	    0.0f,                                    1.0f};
+	const vk::Rect2D scissor = target;
 	command.setViewport(0, 1, &viewport);
-	command.setScissor(0, 1, &rect);
+	command.setScissor(0, 1, &scissor);
 	command.draw(3, 1, 0, 0);
 	command.endRendering();
 }
 
 void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* source,
                                       const Presenter::Layer& overlay, bool draw_system_overlay) {
+	EXIT_IF(m_image_index >= m_images.size());
 	auto       vk_command      = command.Handle();
-	const bool convert_source  = source != nullptr && source->hdr && !m_hdr_active;
-	const bool blit_source     = source != nullptr && !convert_source;
+	// The overlays bind their own graphics pipelines and dynamic state.
+	command.InvalidateGraphicsState();
 	const bool draw_overlay    = overlay.frame != nullptr;
-	const bool draw_attachment = convert_source || draw_overlay || draw_system_overlay;
-	if (blit_source) {
+	const bool draw_attachment = draw_overlay || draw_system_overlay;
+	if (source != nullptr) {
 		source->Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal,
 		                vk::AccessFlagBits2::eTransferRead);
-	}
-	if (convert_source) {
-		source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
-		                vk::AccessFlagBits2::eShaderRead);
 	}
 	if (draw_overlay) {
 		overlay.frame->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
 		                       vk::AccessFlagBits2::eShaderRead);
 	}
 
+	// A large frame shrinks through its mip chain first, so the final blit never skips source
+	// texels (see PresentSourceLevel). Shrinking by less than 2x draws with PresentFilter.
+	// The frame keeps its aspect ratio inside the window; the bars around it are black.
+	vk::Rect2D target {{0, 0}, m_extent};
+	if (source != nullptr) {
+		target = PresentRect({source->image.extent.width, source->image.extent.height}, m_extent);
+	} else if (draw_overlay) {
+		target = PresentRect(
+		    {overlay.frame->image.extent.width, overlay.frame->image.extent.height}, m_extent);
+	}
+	const bool   bars         = target.offset.x != 0 || target.offset.y != 0;
+	// One log line per change of the shown rectangle (window resized, frame size changed).
+	static vk::Rect2D   logged_target {};
+	static vk::Extent2D logged_window {};
+	if (target.offset.x != logged_target.offset.x || target.offset.y != logged_target.offset.y ||
+	    target.extent.width != logged_target.extent.width ||
+	    target.extent.height != logged_target.extent.height ||
+	    m_extent.width != logged_window.width || m_extent.height != logged_window.height) {
+		logged_target = target;
+		logged_window = m_extent;
+		// printf, not LOGF: the test runs silence the log; flushed so a redirected stdout shows it.
+		KYTY_INTERNAL_PRINTF("Presentation: frame shown at %ux%u offset (%d,%d) in the %ux%u window%s\n",
+		                     target.extent.width, target.extent.height, target.offset.x,
+		                     target.offset.y, m_extent.width, m_extent.height,
+		                     bars ? " (black bars)" : "");
+		std::fflush(stdout);
+	}
+	uint32_t     source_level = 0;
+	vk::Extent2D blit_extent {};
+	bool         filtered = false;
+	bool         fxaa     = false;
+	if (source != nullptr) {
+		const vk::Extent2D source_extent {source->image.extent.width, source->image.extent.height};
+		source_level = PresentSourceLevel(source_extent, target.extent, source->image.mip_levels);
+		RecordPresentDownscale(vk_command, source->image.image, source_extent, source_level);
+		blit_extent = MipExtent(source_extent, source_level);
+		// FXAA draws every frame through the filter, at any scale the filter takes.
+		fxaa        = Config::FxaaEnabled() && blit_extent.width <= 2u * target.extent.width &&
+		              blit_extent.height <= 2u * target.extent.height;
+		filtered    = fxaa || PresentNeedsFilter(blit_extent, target.extent);
+		if (filtered) {
+			if (source->mips_view == nullptr) {
+				vk::ImageViewCreateInfo view {};
+				view.image            = source->image.image;
+				view.viewType         = vk::ImageViewType::e2D;
+				view.format           = source->image.format;
+				view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0,
+				                         source->image.mip_levels, 0, 1};
+				RequireVulkanSuccess(
+				    m_window.graphic_ctx.device.createImageView(&view, nullptr, &source->mips_view),
+				    "create presentation source view");
+			}
+			source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
+			                vk::AccessFlagBits2::eShaderRead);
+		}
+	}
+
 	vk::ImageMemoryBarrier to_transfer {};
-	to_transfer.sType                           = vk::StructureType::eImageMemoryBarrier;
-	to_transfer.dstAccessMask                   = vk::AccessFlagBits::eTransferWrite;
-	to_transfer.oldLayout                       = vk::ImageLayout::eUndefined;
-	to_transfer.newLayout                       = vk::ImageLayout::eTransferDstOptimal;
+	to_transfer.sType = vk::StructureType::eImageMemoryBarrier;
+	to_transfer.dstAccessMask =
+	    filtered ? vk::AccessFlagBits::eColorAttachmentWrite : vk::AccessFlagBits::eTransferWrite;
+	to_transfer.oldLayout = vk::ImageLayout::eUndefined;
+	to_transfer.newLayout =
+	    filtered ? vk::ImageLayout::eColorAttachmentOptimal : vk::ImageLayout::eTransferDstOptimal;
 	to_transfer.srcQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 	to_transfer.dstQueueFamilyIndex             = VK_QUEUE_FAMILY_IGNORED;
 	to_transfer.image                           = m_images[m_image_index];
@@ -785,58 +1095,65 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	to_transfer.subresourceRange.baseArrayLayer = 0;
 	to_transfer.subresourceRange.layerCount     = 1;
 	// Match the acquire wait stage so the layout transition cannot precede acquisition.
-	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {}, 0,
-	                           nullptr, 0, nullptr, 1, &to_transfer);
+	const auto write_stage = filtered ? vk::PipelineStageFlagBits::eColorAttachmentOutput
+	                                  : vk::PipelineStageFlagBits::eTransfer;
+	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, write_stage,
+	                           vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 1, &to_transfer);
 
-	const auto* aspect_source = source != nullptr ? source : overlay.frame;
-	const auto  game_rect     = !Config::StretchEnabled() && aspect_source != nullptr
-	                               ? FitAspect(aspect_source->image.extent, m_extent)
-	                               : vk::Rect2D {{0, 0}, m_extent};
-	if (source == nullptr || game_rect.extent != m_extent) {
-		const vk::ClearColorValue black {};
-		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
-		                           &black, 1, &to_transfer.subresourceRange);
-		if (blit_source) {
-			vk::ImageMemoryBarrier after_clear = to_transfer;
-			after_clear.srcAccessMask          = vk::AccessFlagBits::eTransferWrite;
-			after_clear.oldLayout              = vk::ImageLayout::eTransferDstOptimal;
+	if (filtered) {
+		m_filter.Record(m_window.graphic_ctx.device, vk_command, source->mips_view, source_level,
+		                blit_extent, m_image_views[m_image_index], m_format, m_extent, target,
+		                fxaa);
+	} else if (source != nullptr) {
+		if (bars) {
+			// Black bars, then the frame; the barrier orders the two transfer writes.
+			const vk::ClearColorValue black {};
+			vk_command.clearColorImage(m_images[m_image_index],
+			                           vk::ImageLayout::eTransferDstOptimal, &black, 1,
+			                           &to_transfer.subresourceRange);
+			vk::ImageMemoryBarrier cleared = to_transfer;
+			cleared.srcAccessMask          = vk::AccessFlagBits::eTransferWrite;
+			cleared.dstAccessMask          = vk::AccessFlagBits::eTransferWrite;
+			cleared.oldLayout              = vk::ImageLayout::eTransferDstOptimal;
+			cleared.newLayout              = vk::ImageLayout::eTransferDstOptimal;
 			vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-			                           vk::PipelineStageFlagBits::eTransfer,
-			                           vk::DependencyFlags {}, 0, nullptr, 0, nullptr, 1,
-			                           &after_clear);
+			                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlags {},
+			                           0, nullptr, 0, nullptr, 1, &cleared);
 		}
-	}
-	if (blit_source) {
 		vk::ImageBlit region {};
 		region.srcSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
-		region.srcSubresource.mipLevel       = 0;
+		region.srcSubresource.mipLevel       = source_level;
 		region.srcSubresource.baseArrayLayer = 0;
 		region.srcSubresource.layerCount     = 1;
-		region.srcOffsets[1].x               = static_cast<int>(source->image.extent.width);
-		region.srcOffsets[1].y               = static_cast<int>(source->image.extent.height);
+		region.srcOffsets[1].x               = static_cast<int>(blit_extent.width);
+		region.srcOffsets[1].y               = static_cast<int>(blit_extent.height);
 		region.srcOffsets[1].z               = 1;
 		region.dstSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
 		region.dstSubresource.mipLevel       = 0;
 		region.dstSubresource.baseArrayLayer = 0;
 		region.dstSubresource.layerCount     = 1;
-		region.dstOffsets[0].x = game_rect.offset.x;
-		region.dstOffsets[0].y = game_rect.offset.y;
-		region.dstOffsets[1].x = game_rect.offset.x + static_cast<int>(game_rect.extent.width);
-		region.dstOffsets[1].y = game_rect.offset.y + static_cast<int>(game_rect.extent.height);
-		region.dstOffsets[1].z               = 1;
+		region.dstOffsets[0].x               = target.offset.x;
+		region.dstOffsets[0].y               = target.offset.y;
+		region.dstOffsets[1].x = target.offset.x + static_cast<int>(target.extent.width);
+		region.dstOffsets[1].y = target.offset.y + static_cast<int>(target.extent.height);
+		region.dstOffsets[1].z = 1;
 		vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
 		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
 		                     &region, vk::Filter::eLinear);
+	} else {
+		const vk::ClearColorValue black {};
+		vk_command.clearColorImage(m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal,
+		                           &black, 1, &to_transfer.subresourceRange);
 	}
 
 	vk::ImageMemoryBarrier to_present {};
 	to_present.sType               = vk::StructureType::eImageMemoryBarrier;
-	to_present.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+	to_present.srcAccessMask =
+	    filtered ? vk::AccessFlagBits::eColorAttachmentWrite : vk::AccessFlagBits::eTransferWrite;
 	to_present.dstAccessMask       = draw_attachment ? vk::AccessFlagBits::eColorAttachmentRead |
 	                                                       vk::AccessFlagBits::eColorAttachmentWrite
 	                                                 : vk::AccessFlagBits::eMemoryRead;
-	to_present.oldLayout           = vk::ImageLayout::eTransferDstOptimal;
+	to_present.oldLayout           = to_transfer.newLayout;
 	to_present.newLayout           = draw_attachment ? vk::ImageLayout::eColorAttachmentOptimal
 	                                                 : vk::ImageLayout::ePresentSrcKHR;
 	to_present.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -847,37 +1164,29 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	to_present.subresourceRange.levelCount     = 1;
 	to_present.subresourceRange.baseArrayLayer = 0;
 	to_present.subresourceRange.layerCount     = 1;
-	vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	vk_command.pipelineBarrier(write_stage,
 	                           draw_attachment ? vk::PipelineStageFlagBits::eColorAttachmentOutput
 	                                           : vk::PipelineStageFlagBits::eAllCommands,
 	                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
 	                           &to_present);
 	if (draw_attachment) {
-		// Each pass blends over the color writes of the previous one.
-		to_present.srcAccessMask      = vk::AccessFlagBits::eColorAttachmentWrite;
-		to_present.oldLayout          = vk::ImageLayout::eColorAttachmentOptimal;
-		const auto attachment_barrier = [&] {
-			vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-			                           vk::PipelineStageFlagBits::eColorAttachmentOutput,
-			                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0, nullptr, 1,
-			                           &to_present);
-		};
-		if (convert_source) {
-			DrawLayer(vk_command, {source, 0, false}, game_rect);
-			if (draw_overlay || draw_system_overlay) {
-				attachment_barrier();
-			}
-		}
 		if (draw_overlay) {
-			DrawLayer(vk_command, overlay, game_rect);
+			DrawOverlay(vk_command, overlay, target);
 			if (draw_system_overlay) {
-				attachment_barrier();
+				to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
+				to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;
+				vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+				                           vk::PipelineStageFlagBits::eColorAttachmentOutput,
+				                           vk::DependencyFlagBits::eByRegion, 0, nullptr, 0,
+				                           nullptr, 1, &to_present);
 			}
 		}
 		if (draw_system_overlay) {
 			m_system_overlay->Record(vk_command, m_image_views[m_image_index]);
 		}
+		to_present.srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite;
 		to_present.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
+		to_present.oldLayout     = vk::ImageLayout::eColorAttachmentOptimal;
 		to_present.newLayout     = vk::ImageLayout::ePresentSrcKHR;
 		vk_command.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
 		                           vk::PipelineStageFlagBits::eAllCommands,
@@ -887,6 +1196,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 }
 
 uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
+	EXIT_IF(m_frame_index >= m_image_acquired.size() || m_image_index >= m_render_complete.size());
 	SubmitInfo submit;
 	submit.AddWait(m_image_acquired[m_frame_index], 1, vk::PipelineStageFlagBits::eTransfer);
 	submit.AddSignal(m_render_complete[m_image_index]);
@@ -896,6 +1206,7 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 }
 
 Swapchain::Status Swapchain::Present() {
+	EXIT_IF(m_image_index >= m_render_complete.size());
 	const auto         ready = m_render_complete[m_image_index];
 	vk::PresentInfoKHR present {};
 	present.sType              = vk::StructureType::ePresentInfoKHR;
@@ -905,9 +1216,12 @@ Swapchain::Status Swapchain::Present() {
 	present.pWaitSemaphores    = &ready;
 	present.waitSemaphoreCount = 1;
 
+	m_window.graphic_ctx.presented_frames.fetch_add(1, std::memory_order_relaxed);
 	vk::Result result;
 	{
-		Common::LockGuard lock(m_window.graphic_ctx.queue_mutex);
+		DrainStats::ReasonScope reason(DrainStats::Reason::PresentFrame);
+		DrainStats::WaitTimer   held(DrainStats::Kind::Submit);
+		Common::LockGuard       lock(m_window.graphic_ctx.queue_mutex);
 		result = m_window.graphic_ctx.queue.presentKHR(&present);
 	}
 	switch (result) {
@@ -931,8 +1245,7 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
-Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr,
-                                          bool headset) {
+Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto frame_format = info.pixel_format;
@@ -952,12 +1265,6 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
-	if (headset) {
-		// The frame holds the raw display-encoded pixels the headset needs.
-		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
-		               vk::AccessFlagBits2::eTransferRead);
-		Vr::OpenXrQueueEyeSource(buffer, frame->image);
-	}
 	return *frame;
 }
 
@@ -968,6 +1275,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
 	frame->hdr   = false;
 	frame->blank = true;
+	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -975,7 +1283,6 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 		EXIT_IF(producer->IsInvalid());
 		frame->Clear(*producer, clear);
 	} else {
-		Common::LockGuard lock(m_impl->present_mutex);
 		auto& command = m_impl->present_scheduler.BeginCommand();
 		frame->Clear(command, clear);
 		frame->present_tick = m_impl->present_scheduler.Submit();
@@ -988,8 +1295,12 @@ bool Presenter::PresentLastFrame() {
 	if (m_impl->layers[0].frame == nullptr && m_impl->layers[1].frame == nullptr) {
 		return false;
 	}
-	m_impl->Present();
+	m_impl->Present(false);
 	return true;
+}
+
+bool Presenter::IsGuestPaused() const noexcept {
+	return m_impl->window.loop.paused.load(std::memory_order_acquire);
 }
 
 bool Presenter::IsHdrSupported() const noexcept {
@@ -998,7 +1309,7 @@ bool Presenter::IsHdrSupported() const noexcept {
 
 bool Presenter::NeedsSystemOverlayRefresh() const noexcept {
 	const auto visual = GetSystemOverlayVisualState();
-	return visual.active ||
+	return visual.interactive ||
 	       visual.revision != m_impl->presented_overlay_revision.load(std::memory_order_acquire);
 }
 
@@ -1015,6 +1326,7 @@ void Presenter::Present(std::span<const Layer> layers) {
 	Common::LockGuard lock(m_impl->present_mutex);
 	for (const auto& layer: layers) {
 		EXIT_IF(layer.bus < 0 || layer.bus >= static_cast<int>(m_impl->layers.size()));
+		m_impl->frames.ValidateForPresent(layer.frame);
 		auto& previous = m_impl->layers[layer.bus];
 		if (previous.frame != nullptr) {
 			m_impl->frames.Release(previous.frame);
@@ -1036,11 +1348,8 @@ void Presenter::ClearLayer(int bus) {
 	}
 }
 
-void Presenter::Impl::Present() {
+void Presenter::Impl::Present(bool new_frame) {
 	KYTY_PROFILER_FUNCTION();
-	using Common::DebugCounters::Counter;
-	using Common::DebugCounters::ScopedTimer;
-	ScopedTimer present_time(Counter::PresentNs);
 
 	const auto overlay_visual = GetSystemOverlayVisualState();
 	// Keep black/blank flips in the current color space; only real main-bus frames switch it.
@@ -1052,28 +1361,24 @@ void Presenter::Impl::Present() {
 		RecoverSwapchain(Swapchain::Status::Recreate);
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
-		auto status = [&] {
-			ScopedTimer acquire_time(Counter::PresentAcquireNs);
-			return swapchain.AcquireNextImage(present_scheduler);
-		}();
+		auto status = swapchain.AcquireNextImage(present_scheduler);
 		if (status != Swapchain::Status::Success) {
 			RecoverSwapchain(status);
 			continue;
 		}
-		// present_mutex owns the prepared frames and this scheduler. Only queue submission
-		// is shared with rendering, and it has its own queue_mutex.
-		auto&      command = present_scheduler.BeginCommand();
-		const bool draw_system_overlay = [&] {
-			ScopedTimer overlay_time(Counter::OverlayNs);
-			return (overlay_visual.active || PerformanceOverlayEnabled()) &&
-			       swapchain.PrepareSystemOverlay();
-		}();
-		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
-		                                draw_system_overlay);
-		const auto tick = swapchain.Submit(present_scheduler);
-		for (const auto& layer: layers) {
-			if (layer.frame != nullptr) {
-				layer.frame->present_tick = tick;
+		{
+			Common::LockGuard render_lock(renderer.GetMutex());
+			auto&             command = present_scheduler.BeginCommand();
+			const bool        draw_system_overlay =
+			    (overlay_visual.active || PerformanceOverlayEnabled() || DebugMenuOpen()) &&
+			    swapchain.PrepareSystemOverlay();
+			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
+			                                draw_system_overlay);
+			const auto tick = swapchain.Submit(present_scheduler);
+			for (const auto& layer: layers) {
+				if (layer.frame != nullptr) {
+					layer.frame->present_tick = tick;
+				}
 			}
 		}
 		status = swapchain.Present();
@@ -1083,7 +1388,7 @@ void Presenter::Impl::Present() {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
-		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+		window.UpdateTitle(new_frame);
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");

@@ -3,127 +3,129 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
-#include <algorithm>
+#include <array>
 #include <span>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
+class Value;
+
 using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uint32_t> values);
-
-// Image descriptors at base + first + k * step, k < count, within size bytes that a sampled
-// root selects by GPU-computed byte offset. The host keeps them resident instead of
-// materializing them.
-struct ImageHeapRequest {
-	uint64_t             base  = 0;
-	uint64_t             size  = 0;
-	uint64_t             step  = 0;
-	uint64_t             first = 0;
-	uint64_t             count = 0;
-	const ImageResource* root  = nullptr;
-};
-
-struct ImageHeapView {
-	uint64_t                         slots      = 0; // Device address of one slot per heap dword.
-	uint32_t                         slot_count = 0; // Keys past it select a trailing null slot.
-	std::span<const DescriptorValue> kinds; // One representative descriptor per kind.
-};
-
-class ImageHeapSource {
-public:
-	// False when the host does not keep the table resident.
-	virtual bool Acquire(const ImageHeapRequest& request, ImageHeapView& view) = 0;
-
-protected:
-	~ImageHeapSource() = default;
-};
 
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
 	uint64_t                  shader_base                = 0;
+	SrtMemoryReader           read_memory                = nullptr;
 	void*                     userdata                   = nullptr;
 	SrtMemoryReader           read_specialization_memory = nullptr;
+	// read_specialization_memory succeeds for an aligned, nonzero 64-byte block only when every
+	// dword in it would succeed with the same value, so one refresh may read whole blocks.
+	bool                      specialization_block_reads = false;
+	// Userdata for read_specialization_memory; null means userdata.
+	void*                     specialization_userdata    = nullptr;
+	// Optional: reads an aligned, nonzero 64-byte block for read_memory (with userdata) only when
+	// reading each of its dwords with read_memory would give the same values; false otherwise.
+	SrtMemoryReader           read_memory_block          = nullptr;
 	std::span<const uint32_t> workgroup_counts;
-	uint64_t                  indirect_args_address = 0;
-	ImageHeapSource*          image_heap            = nullptr;
 };
 
-class SrtReadCapture {
-public:
-	SrtReadCapture(SrtRuntime source, std::vector<std::pair<uint64_t, uint64_t>>& ranges):
-	    m_source(source), m_ranges(ranges) {}
-	SrtRuntime ObservedRuntime();
+[[nodiscard]] inline void* SpecializationUserdata(const SrtRuntime& runtime) {
+	return runtime.specialization_userdata != nullptr ? runtime.specialization_userdata
+	                                                  : runtime.userdata;
+}
 
-private:
-	static bool Read(void* userdata, uint64_t address, std::span<uint32_t> values);
-
-	SrtRuntime                                  m_source;
-	std::vector<std::pair<uint64_t, uint64_t>>& m_ranges;
-};
-
-enum class RuntimeValueType { Any, Integer, ImmutableInteger };
+enum class RuntimeValueType { Any, Integer };
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType type = RuntimeValueType::Any);
-// Uniform across a compute wave, including values derived from its workgroup ID.
-// This does not imply that the host can evaluate the value.
-bool ValidateWaveUniformValue(const ResourcePlan& program, Value value);
-// Compiles the plan's x86 walker. Without values it walks the plan's resources; otherwise it
-// only evaluates the values, with every block reachable.
-void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values = {});
-// Runs the walker. flat receives the scalar reads of reachable blocks and reads, when non-null,
-// one DWORD range per guest load. False when a reachable read is unknown.
-bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
-             std::vector<std::pair<uint64_t, uint64_t>>* reads);
-// Results of the last walk; false when unknown.
-bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result);
-bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result);
-bool WalkedActive(const ResourcePlan& plan, uint32_t source);
-bool WalkedImageActive(const ResourcePlan& plan, uint32_t image);
-// Length of the guest load at rip if it belongs to the walker running on this thread, else 0.
-// The exception handler completes such a load as a zero read.
-uint32_t SrtWalkerLoadLength(uint64_t rip);
+// The same, printing every rejected value on the way (diagnostics).
+bool ValidateRuntimeValueTraced(const ResourcePlan& program, Value value,
+                                RuntimeValueType type = RuntimeValueType::Any);
+// Uses the strict reader for values that affect shader specialization.
+SrtRuntime CleanRuntime(SrtRuntime runtime);
 
-// Nonnegative affine coefficients: element zero is constant, remaining elements are
-// caller-selected leaves. Runtime range proofs must additionally exclude U32 wrap.
-template <size_t Size>
-std::optional<std::array<uint64_t, Size>> AffineIndex(
-    Value value, const auto& resolve, const auto& leaf, uint32_t depth = 0) {
-	value = resolve(value);
-	if (depth > 32u || value.GetType() != Type::U32) return {};
-	std::array<uint64_t, Size> result {};
-	if (value.IsImmediate()) {
-		result[0] = value.U32();
-		return result;
-	}
-	if (const auto index = leaf(value)) {
-		result[*index] = 1u;
-		return result;
-	}
-	const auto* inst = value.TryInstruction();
-	if (inst == nullptr) return {};
-	const auto op = inst->GetOpcode();
-	if (op != ValueOpcode::IAdd32 && op != ValueOpcode::IMul32 &&
-	    op != ValueOpcode::ShiftLeftLogical32) return {};
-	auto left = AffineIndex<Size>(inst->Arg(0), resolve, leaf, depth + 1u);
-	auto right = AffineIndex<Size>(inst->Arg(1), resolve, leaf, depth + 1u);
-	if (!left || !right) return {};
-	const auto constant = [](const auto& coefficients) {
-		return std::ranges::all_of(std::span(coefficients).subspan(1u),
-		                          [](uint64_t coefficient) { return coefficient == 0u; });
-	};
-	if (op == ValueOpcode::IMul32 && !constant(*right)) std::swap(left, right);
-	if (op != ValueOpcode::IAdd32 && !constant(*right)) return {};
-	if (op == ValueOpcode::ShiftLeftLogical32) {
-		if ((*right)[0] >= 32u) return {};
-		(*right)[0] = uint64_t {1} << (*right)[0];
-	}
-	for (size_t index = 0; index < Size; ++index) {
-		(*left)[index] = op == ValueOpcode::IAdd32
-		    ? (*left)[index] + (*right)[index] : (*left)[index] * (*right)[0];
-		if ((*left)[index] > UINT32_MAX) return {};
-	}
-	return left;
-}
+// One memoized evaluation session shared by the entire shader resource refresh.
+class SrtWalker {
+public:
+	SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
+	          std::span<const uint8_t> clean_flat_slots = {}, SrtWalker* clean_evaluator = nullptr,
+	          Value active_mask = {});
+	~SrtWalker();
+	SrtWalker(const SrtWalker&)            = delete;
+	SrtWalker& operator=(const SrtWalker&) = delete;
+
+	bool Evaluate(Value value, uint32_t& result);
+	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
+	// An empty span means that all sources are active.
+	std::span<const uint8_t> FindActiveSources();
+	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+
+	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
+
+private:
+	static float Float32(uint64_t bits);
+	bool EvaluateWide(Value value, uint64_t& result);
+	bool Arg(const Inst& inst, size_t index, uint64_t& result);
+	bool EvaluatePhi(const Inst& inst, uint64_t& result);
+	bool EvaluateExtract(const Inst& inst, uint64_t& result);
+	bool EvaluateRawRead(const Inst& inst, uint64_t& result);
+	bool EvaluateInst(const Inst& inst, uint64_t& result);
+
+	const ResourcePlan&              m_program;
+	SrtRuntime                      m_runtime;
+	std::span<const uint8_t>         m_clean_flat_slots;
+	SrtWalker*                      m_clean_evaluator = nullptr;
+	Value                           m_active_mask;
+	ResourcePlan::EvaluationContext& m_context;
+};
+
+// Whether plans compiled from now on read consecutive flat SRT slots as runs (the default).
+void SetFlatRunReads(bool enabled);
+
+// Resolves a plan's descriptor, SRT, condition and fill values into index-based nodes. The plan
+// must not be modified afterwards.
+const CompiledResourcePlan& CompileResourcePlan(const ResourcePlan& program);
+
+// SrtWalker over a CompiledResourcePlan. It keeps SrtWalker's evaluation contexts, clean
+// predicates, EXEC-mask selects and failure semantics, so both produce identical results.
+class SrtEvaluator {
+public:
+	SrtEvaluator(const ResourcePlan& program, const CompiledResourcePlan& compiled,
+	             const SrtRuntime& runtime, bool clean_flat_slots = false,
+	             SrtEvaluator* clean_evaluator = nullptr,
+	             uint32_t      active_mask     = ResourceNode::NoNode);
+	~SrtEvaluator();
+	SrtEvaluator(const SrtEvaluator&)            = delete;
+	SrtEvaluator& operator=(const SrtEvaluator&) = delete;
+
+	bool Evaluate(uint32_t node, uint32_t& result);
+	bool EvaluateDescriptor(uint32_t source, DescriptorValue& result);
+	// An empty span means that all sources are active.
+	std::span<const uint8_t> FindActiveSources();
+	bool RefreshFlatBuffer(std::vector<uint32_t>& flat);
+
+private:
+	bool EvaluateWide(uint32_t node, uint64_t& result);
+	bool EvaluateInst(const ResourceNode& node, uint64_t& result);
+	bool EvaluateRawRead(const ResourceNode& node, uint64_t& result);
+	// KYTY_DEBUG_SRT_FAIL: prints the innermost node that fails to evaluate under `node`.
+	void DescribeFailure(uint32_t node, uint32_t depth);
+	// Reads a run's dwords into their flat slots; false leaves them unchanged.
+	bool ReadFlatRun(const CompiledResourcePlan::FlatRun& run, std::vector<uint32_t>& flat);
+
+	const ResourcePlan&              m_program;
+	const CompiledResourcePlan&      m_compiled;
+	const ResourceNode*              m_nodes;
+	SrtRuntime                       m_runtime;
+	bool                             m_clean_flat_slots = false;
+	SrtEvaluator*                    m_clean_evaluator  = nullptr;
+	uint32_t                         m_active_mask      = ResourceNode::NoNode;
+	ResourcePlan::EvaluationContext& m_context;
+	ResourcePlan::EvaluationContext::Entry* m_memo;
+	uint64_t                         m_generation;
+	// Set by a successful RefreshFlatBuffer: this walker's slot values.
+	const std::vector<uint32_t>*     m_flat = nullptr;
+};
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

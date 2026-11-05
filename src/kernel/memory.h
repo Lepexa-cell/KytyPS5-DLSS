@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_KERNEL_MEMORY_H_
 #define EMULATOR_INCLUDE_EMULATOR_KERNEL_MEMORY_H_
 
+#include <string>
 #include "common/abi.h"
 #include "common/common.h"
 #include "common/virtualMemory.h"
@@ -18,18 +19,17 @@ void Shutdown();
 // Guest memory usage for the performance panel. Takes only bookkeeping locks, so it never
 // waits on the GPU; call it only while the memory subsystem is initialized.
 struct DebugStats {
-	uint64_t direct_total        = 0;
-	uint64_t direct_allocated    = 0; // sceKernelAllocateDirectMemory.
-	uint64_t pooled_allocated    = 0; // Memory pool expansions.
+	uint64_t direct_total       = 0;
+	uint64_t direct_allocated   = 0; // sceKernelAllocateDirectMemory.
+	uint64_t pooled_allocated   = 0; // Memory pool expansions.
 	uint64_t automatic_allocated = 0; // Extended memory.
-	uint64_t direct_mapped       = 0;
-	uint64_t flexible_total      = 0;
-	uint64_t flexible_used       = 0;
-	uint64_t pool_committed      = 0;
-	uint64_t cpu_page_entries       = 0; // 2 MiB page-table entries in use.
-	uint64_t gpu_page_entries       = 0;
-	uint64_t cpu_page_entries_total = 0;
-	uint64_t gpu_page_entries_total = 0;
+	uint64_t direct_mapped      = 0;
+	uint64_t flexible_total     = 0;
+	uint64_t flexible_used      = 0;
+	uint64_t pool_committed     = 0;
+	uint64_t cpu_page_entries   = 0; // 2 MiB page-table entries in use.
+	uint64_t gpu_page_entries   = 0;
+	uint64_t page_entries_total = 0; // Per side.
 };
 [[nodiscard]] DebugStats GetDebugStats();
 
@@ -126,16 +126,33 @@ static_assert(sizeof(KernelMemoryPoolBlockStats) == 16,
               "KernelMemoryPoolBlockStats struct size is incorrect");
 
 void                   RegisterCallbacks(callback_func_t alloc_func, callback_func_t free_func);
+void                   SetFlexibleMemorySize(uint64_t size);
 int AllocateDirectMemory(int64_t search_start, int64_t search_end, size_t size, size_t alignment,
                          int memory_type, int64_t* phys_addr_out, bool automatic = false);
 int MapAutomaticMemory(uint64_t vaddr, size_t size, int type, int prot);
-int UnmapAmmMemory(uint64_t vaddr, size_t size);
 bool                   TryWriteBacking(uint64_t vaddr, const void* data, uint64_t size);
 bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size);
+// Debug: the guest addresses mapping the same direct memory as [vaddr, +size) ("phys=... va=...").
+std::string            DebugDescribeAliases(uint64_t vaddr, uint64_t size);
+bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
+// GPU thread: some byte of [vaddr, vaddr + size) was written by GPU work into a buffer, so the
+// GPU holds it and a host read would wait for the GPU.
+// Reads guest memory for Thread_Gpu's own use. Bytes the GPU has not written are read without
+// faulting even when GPU writes elsewhere protect their page; GPU-written bytes still read back.
+void                   ReadGuestOnGpuThread(uint64_t vaddr, void* data, uint64_t size);
+// The shader whose resources Thread_Gpu is materializing (0: none), for KYTY_DEBUG_DIRTY_GPU_READS.
+extern thread_local uint64_t t_debug_reading_shader;
+extern thread_local uint32_t t_debug_reading_stage;
+// Copies a range within one page when ReadGuestOnGpuThread would read it as a plain copy (no
+// GPU-dirty hint on the page); false otherwise, and nothing is read.
+bool                   TryReadGuestPlainOnGpuThread(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
-bool                   CopySparseMemory(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// As ClampRangeSize, but 0 for a range outside mapped memory instead of ending the session.
+[[nodiscard]] uint64_t MappedRangeSize(uint64_t vaddr, uint64_t size) noexcept;
+// Changes whenever the virtual memory map changes: ClampRangeSize answers stand while it does not.
+[[nodiscard]] uint64_t RangeMapGeneration() noexcept;
 void                   WriteBacking(uint64_t vaddr, const void* data, uint64_t size) noexcept;
 void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 void                   InstallGpuResources(Graphics::RenderContext* renderer) noexcept;
@@ -197,9 +214,6 @@ int KYTY_SYSV_ABI KernelMemoryPoolGetBlockStats(KernelMemoryPoolBlockStats* outp
 
 uint64_t AllocateProgramMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name);
-// Loaded modules' segments use flexible memory without taking its backing.
-void ChargeFlexibleMemory(uint64_t size);
-void ReleaseFlexibleMemory(uint64_t size);
 void SetProgramMemoryProtection(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode);
 uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size,
                                Common::VirtualMemory::Mode mode, const char* name,
@@ -213,7 +227,6 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size);
 
 #if defined(KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS)
-void     TestSetGpuRangeCallback(void (*callback)(bool mapped, uint64_t addr, size_t size));
 void     TestBeforeNextBackingMap(callback_func_t callback);
 void     TestSetBackingReadCallback(callback_func_t callback);
 void     TestFailNextPhysicalMemoryUnmap();
@@ -225,11 +238,6 @@ bool     TestPlaceholderRangeIsFree(uint64_t vaddr, uint64_t size);
 bool     TestGuestAddressRangeIsOwned(uint64_t vaddr, uint64_t size);
 bool     TestGuestBackingOutsideAddressSpace();
 uint64_t TestGuestBackingSize();
-uint64_t TestFlexibleBackingHighWater();
-uint64_t TestGuestFreeRangeVisits();
-uint64_t TestDirectMappingCount();
-uint64_t TestFlexibleMappingCount();
-uint64_t TestBackingBytesZeroed();
 bool     TestGuestFreeRangeBounds();
 #endif
 

@@ -1,3 +1,7 @@
+> Unofficial, modified version of [KytyPS5](https://github.com/KytyPS5/KytyPS5), based on commit `dad900c61`, with work
+> from other KytyPS5 forks. Licensed under GPL-2.0, see `LICENSE`. Changes date from October and November 2026. It contains
+> no games or firmware. The text below is the original KytyPS5 README.
+
 # KytyPS5
 
 [![Build KytyPS5 (Windows)](https://img.shields.io/github/check-runs/KytyPS5/KytyPS5/main?nameFilter=Build%20KytyPS5%20%28Windows%29&label=Build%20KytyPS5%20%28Windows%29)](https://github.com/KytyPS5/KytyPS5/actions/workflows/build.yml)
@@ -23,8 +27,11 @@ can change significantly between builds.
 
 ## Current Status
 
+KytyPS5 can boot 2D and 3D games, including titles built with Unreal Engine
+4/5, Unity, and custom engines. External low-level emulation modules are neither required nor
+planned.
+
 Development is currently focused on expanding game compatibility and improving boot reliability.
-External low-level emulation modules are neither required nor planned.
 
 Windows and Linux are the primary target platforms and receive the most testing.
 
@@ -43,16 +50,6 @@ or graphical glitches, so please include the version you tested when reporting a
 ## Screenshots
 
 <table align="center">
-  <tr>
-    <td align="center">
-      <strong>Cyberpunk 2077</strong><br>
-      <img src="docs/screenshots/ps5-07.png" width="300" alt="Cyberpunk 2077 running in KytyPS5">
-    </td>
-    <td align="center">
-      <strong>MLB The Show 23</strong><br>
-      <img src="docs/screenshots/ps5-08.png" width="300" alt="MLB The Show 23 running in KytyPS5">
-    </td>
-  </tr>
   <tr>
     <td align="center">
       <strong>Astro Bot</strong><br>
@@ -78,21 +75,10 @@ or graphical glitches, so please include the version you tested when reporting a
       <strong>Demon's Souls</strong><br>
       <img src="docs/screenshots/ps5-02.png" width="300" alt="Demon's Souls running in KytyPS5">
     </td>
-    <td align="center">
-      <strong>UFC 6</strong><br>
-      <img src="docs/screenshots/ps5-06.jpg" width="300" alt="UFC 6 running in KytyPS5">
-    </td>
   </tr>
 </table>
 
 <p align="center"><em>And many more...</em></p>
-
-## Notable Forks
-
-These community forks bring KytyPS5 to other platforms.
-
-- [Cosmo/KytyPS5](https://github.com/Cosmo/KytyPS5) — Xbox Series X: Direct3D 12 renderer, sleek
-  controller-first interface, and local multiplayer for up to four players.
 
 ## Contributing
 
@@ -267,7 +253,6 @@ inputs. A Vulkan 1.3 driver must be available at runtime (on NixOS,
 On regular Fedora, install dependencies on the host. On Fedora Atomic variants such as Bazzite,
 Bluefin and Silverblue, use [Distrobox](https://distrobox.it/) and run the install and build steps
 inside the container. Keep the checkout in your home directory so it is shared with the container.
-Add `--nvidia` to the create command for hosts using the proprietary NVIDIA driver:
 
 ```bash
 distrobox create --name kyty-build --image registry.fedoraproject.org/fedora:latest
@@ -289,11 +274,11 @@ From the repository root, follow the launcher configure, build and install steps
 [Building on Linux](#building-on-linux), omitting `-DCMAKE_PREFIX_PATH="$Qt6_DIR"`; CMake finds
 Fedora's packaged Qt 6 automatically.
 
-Run `./_Build/linux/install/kyty_launcher` on regular Fedora or inside the container. To launch a
+Run `./_Build/linux/install/launcher` on regular Fedora or inside the container. To launch a
 container build from the host, leave the container with `exit`, then run from the repository root:
 
 ```bash
-distrobox enter kyty-build -- ./_Build/linux/install/kyty_launcher
+distrobox enter kyty-build -- ./_Build/linux/install/launcher
 ```
 
 Qt libraries and plugins are bundled. You can also launch directly on a Fedora Atomic host
@@ -359,7 +344,7 @@ Use `_Build/linux` instead of `_Build/windows` for a Linux build.
 
 A ready-made Visual Studio Code setup is included in [`.vscode`](.vscode). It configures CMake
 Tools to build the project with Ninja and `clang-cl` and provides launch profiles for both
-`kyty_launcher.exe` and `kyty_emulator.exe`. It is Windows-only: VS Code settings cannot select a
+`launcher.exe` and `kyty_emulator.exe`. It is Windows-only: VS Code settings cannot select a
 compiler per platform, so on Linux configure from the command line as shown above.
 
 Before using it:
@@ -379,11 +364,11 @@ Update your graphics driver before reporting rendering problems.
 To use the graphical launcher:
 
 ```powershell
-.\_Build\windows\install\kyty_launcher.exe
+.\_Build\windows\install\launcher.exe
 ```
 
 ```bash
-./_Build/linux/install/kyty_launcher
+./_Build/linux/install/launcher
 ```
 
 ```bash

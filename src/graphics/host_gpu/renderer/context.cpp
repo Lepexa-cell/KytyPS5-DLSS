@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -14,13 +15,42 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <utility>
 namespace Libs::Graphics {
 
 CommandBuffer::CommandBuffer(CommandScheduler& scheduler)
     : m_context(scheduler.Context()), m_graphics(scheduler.Graphics()) {}
 
+bool CommandBuffer::IsInvalid() const {
+	return m_buffer == nullptr;
+}
+
+vk::CommandBuffer CommandBuffer::Handle() const {
+	EXIT_IF(IsInvalid());
+	if (m_compute_access_pending) [[unlikely]] {
+		m_compute_access_pending = false;
+		ShaderAccessBarrier(m_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	}
+	// Whatever is recorded now may write indirect arguments (see IndirectArgsVisible).
+	m_indirect_visible = false;
+	return m_buffer;
+}
+
+vk::CommandBuffer CommandBuffer::ChainHandle() const {
+	EXIT_IF(IsInvalid() || m_rendering);
+	return m_buffer;
+}
+
+vk::CommandBuffer CommandBuffer::HandleForFullBarrier() const {
+	EXIT_IF(IsInvalid());
+	m_compute_access_pending = false;
+	m_indirect_visible       = false;
+	return m_buffer;
+}
+
 void CommandBuffer::Begin() {
-	EXIT_IF(m_rendering || IsInvalid());
+	EXIT_IF(m_rendering || m_pending_shader_writes || IsInvalid());
+	m_compute_access_pending = false;
 	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
@@ -29,6 +59,8 @@ void CommandBuffer::Begin() {
 	auto result = buffer.begin(&begin_info);
 
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	// A new command buffer starts without any pipeline or dynamic state.
+	InvalidateGraphicsState();
 }
 
 void CommandBuffer::End() const {
@@ -40,10 +72,23 @@ void CommandBuffer::End() const {
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }
 
+void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0, uint32_t arg1,
+                                 uint32_t arg2, uint32_t arg3, uint64_t arg4) {
+	m_debug_op        = op;
+	m_debug_submit_id = submit_id;
+	m_debug_arg0      = arg0;
+	m_debug_arg1      = arg1;
+	m_debug_arg2      = arg2;
+	m_debug_arg3      = arg3;
+	m_debug_arg4      = arg4;
+}
+
 void CommandBuffer::BeginRendering(const RenderState& state) const {
 	if (m_rendering && m_render_state == state) {
 		return;
 	}
+	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
+	        state.num_color_attachments > RENDER_COLOR_ATTACHMENTS_MAX);
 	EndRendering();
 
 	std::array<vk::RenderingAttachmentInfo, RENDER_COLOR_ATTACHMENTS_MAX> colors {};
@@ -51,8 +96,10 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 		const auto& attachment = state.color_attachments[i];
 		colors[i].imageView    = attachment.image_view;
 		colors[i].imageLayout  = attachment.image_layout;
-		colors[i].loadOp       = vk::AttachmentLoadOp::eLoad;
-		colors[i].storeOp      = vk::AttachmentStoreOp::eStore;
+		colors[i].loadOp =
+		    attachment.is_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad;
+		colors[i].storeOp                 = vk::AttachmentStoreOp::eStore;
+		colors[i].clearValue.color.uint32 = attachment.clear_value;
 	}
 
 	const auto&                 depth_stencil = state.depth_stencil_attachment;
@@ -80,19 +127,37 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	rendering.pDepthAttachment     = depth_stencil.has_depth ? &depth : nullptr;
 	rendering.pStencilAttachment   = depth_stencil.has_stencil ? &stencil : nullptr;
 	Handle().beginRendering(rendering);
+	if (g_render_debug_counters.counting.load(std::memory_order_relaxed)) [[unlikely]] {
+		g_render_debug_counters.render_begins.fetch_add(1, std::memory_order_relaxed);
+	}
 	m_render_state = state;
-	// The open pass holds the cleared contents, so a later clear begins a new pass.
-	m_render_state.depth_stencil_attachment.depth_clear   = false;
-	m_render_state.depth_stencil_attachment.stencil_clear = false;
-	m_rendering                                           = true;
+	if (GlobalBarrierLiteLevel() >= 2) {
+		// Upstream 70668fbd9: the open pass holds the cleared contents, so a later clear of the same
+		// targets begins a new pass instead of matching this one (no flush event ends it any more).
+		for (auto& color: m_render_state.color_attachments) {
+			color.is_clear = false;
+		}
+		m_render_state.depth_stencil_attachment.depth_clear   = false;
+		m_render_state.depth_stencil_attachment.stencil_clear = false;
+	}
+	m_rendering = true;
 }
 
 void CommandBuffer::EndRendering() const {
-	if (!m_rendering) {
-		return;
+	if (m_rendering) {
+		Handle().endRendering();
+		if (g_render_debug_counters.counting.load(std::memory_order_relaxed)) [[unlikely]] {
+			g_render_debug_counters.render_ends.fetch_add(1, std::memory_order_relaxed);
+		}
+		m_rendering    = false;
+		m_render_state = {};
 	}
-	Handle().endRendering();
-	m_rendering = false;
+	if (m_pending_shader_writes) {
+		ShaderWriteBarrier(Handle(), std::exchange(m_pending_shader_writes, {}));
+		if (g_render_debug_counters.counting.load(std::memory_order_relaxed)) [[unlikely]] {
+			g_render_debug_counters.image_barriers.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
 }
 
 } // namespace Libs::Graphics

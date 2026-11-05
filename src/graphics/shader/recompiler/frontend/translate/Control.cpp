@@ -14,6 +14,12 @@ bool IsExecOrVcc(const Decoder::Operand& operand) {
 	}
 }
 
+Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
+	Decoder::Operand operand;
+	operand.kind = kind;
+	return operand;
+}
+
 } // namespace
 
 void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) {
@@ -45,51 +51,80 @@ void Translator::S_SUBVECTOR_LOOP(const Decoder::Instruction& inst, bool begin) 
 
 void Translator::S_SAVEEXEC(const Decoder::Instruction& inst, IR::ValueOpcode operation,
                             bool negate_exec, bool negate_source, bool write_64) {
-	const auto combine = [&](IR::U32 old, IR::U32 src) {
-		const auto lhs = negate_exec ? ir.BitwiseNot(old) : old;
-		const auto rhs = negate_source ? ir.BitwiseNot(src) : src;
-		return operation == IR::ValueOpcode::LogicalAnd ? ir.BitwiseAnd(lhs, rhs)
-		                                                : ir.BitwiseOr(lhs, rhs);
-	};
 	if (!write_64) {
 		// Read the encoded scalar word and preserve EXEC_HI, including in wave32.
-		const auto old    = ir.GetExecLo();
-		const auto result = combine(old, ReadU32(inst.src0));
+		const auto old = ir.GetExecLo();
+		const auto src = ReadU32(inst.src0);
+		const auto lhs = negate_exec ? ir.BitwiseNot(old) : old;
+		const auto rhs = negate_source ? ir.BitwiseNot(src) : src;
+		IR::U32 result;
+		switch (operation) {
+			case IR::ValueOpcode::LogicalAnd: result = ir.BitwiseAnd(lhs, rhs); break;
+			case IR::ValueOpcode::LogicalOr: result = ir.BitwiseOr(lhs, rhs); break;
+			default: EXIT("unsupported SAVEEXEC operation");
+		}
 		WriteRawU32(inst.dst, old);
 		WriteRawU32(ConditionOperand(Decoder::OperandKind::ExecLo), result);
 		ir.SetScc(ir.INotEqual(result, IR::U32(IR::Value(0u))));
 		return;
 	}
-	// EXEC words combine bitwise; the per-lane EXEC combines the per-lane masks, so helper lanes
-	// stay enabled.
-	const auto old      = ir.GetExec();
-	const auto src      = ReadMask(inst.src0);
-	const auto lhs      = negate_exec ? ir.LogicalNot(old) : old;
-	const auto rhs      = negate_source ? ir.LogicalNot(src) : src;
-	const auto src_mask = ReadU32Pair(inst.src0);
-	const std::array old_mask {ir.GetExecLo(), ir.GetExecHi()};
-	const std::array mask {combine(old_mask[0], src_mask[0]), combine(old_mask[1], src_mask[1])};
-	WriteMask(inst.dst, old, old_mask, true);
-	WriteMask(ConditionOperand(Decoder::OperandKind::ExecLo), IR::U1(ir.Emit(operation, {lhs, rhs})),
-	          mask);
+	// Scalar SAVEEXEC operates on every mask bit, including lanes absent from the host
+	// subgroup. Keep the raw words separate from the per-invocation predicate: a ballot
+	// cannot recover those bits after OR/NOT enables them.
+	const auto             old_words   = std::array {ir.GetExecLo(), ir.GetExecHi()};
+	const auto             src_words   = ReadU32Pair(inst.src0);
+	const auto             old         = ir.GetExec();
+	const bool             mask_source = inst.src0.kind == Decoder::OperandKind::Sgpr ||
+	                                     inst.src0.kind == Decoder::OperandKind::ExecLo ||
+	                                     inst.src0.kind == Decoder::OperandKind::VccLo;
+	const auto             src         = mask_source ? ReadMask(inst.src0) : ThreadBit(src_words);
+	const auto             lhs         = negate_exec ? ir.LogicalNot(old) : old;
+	const auto             rhs         = negate_source ? ir.LogicalNot(src) : src;
+	const auto             result      = IR::U1(ir.Emit(operation, {lhs, rhs}));
+	std::array<IR::U32, 2> mask;
+	for (uint32_t component = 0; component < 2u; ++component) {
+		const auto left = negate_exec ? ir.BitwiseNot(old_words[component]) : old_words[component];
+		const auto right =
+		    negate_source ? ir.BitwiseNot(src_words[component]) : src_words[component];
+		switch (operation) {
+			case IR::ValueOpcode::LogicalAnd: mask[component] = ir.BitwiseAnd(left, right); break;
+			case IR::ValueOpcode::LogicalOr: mask[component] = ir.BitwiseOr(left, right); break;
+			default: EXIT("unsupported SAVEEXEC operation");
+		}
+	}
+	WriteU32Pair(inst.dst, old_words);
+	if (inst.dst.kind == Decoder::OperandKind::Sgpr) {
+		// Preserve the saved predicate through later mask restores without replacing the
+		// saved scalar bits with a ballot. WriteU32Pair already invalidates overlapping tags.
+		const auto dst = static_cast<IR::ScalarReg>(inst.dst.reg);
+		ir.SetThreadBitScalarReg(dst, old);
+		ir.SetScalarMaskTag(dst, IR::U1(IR::Value(true)));
+	} else if (inst.dst.kind == Decoder::OperandKind::VccLo) {
+		ir.SetVcc(old);
+	}
+	ir.SetExec(result);
+	ir.SetExecLo(mask[0]);
+	ir.SetExecHi(mask[1]);
 	ir.SetScc(ir.INotEqual(ir.BitwiseOr(mask[0], mask[1]), IR::U32(IR::Value(0u))));
 }
 
 void Translator::ADD_U32(const Decoder::Instruction& inst, bool vector, bool use_carry_in) {
-	const auto lhs     = ReadU32(inst.src0);
-	const auto rhs     = ReadU32(inst.src1);
-	const auto partial = ir.IAdd(lhs, rhs);
-	auto       result  = partial;
-	auto       carry   = ir.ULessThan(partial, lhs);
-	if (use_carry_in) {
-		// The carry-in is 0 or 1, so the second add carries out only when it wraps to zero.
-		result = ir.IAdd(partial, vector ? ConditionBit(inst.src2)
-		                                 : ConditionBit(ConditionOperand(Decoder::OperandKind::Scc)));
-		carry  = ir.LogicalOr(carry, ir.ULessThan(result, partial));
-	}
+	const auto zero     = IR::U32(IR::Value(0u));
+	const auto lhs      = ReadU32(inst.src0);
+	const auto rhs      = ReadU32(inst.src1);
+	const auto carry_in = !use_carry_in ? zero
+	                      : vector      ? ConditionBit(inst.src2)
+	                                    : ConditionBit(ConditionOperand(Decoder::OperandKind::Scc));
+	const auto add0     = ir.Emit(IR::ValueOpcode::IAddCarry32, {lhs, rhs});
+	const auto partial  = ir.CompositeExtract(add0, 0);
+	const auto carry0   = ir.CompositeExtract(add0, 1);
+	const auto add1     = ir.Emit(IR::ValueOpcode::IAddCarry32, {partial, carry_in});
+	const auto result   = ir.CompositeExtract(add1, 0);
+	const auto carry1   = ir.CompositeExtract(add1, 1);
+	const auto carry    = ir.INotEqual(ir.BitwiseOr(carry0, carry1), zero);
 	WriteOperand(DestinationOperand(inst), result);
 	if (vector) {
-		WriteVectorMask(inst.dst2, carry);
+		WriteMask(inst.dst2, ir.LogicalAnd(ir.GetExec(), carry));
 	} else {
 		ir.SetScc(carry);
 	}
@@ -102,7 +137,7 @@ void Translator::SUB_U32(const Decoder::Instruction& inst, bool vector, bool rev
 	const auto borrow = ir.UGreaterThan(rhs, lhs);
 	WriteOperand(DestinationOperand(inst), result);
 	if (vector) {
-		WriteVectorMask(inst.dst2, borrow);
+		WriteMask(inst.dst2, ir.LogicalAnd(ir.GetExec(), borrow));
 	} else {
 		ir.SetScc(borrow);
 	}
@@ -120,7 +155,7 @@ void Translator::SUBB_U32(const Decoder::Instruction& inst, bool vector, bool re
 	const auto borrow    = ir.LogicalOr(borrow0, borrow1);
 	WriteOperand(DestinationOperand(inst), result);
 	if (vector) {
-		WriteVectorMask(inst.dst2, borrow);
+		WriteMask(inst.dst2, ir.LogicalAnd(ir.GetExec(), borrow));
 	} else {
 		ir.SetScc(borrow);
 	}
@@ -134,25 +169,29 @@ void Translator::S_ABSDIFF_I32(const Decoder::Instruction& inst) {
 }
 
 void Translator::S_ADD_SUB_I32(const Decoder::Instruction& inst, bool subtract) {
-	const auto lhs    = ReadU32(inst.src0);
-	const auto rhs    = ReadU32(inst.src1);
-	const auto result = subtract ? ir.ISub(lhs, rhs) : ir.IAdd(lhs, rhs);
-	// Signed overflow moves the result past lhs the wrong way for the sign of rhs.
-	const auto ge = [&](IR::Value a, IR::Value b) {
-		return IR::U1(ir.Emit(IR::ValueOpcode::SGreaterThanEqual32, {a, b}));
-	};
-	const auto moved = subtract ? ge(lhs, result) : ge(result, lhs);
+	const auto lhs      = ReadU32(inst.src0);
+	const auto rhs      = ReadU32(inst.src1);
+	const auto result   = subtract ? ir.ISub(lhs, rhs) : ir.IAdd(lhs, rhs);
+	const auto shift    = IR::U32(IR::Value(31u));
+	const auto lhs_sign = ir.ShiftRightLogical(lhs, shift);
+	const auto rhs_sign = ir.ShiftRightLogical(rhs, shift);
+	const auto out_sign = ir.ShiftRightLogical(result, shift);
+	const auto inputs = subtract ? ir.INotEqual(lhs_sign, rhs_sign) : ir.IEqual(lhs_sign, rhs_sign);
+	const auto changed = ir.INotEqual(lhs_sign, out_sign);
 	WriteOperand(DestinationOperand(inst), result);
-	ir.SetScc(IR::U1(ir.Emit(IR::ValueOpcode::LogicalXor, {moved, ge(rhs, IR::Value(0u))})));
+	ir.SetScc(ir.LogicalAnd(inputs, changed));
 }
 
 void Translator::S_LSHL_ADD_U32(const Decoder::Instruction& inst, uint32_t shift_amount) {
-	const auto lhs         = ReadU32(inst.src0);
-	const auto rhs         = ReadU32(inst.src1);
-	const auto shifted     = ir.ShiftLeftLogical(lhs, IR::U32(IR::Value(shift_amount)));
-	const auto result      = ir.IAdd(shifted, rhs);
-	const auto add_carry   = ir.ULessThan(result, shifted);
-	const auto shift_carry = ir.UGreaterThan(lhs, IR::U32(IR::Value(~0u >> shift_amount)));
+	const auto lhs           = ReadU32(inst.src0);
+	const auto shift         = IR::U32(IR::Value(shift_amount));
+	const auto rhs           = ReadU32(inst.src1);
+	const auto shifted       = ir.ShiftLeftLogical(lhs, shift);
+	const auto result        = ir.IAdd(shifted, rhs);
+	const auto add_carry     = ir.ULessThan(result, shifted);
+	const auto inverse_shift = ir.ISub(IR::U32(IR::Value(32u)), shift);
+	const auto shifted_out   = ir.ShiftRightLogical(lhs, inverse_shift);
+	const auto shift_carry   = ir.INotEqual(shifted_out, IR::U32(IR::Value(0u)));
 	WriteOperand(DestinationOperand(inst), result);
 	ir.SetScc(ir.LogicalOr(add_carry, shift_carry));
 }
@@ -175,6 +214,23 @@ void Translator::S_WAITCNT_VSCNT(const Decoder::Instruction& inst) {
 		EXIT("unsupported partial or register-based S_WAITCNT_VSCNT at 0x%08x", inst.pc);
 	}
 	if (count == 0u) ir.Emit(IR::ValueOpcode::StoreCompletion);
+}
+
+void Translator::S_WAITCNT(const Decoder::Instruction& inst) {
+	// LGKM_CNT is SIMM16[13:8] of S_WAITCNT; S_WAITCNT_LGKMCNT (SOPK 0x1a) waits for SIMM16[5:0]
+	// (plus an SGPR that compilers leave NULL). The other SOPK forms count other memory.
+	bool lgkm_zero = false;
+	if (inst.family == Decoder::Family::SOPP) {
+		lgkm_zero = ((inst.src0.value >> 8u) & 0x3fu) == 0u;
+	} else if (inst.family == Decoder::Family::SOPK && inst.opcode_id == 0x1au) {
+		lgkm_zero = (inst.src0.value & 0x3fu) == 0u;
+	}
+	// On the GPU a wave's LDS operations complete in order, so after lgkmcnt(0) every lane sees what
+	// the others wrote. The emitter makes this a subgroup barrier in shaders that write LDS
+	// (KYTY_LDS_WAIT_BARRIER).
+	if (lgkm_zero) {
+		ir.Emit(IR::ValueOpcode::LdsWaitBarrier);
+	}
 }
 
 void Translator::S_BARRIER() {
@@ -236,7 +292,6 @@ void Translator::S_CSELECT_B32(const Decoder::Instruction& inst) {
 
 void Translator::ScalarSelect64(const Decoder::Instruction& inst,
                                  const Decoder::Operand& false_source) {
-	// Preserve per-word expressions for descriptor tracking and mask provenance.
 	const auto condition     = ir.GetScc();
 	const auto lhs           = ReadU32Pair(inst.src0);
 	const auto rhs           = ReadU32Pair(false_source);
@@ -279,6 +334,18 @@ void Translator::S_MOV_B64(const Decoder::Instruction& inst) {
 		source_mask = inst.src0.kind == Decoder::OperandKind::VccLo ? ir.GetVcc()
 		                                                          : ReadMask(inst.src0);
 		source_mask_valid = ReadMaskValid(inst.src0);
+		if (entry_live_exec && inst.src0.kind == Decoder::OperandKind::ExecLo &&
+		    inst.dst.kind == Decoder::OperandKind::Sgpr) {
+			// The live pixel mask (s_mov sN, exec before s_wqm): helper invocations are not in it,
+			// as in its scalar bits. A wave-wide reduction over it (a min over the live pixels'
+			// material IDs) would otherwise take a helper's value that no live lane consumes.
+			source_mask = ir.LogicalAnd(
+			    source_mask,
+			    ir.LogicalNot(IR::U1(ir.Emit(IR::ValueOpcode::IsHelperInvocation))));
+		}
+	}
+	if (inst.dst.kind == Decoder::OperandKind::ExecLo) {
+		entry_live_exec = false;
 	}
 	// Preserve all 64 scalar bits independently of the per-thread predicate.
 	WriteU32Pair(inst.dst, ReadU32Pair(inst.src0));
@@ -296,6 +363,9 @@ void Translator::S_MOV_B64(const Decoder::Instruction& inst) {
 }
 
 void Translator::S_WQM(const Decoder::Instruction& inst, bool wide) {
+	if (inst.dst.kind == Decoder::OperandKind::ExecLo || inst.dst.kind == Decoder::OperandKind::ExecHi) {
+		entry_live_exec = false;
+	}
 	const bool source_is_mask = inst.src0.kind == Decoder::OperandKind::Sgpr ||
 	                            inst.src0.kind == Decoder::OperandKind::ExecLo ||
 	                            inst.src0.kind == Decoder::OperandKind::VccLo ||
@@ -319,6 +389,17 @@ void Translator::S_WQM(const Decoder::Instruction& inst, bool wide) {
 		source = ir.ConstructU64(ReadU32(inst.src0), IR::U32(IR::Value(0u)));
 	}
 	const auto result = IR::U64(ir.Emit(IR::ValueOpcode::WqmU64, {source}));
+	// The scalar mask follows the ballots, which leave helper invocations out: a waterfall loop
+	// over the EXEC copy (s_ff1, v_readlane, v_cmp, s_andn2) must find only lanes its compare can
+	// clear, or it never ends. Helpers still run as live lanes (the per-lane `live` below).
+	auto scalar_result = result;
+	if (program.stage == ShaderType::Pixel) {
+		const auto live_ballot = ir.Emit(IR::ValueOpcode::Ballot, {IR::Value(true)});
+		const auto live_mask   = ir.ConstructU64(
+            ir.CompositeExtract(live_ballot, 0),
+            program.wave_size == 64u ? ir.CompositeExtract(live_ballot, 1) : IR::U32(IR::Value(0u)));
+		scalar_result = IR::U64(ir.Emit(IR::ValueOpcode::BitwiseAnd64, {result, live_mask}));
+	}
 	if (!wide) {
 		const auto low = ir.CompositeExtract(result, 0);
 		const bool destination_is_mask = IsExecOrVcc(inst.dst);
@@ -376,7 +457,7 @@ void Translator::S_WQM(const Decoder::Instruction& inst, bool wide) {
 	// from the scalar mask: reconstructing an entry-true predicate from a ballot
 	// otherwise introduces a spurious dependency into every vector write.
 	const auto live = ir.LogicalOr(retained_live, ThreadBit(ExtractU64(result)));
-	WriteOperand(DestinationOperand(inst), result);
+	WriteOperand(DestinationOperand(inst), scalar_result);
 	if (inst.dst.kind == Decoder::OperandKind::ExecLo) {
 		ir.SetExec(live);
 	} else if (inst.dst.kind == Decoder::OperandKind::VccLo) {
@@ -459,13 +540,11 @@ void Translator::V_PERMLANE16_B32(const Decoder::Instruction& inst, bool x16) {
 	    .fetch_inactive = inst.dst.op_sel,
 	    .bound_control  = inst.dst.op_sel_hi,
 	};
-	// An EXEC-disabled source lane without FI disables the write unless BOUND_CTRL reads zero.
-	const auto inactive = flags.fetch_inactive || flags.bound_control
-	                          ? IR::U32(IR::Value(0u))
-	                          : ir.GetVectorReg(static_cast<IR::VectorReg>(inst.dst.reg));
-	const auto result   = ir.Emit(
-	    IR::ValueOpcode::Permlane16U32,
-	    {ReadU32(inst.src0), ReadU32(inst.src1), ReadU32(inst.src2), ir.GetExec(), inactive}, flags);
+	// The scalar EXEC copy also holds the bits of lanes the host did not launch.
+	const auto result = ir.Emit(IR::ValueOpcode::Permlane16U32,
+	                            {ReadU32(inst.src0), ReadU32(inst.src1), ReadU32(inst.src2),
+	                             ir.GetExec(), ir.GetExecLo(), ir.GetExecHi()},
+	                            flags);
 	auto dst      = DestinationOperand(inst);
 	dst.op_sel    = false;
 	dst.op_sel_hi = false;

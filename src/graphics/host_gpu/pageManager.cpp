@@ -2,15 +2,19 @@
 
 #include "common/alignment.h"
 #include "common/virtualMemory.h"
+#include "common/switches.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "kernel/memory.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <utility>
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -22,7 +26,12 @@
 #endif
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+#undef min
+#undef max
 #else
 #include <unistd.h>
 #endif
@@ -36,6 +45,17 @@ constexpr uint64_t ADDRESS_SIZE = TRACKER_ADDRESS_SIZE;
 constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
+
+[[noreturn]] void FailFast(const char* reason = nullptr) noexcept {
+	std::fputs("PageManager fail-fast: ", stderr);
+	std::fputs(reason != nullptr ? reason : "invalid page state", stderr);
+	std::fputc('\n', stderr);
+	std::fflush(stderr);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	TerminateProcess(GetCurrentProcess(), static_cast<UINT>(EXCEPTION_NONCONTINUABLE_EXCEPTION));
+#endif
+	std::_Exit(322);
+}
 
 [[noreturn]] void Fatal(const char* format, ...) {
 	std::fputs("PageManager fatal: ", stderr);
@@ -74,7 +94,137 @@ void ValidateRange(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+bool ProtectStatsEnabled() {
+	static const bool enabled = KYTY_GETENV("KYTY_DEBUG_BDA_STATS") != nullptr;
+	return enabled;
+}
+
+thread_local PageManager::ProtectStats t_protect_stats;
+
+void ProtectNow(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+	const bool stats = ProtectStatsEnabled();
+	const auto start = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	const bool done  = Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode);
+	if (stats) {
+		t_protect_stats.calls++;
+		t_protect_stats.ns += static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+		        .count());
+	}
+	if (!done) {
+		Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
+		      static_cast<uint32_t>(mode));
+	}
+}
+
+// Deferred protection changes (see PageManager::DeferProtects), run in order. Every change of a
+// page's protection happens under its region's lock, and an immediate change first runs the
+// queued ones, so a page's changes take effect in the order they were made.
+struct DeferredProtect {
+	uint64_t                    vaddr;
+	uint64_t                    size;
+	Common::VirtualMemory::Mode mode;
+};
+std::mutex                   g_deferred_mutex;
+std::vector<DeferredProtect> g_deferred;
+std::atomic<uint64_t>        g_deferred_count {0};
+// Split mode: g_deferred_mutex only guards the queue and is never held during a protection
+// change, so the GPU thread queueing a change no longer waits for the upload helper's
+// VirtualProtect calls. Whoever runs queued changes holds g_run_mutex (taken before
+// g_deferred_mutex) from taking them off the queue until they are made, which keeps a page's
+// changes in order; g_deferred_count then counts the queued and the running changes.
+// KYTY_DEFER_PROTECTS_SPLIT=0 runs them under g_deferred_mutex as before.
+std::mutex g_run_mutex;
+
+bool SplitEnabled() {
+	static const bool enabled = [] {
+		const char* text = KYTY_GETENV("KYTY_DEFER_PROTECTS_SPLIT");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	return enabled;
+}
+thread_local bool            t_defer_protects = false;
+thread_local uint64_t        t_deferred_pushes = 0;
+
+// Caller holds g_deferred_mutex.
+void RunDeferredLocked() noexcept {
+	for (const auto& item: g_deferred) {
+		ProtectNow(item.vaddr, item.size, item.mode);
+	}
+	g_deferred.clear();
+	g_deferred_count.store(0, std::memory_order_release);
+}
+
+// Caller holds g_deferred_mutex: runs, in order, the queued changes overlapping the range; the
+// others keep their place.
+void RunDeferredOverlappingLocked(uint64_t vaddr, uint64_t size) noexcept {
+	size_t kept = 0;
+	for (size_t i = 0; i < g_deferred.size(); i++) {
+		const auto& item = g_deferred[i];
+		if (item.vaddr < vaddr + size && vaddr < item.vaddr + item.size) {
+			ProtectNow(item.vaddr, item.size, item.mode);
+		} else {
+			g_deferred[kept++] = item;
+		}
+	}
+	g_deferred.resize(kept);
+	g_deferred_count.store(kept, std::memory_order_release);
+}
+
+// Split mode: runs the queued changes (all, or those overlapping the range) outside
+// g_deferred_mutex.
+void RunDeferredSplit(bool all, uint64_t vaddr = 0, uint64_t size = 0) noexcept {
+	thread_local std::vector<DeferredProtect> batch;
+	std::scoped_lock                          run(g_run_mutex);
+	{
+		std::scoped_lock lock(g_deferred_mutex);
+		if (all) {
+			batch.swap(g_deferred);
+		} else {
+			size_t kept = 0;
+			for (size_t i = 0; i < g_deferred.size(); i++) {
+				const auto& item = g_deferred[i];
+				if (item.vaddr < vaddr + size && vaddr < item.vaddr + item.size) {
+					batch.push_back(item);
+				} else {
+					g_deferred[kept++] = item;
+				}
+			}
+			g_deferred.resize(kept);
+		}
+	}
+	for (const auto& item: batch) {
+		ProtectNow(item.vaddr, item.size, item.mode);
+	}
+	g_deferred_count.fetch_sub(batch.size(), std::memory_order_release);
+	batch.clear();
+}
+
 } // namespace
+
+uint64_t PageManager::DeferredPushes() noexcept {
+	return t_deferred_pushes;
+}
+
+void PageManager::DeferProtects(bool defer) noexcept {
+	t_defer_protects = defer;
+}
+
+void PageManager::RunDeferredProtects() noexcept {
+	if (g_deferred_count.load(std::memory_order_acquire) == 0) {
+		return;
+	}
+	if (SplitEnabled()) {
+		RunDeferredSplit(true);
+		return;
+	}
+	std::scoped_lock lock(g_deferred_mutex);
+	RunDeferredLocked();
+}
+
+PageManager::ProtectStats PageManager::TakeProtectStats() noexcept {
+	return std::exchange(t_protect_stats, {});
+}
 
 struct PageManager::Impl {
 	struct PageState {
@@ -159,14 +309,15 @@ struct PageManager::Impl {
 			SpinGuard lock(region->lock);
 			for (auto& page: region->pages) {
 				if (page.write_watchers != 0 || page.access_watchers != 0) {
-					Fatal("destroyed with live page state");
+					FailFast("PageManager destroyed with live page state");
 				}
 			}
 		}
 	}
 
 	Region* FindRegion(uint64_t vaddr) const noexcept {
-		return regions[vaddr / REGION_SIZE].load(std::memory_order_acquire);
+		return vaddr < ADDRESS_SIZE ? regions[vaddr / REGION_SIZE].load(std::memory_order_acquire)
+		                            : nullptr;
 	}
 
 	Region* GetOrCreateRegion(uint64_t vaddr) {
@@ -186,10 +337,23 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
-		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
-			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
-			      static_cast<uint32_t>(mode));
+		if (t_defer_protects) {
+			std::scoped_lock lock(g_deferred_mutex);
+			g_deferred.push_back({vaddr, size, mode});
+			g_deferred_count.fetch_add(1, std::memory_order_release);
+			t_deferred_pushes++;
+			return;
 		}
+		if (g_deferred_count.load(std::memory_order_acquire) != 0) {
+			if (SplitEnabled()) {
+				// Changes queued later for these pages wait for this region's lock, held here.
+				RunDeferredSplit(false, vaddr, size);
+			} else {
+				std::scoped_lock lock(g_deferred_mutex);
+				RunDeferredOverlappingLocked(vaddr, size);
+			}
+		}
+		ProtectNow(vaddr, size, mode);
 	}
 
 	template <bool track, bool is_read, bool masked>
@@ -209,14 +373,13 @@ struct PageManager::Impl {
 			}
 		};
 
-		constexpr int delta = track ? 1 : -1;
 		for (size_t page_index = first; page_index < last; page_index++) {
 			auto&      page    = region.pages[page_index];
 			const auto address = base_addr + page_index * PAGE_SIZE;
 			const bool update  = !masked || mask->Get(page_index);
 
 			const auto old_perms = page.Perms();
-			const auto new_count = update ? page.AddDelta<delta, is_read>(address)
+			const auto new_count = update ? page.AddDelta<track ? 1 : -1, is_read>(address)
 			                              : page.AddDelta<0, is_read>(address);
 			const auto new_perms = page.Perms();
 
@@ -274,6 +437,10 @@ PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
 
 PageManager::~PageManager() = default;
 
+uint64_t PageManager::GetPageSize() const {
+	return PAGE_SIZE;
+}
+
 template <bool track>
 void PageManager::UpdatePageWatchers(uint64_t vaddr, uint64_t size) {
 	m_impl->UpdatePageWatchers<track, false>(vaddr, size);
@@ -284,10 +451,18 @@ template void PageManager::UpdatePageWatchers<false>(uint64_t, uint64_t);
 
 template <bool track, bool is_read>
 void PageManager::UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask) {
+	if (base_addr % REGION_SIZE != 0 || base_addr >= ADDRESS_SIZE ||
+	    REGION_SIZE > ADDRESS_SIZE - base_addr) {
+		Fatal("invalid tracking region base 0x%016" PRIx64, base_addr);
+	}
+
 	const auto start_range = mask.FirstRange();
 	const auto end_range   = mask.LastRange();
-	const auto first       = start_range.first;
-	const auto last        = end_range.second;
+	if (start_range.first == REGION_PAGES) {
+		FailFast("empty region watcher mask");
+	}
+	const auto first = start_range.first;
+	const auto last  = end_range.second;
 	if (start_range.second == end_range.second) {
 		m_impl->UpdatePageWatchers<track, is_read>(base_addr + first * PAGE_SIZE,
 		                                           (last - first) * PAGE_SIZE);

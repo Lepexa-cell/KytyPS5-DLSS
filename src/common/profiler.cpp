@@ -5,12 +5,37 @@
 #include <common/TracyProtocol.hpp>
 #include <common/TracyVersion.hpp>
 #include <cstdio>
+#include <string>
 #include <tracy/Tracy.hpp>
+
+#if KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+#include <pthread.h>
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace Profiler {
 
 void SetThreadName(const char* name) {
-	if (tracy::ProfilerAvailable() && name != nullptr) {
+	if (name == nullptr) {
+		return;
+	}
+	// Name the OS thread too, so host tools and the performance panel can tell threads apart.
+#if defined(__APPLE__)
+	pthread_setname_np(name);
+#elif KYTY_PLATFORM == KYTY_PLATFORM_LINUX
+	pthread_setname_np(pthread_self(), std::string(name).substr(0, 15).c_str());
+#elif KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	if (const auto length = MultiByteToWideChar(CP_UTF8, 0, name, -1, nullptr, 0); length > 1) {
+		std::wstring wide(static_cast<size_t>(length), L'\0');
+		MultiByteToWideChar(CP_UTF8, 0, name, -1, wide.data(), length);
+		(void)SetThreadDescription(GetCurrentThread(), wide.c_str());
+	}
+#endif
+	if (tracy::ProfilerAvailable()) {
 		tracy::SetThreadName(name);
 	}
 }

@@ -43,12 +43,24 @@ struct ControllerSettings {
 	int     vibration_intensity = 100;
 	// 0 shares player 1 with the first gamepad; 1..MAX_PLAYERS dedicates that player to the keyboard.
 	int     keyboard_player     = 0;
+	// DualSense support (--dualsense-fix) and the host mix levels
+	// (--audio-*-volume, percent 0..200, no dialog fields; kept from Kyty.ini).
+	bool dualsense_fix     = false;
+	int  audio_master      = 100;
+	int  audio_main        = 100;
+	int  audio_music       = 100;
+	int  audio_pad_speaker = 30;
 
 	void WriteSettings(QSettings* s) const {
 		s->setValue("controller_color", color);
 		s->setValue("controller_speaker_volume", speaker_volume);
 		s->setValue("controller_vibration_intensity", vibration_intensity);
 		s->setValue("controller_keyboard_player", keyboard_player);
+		s->setValue("controller_dualsense_fix", dualsense_fix);
+		s->setValue("audio_master_volume", audio_master);
+		s->setValue("audio_main_volume", audio_main);
+		s->setValue("audio_music_volume", audio_music);
+		s->setValue("audio_pad_speaker_main_volume", audio_pad_speaker);
 	}
 
 	void ReadSettings(QSettings* s) {
@@ -63,6 +75,16 @@ struct ControllerSettings {
 		vibration_intensity = read_percent("controller_vibration_intensity", 100);
 		keyboard_player = qBound(0, s->value("controller_keyboard_player", 0).toInt(),
 		                         Config::MAX_PLAYERS);
+		dualsense_fix = s->value("controller_dualsense_fix", false).toBool();
+		const auto read_mix = [s](const char* key, int fallback) {
+			bool      ok    = false;
+			const int value = s->value(key, fallback).toInt(&ok);
+			return ok ? qBound(0, value, 200) : fallback;
+		};
+		audio_master      = read_mix("audio_master_volume", 100);
+		audio_main        = read_mix("audio_main_volume", 100);
+		audio_music       = read_mix("audio_music_volume", 100);
+		audio_pad_speaker = read_mix("audio_pad_speaker_main_volume", 30);
 	}
 };
 
@@ -77,6 +99,9 @@ public:
 	static constexpr int MAX_SCREEN_SIZE = 16384;
 
 	static QString NormalizeResolution(const QString& text);
+
+	enum class ShaderOptimizationType { None, Size, Performance };
+	Q_ENUM(ShaderOptimizationType)
 
 	enum class PresentMode { Fifo, Mailbox, Immediate };
 	Q_ENUM(PresentMode)
@@ -98,7 +123,6 @@ public:
 	QString     addons_dir;  /* Global setting; not saved per game. */
 	QStringList addcont;     /* User add-ons ("LABEL" or "LABEL=DIR"), saved by title ID. */
 	bool        custom_settings = false;
-	bool        pro_supported   = false; /* attribute3 bit 22 from sce_sys/param.json */
 	GameStatus  game_status     = GameStatus::Unknown;
 	QString     game_comment;
 
@@ -131,6 +155,7 @@ public:
 	int                    console_language            = DEFAULT_CONSOLE_LANGUAGE;
 	bool                   vulkan_validation_enabled   = false;
 	bool                   shader_validation_enabled   = false;
+	ShaderOptimizationType shader_optimization_type    = ShaderOptimizationType::Performance;
 	LogDirection           shader_log_direction        = LogDirection::Silent;
 	QString                shader_log_folder           = "_Shaders";
 	bool                   command_buffer_dump_enabled = false;
@@ -176,6 +201,7 @@ public:
 		console_language            = other.console_language;
 		vulkan_validation_enabled   = other.vulkan_validation_enabled;
 		shader_validation_enabled   = other.shader_validation_enabled;
+		shader_optimization_type    = other.shader_optimization_type;
 		shader_log_direction        = other.shader_log_direction;
 		shader_log_folder           = other.shader_log_folder;
 		command_buffer_dump_enabled = other.command_buffer_dump_enabled;
@@ -201,7 +227,6 @@ public:
 		basedir         = other.basedir;
 		game_path       = other.game_path;
 		custom_settings = other.custom_settings;
-		pro_supported   = other.pro_supported;
 		game_status     = other.game_status;
 		game_comment    = other.game_comment;
 	}

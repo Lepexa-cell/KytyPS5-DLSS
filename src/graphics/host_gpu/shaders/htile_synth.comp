@@ -1,0 +1,87 @@
+#version 450
+
+// Rebuilds a depth target's HTile from its depth, as the PS5's DB keeps it while it renders. One
+// workgroup covers one 8x8 tile and writes the depth-only HTile word: ZMask 0xf (expanded), MinZ
+// in bits 4-17 and MaxZ in bits 18-31, 14 bits each, rounded outward so the range always holds
+// every depth of the tile. Guest shaders read MinZ/16384 and (MaxZ + 1)/16384 (Ghost of Yotei's
+// shadow-cascade binning) or MinZ/16383 and MaxZ/16383; both stay conservative.
+//
+// The word goes where the guest looks for it: 32 KiB blocks of 128x64 tiles (1024x512 pixels),
+// pitch_blocks per row, and inside a block the address bits (2-14) of tile (x, y):
+//   x0 y1 x3 y3 x4 y4 y0^x0 y1^x1 y2^x3 y3^x2 x5 y5 x6
+// (taken from Ghost of Yotei's own HTile reader).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(std430, binding = 0) readonly buffer depth_buf {
+    uint depth[];
+};
+
+layout(std430, binding = 1) writeonly buffer htile_buf {
+    uint htile[];
+};
+
+layout(push_constant) uniform Params {
+    uint width;         // Depth extent in pixels.
+    uint height;
+    uint row_texels;    // Depth row stride in texels.
+    uint slice_texels;  // Depth layer stride in texels.
+    uint first_word;    // HTile word of layer 0, relative to the binding.
+    uint layer_words;   // HTile words per layer.
+    uint pitch_blocks;  // HTile blocks (1024 pixels wide) per row.
+    uint format;        // 0: D32 float, 1: D16 unorm, 2: X8D24 unorm.
+} params;
+
+shared uint tile_min;
+shared uint tile_max;
+
+float LoadDepth(uint x, uint y, uint layer) {
+    const uint texel = layer * params.slice_texels + y * params.row_texels + x;
+    if (params.format == 1u) {
+        const uint word = depth[texel >> 1];
+        return float((texel & 1u) != 0u ? word >> 16 : word & 0xffffu) / 65535.0;
+    }
+    const uint word = depth[texel];
+    if (params.format == 2u) {
+        return float(word & 0xffffffu) / 16777215.0;
+    }
+    return uintBitsToFloat(word);
+}
+
+uint TileWord(uint tx, uint ty) {
+    const uint x = tx & 127u;
+    const uint y = ty & 63u;
+    const uint inside = ((x << 2) & 0x44u) | ((x << 1) & 0x10u) | ((y << 2) & 0x28u) |
+                        ((y << 3) & 0x80u) | ((y << 8) & 0x2f00u);
+    const uint swizzle = ((x << 8) & 0x4300u) ^ ((x << 7) & 0x1400u) ^ ((x << 9) & 0x800u);
+    const uint block   = (tx >> 7) + params.pitch_blocks * (ty >> 6);
+    return block * 8192u + ((inside ^ swizzle) >> 2);
+}
+
+void main() {
+    const uint tx    = gl_WorkGroupID.x;
+    const uint ty    = gl_WorkGroupID.y;
+    const uint layer = gl_WorkGroupID.z;
+    if (gl_LocalInvocationIndex == 0u) {
+        tile_min = 16383u;
+        tile_max = 0u;
+    }
+    barrier();
+    const uint px = tx * 8u + gl_LocalInvocationID.x;
+    const uint py = ty * 8u + gl_LocalInvocationID.y;
+    if (px < params.width && py < params.height) {
+        const float z = clamp(LoadDepth(px, py, layer), 0.0, 1.0);
+        if (!isnan(z)) {
+            atomicMin(tile_min, uint(clamp(floor(z * 16383.0), 0.0, 16383.0)));
+            atomicMax(tile_max, uint(clamp(ceil(z * 16384.0), 0.0, 16383.0)));
+        }
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        // A tile with no valid depth keeps the full range.
+        const uint lo = tile_min <= tile_max ? tile_min : 0u;
+        const uint hi = tile_min <= tile_max ? tile_max : 16383u;
+        htile[params.first_word + layer * params.layer_words + TileWord(tx, ty)] =
+            (hi << 18) | (lo << 4) | 0xfu;
+    }
+}

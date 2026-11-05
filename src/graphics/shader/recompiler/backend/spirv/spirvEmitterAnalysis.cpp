@@ -4,7 +4,10 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
-#include <cstdlib>
+#include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
@@ -30,13 +33,6 @@ bool PixelParameterIsFlat(const EmitterState& state, uint32_t attr) {
 bool PixelParameterIsCustom(const EmitterState& state, uint32_t attr) {
 	return state.program.stage == ShaderType::Pixel &&
 	       ShaderPixelParameterIsCustom(*state.input_info.pixel, attr);
-}
-
-uint32_t MrtOutputType(EmitterState& state, uint32_t index) {
-	const auto& pixel = *state.input_info.pixel;
-	if ((pixel.target_sint_mask & (1u << index)) != 0u) return TypeI32Vector(state, 4);
-	if ((pixel.target_uint_mask & (1u << index)) != 0u) return TypeU32Vector(state, 4);
-	return TypeF32Vector(state, 4);
 }
 
 uint32_t OutputVariableForExport(const EmitterState& state, const IR::ExportInfo& exp) {
@@ -68,10 +64,25 @@ uint32_t          ConstantU32(EmitterState& state, uint32_t value);
 	std::abort();
 }
 
-static uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
-                                         uint32_t variable_id, uint32_t array_index,
-                                         IR::DescriptorBindingKind kind, uint32_t resource,
-                                         const char* variable_name) {
+uint32_t ResourceForDescriptor(const EmitterState& state, IR::DescriptorBindingKind kind,
+                               uint32_t resource) {
+	const auto* descriptor = IR::FindBinding(state.program.bindings, kind);
+	if (descriptor == nullptr) {
+		ExitDescriptorBindingFailure(state, kind, resource, "descriptor group was not allocated");
+	}
+	const auto found =
+	    std::find(descriptor->resources.begin(), descriptor->resources.end(), resource);
+	if (found == descriptor->resources.end()) {
+		ExitDescriptorBindingFailure(state, kind, resource,
+		                             "resource is absent from descriptor group");
+	}
+	return static_cast<uint32_t>(found - descriptor->resources.begin());
+}
+
+uint32_t DescriptorElementPointer(EmitterState& state, uint32_t result_ptr_type,
+                                  uint32_t variable_id, uint32_t array_index,
+                                  IR::DescriptorBindingKind kind, uint32_t resource,
+                                  const char* variable_name) {
 	if (variable_id == 0) {
 		ExitDescriptorBindingFailure(state, kind, resource, variable_name);
 	}
@@ -130,83 +141,89 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 		EXIT("invalid image resource class");
 	}
 	const auto& info = ImageDimensionInfoFor(image.dimension);
-	if (sampled == 2 && info.multisampled != 0u) {
-		state.builder.RequireCapability(spv::CapabilityStorageImageMultisample);
-	}
-	const auto  scalar_type =
-	    image.atomic64 ? TypeU64(state) : ImageScalarType(state, image.numeric_class);
+	const auto scalar_type = image.atomic64 ? TypeScalarU64(state)
+	                                        : ImageScalarType(state, image.numeric_class);
 	return state.builder.Type(spv::OpTypeImage, scalar_type,
 	                          info.spirv_dimension, image.depth_compare ? 1u : 0u, info.arrayed,
 	                          info.multisampled, sampled, format);
 }
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension) {
-	const auto& info = ImageDimensionInfoFor(dimension);
-	return TypeU32Vector(state, info.coordinate_components + (info.one_dimensional ? 1u : 0u));
+	switch (ImageDimensionInfoFor(dimension).coordinate_components) {
+		case 1u: return TypeU32(state);
+		case 2u: return TypeU32Vector(state, 2);
+		case 3u: return TypeU32Vector(state, 3);
+		default: return 0;
+	}
 }
-
-namespace {
-void DecorateNonUniformDescriptor(EmitterState& state, uint32_t id, spv::Capability capability) {
-	state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
-	state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
-	state.builder.RequireCapability(capability);
-	state.builder.AddAnnotation(spv::OpDecorate, id, spv::DecorationNonUniform);
-}
-
-ImageDefinition& ImageDescriptorDefinition(EmitterState& state, const IR::ImageResource& image,
-                                           IR::DescriptorBindingKind kind) {
-	return (image.heap ? state.heap_images : state.images)[IR::ImageBindingIndex(kind)];
-}
-} // namespace
 
 uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip,
                              uint32_t array_index) {
+	const auto& image_resource = state.program.info.images.at(resource);
+	if (image_resource.bindless) {
+		// The bindless image arrays (set 2) at the slot EmitImage computed for this instruction.
+		EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled);
+		const auto type     = ImageType(state, image_resource);
+		const auto variable = state.bindless_image_variables.find(type);
+		EXIT_IF(variable == state.bindless_image_variables.end() || state.bindless_slot == 0);
+		const auto pointer_type =
+		    state.builder.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, type);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, variable->second,
+		                          state.bindless_slot);
+		state.builder.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
+		const auto image = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, type, image, pointer);
+		state.builder.AddAnnotation(spv::OpDecorate, image, spv::DecorationNonUniform);
+		return image;
+	}
 	const auto pointer = ImageDescriptorPointer(state, resource, mip, array_index);
 	const auto image = state.builder.AllocateId();
-	const auto& resource_info = state.program.info.images[resource];
-	const auto kind = *IR::DescriptorBindingForImage(resource_info);
-	state.builder.AddFunction(spv::OpLoad, ImageDescriptorDefinition(state, resource_info, kind).type,
+	state.builder.AddFunction(spv::OpLoad, ImageType(state, state.program.info.images.at(resource)),
 	                          image, pointer);
-	if (array_index != 0u) {
-		DecorateNonUniformDescriptor(state, image,
-		    IR::ImageBindingResourceClass(kind) == IR::ImageResourceClass::Storage
-		        ? spv::CapabilityStorageImageArrayNonUniformIndexing
-		        : spv::CapabilitySampledImageArrayNonUniformIndexing);
-	}
 	return image;
 }
 
-uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler, uint32_t array_index) {
-	if (sampler >= state.program.info.samplers.size()) {
-		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Samplers, sampler,
-		                             "sampler resource index is out of range");
+uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
+	const auto sampler_type = state.builder.Type(spv::OpTypeSampler);
+	const auto pointer_type =
+	    state.builder.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, sampler_type);
+	if (state.program.info.samplers.at(sampler).bindless) {
+		// The bindless sampler array (set 2) at the slot EmitImage computed for this instruction.
+		EXIT_IF(state.bindless_sampler_variable == 0 || state.bindless_sampler_slot == 0);
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer,
+		                          state.bindless_sampler_variable, state.bindless_sampler_slot);
+		state.builder.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
+		const auto sampler_id = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, sampler_type, sampler_id, pointer);
+		state.builder.AddAnnotation(spv::OpDecorate, sampler_id, spv::DecorationNonUniform);
+		return sampler_id;
 	}
+	const auto array_index =
+	    ResourceForDescriptor(state, IR::DescriptorBindingKind::Samplers, sampler);
 	const auto pointer = DescriptorElementPointer(
-	    state, state.sampler_pointer_type, state.sampler_variable,
-	    array_index == 0u ? ConstantU32(state, sampler) : array_index,
+	    state, pointer_type, state.sampler_variable, ConstantU32(state, array_index),
 	    IR::DescriptorBindingKind::Samplers, sampler, "sampler descriptor array was not emitted");
 	const auto sampler_id = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, state.sampler_type, sampler_id, pointer);
-	if (array_index != 0u)
-		DecorateNonUniformDescriptor(state, sampler_id, spv::CapabilitySampledImageArrayNonUniformIndexing);
+	state.builder.AddFunction(spv::OpLoad, sampler_type, sampler_id, pointer);
 	return sampler_id;
 }
 
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id, uint32_t mip,
-                          uint32_t array_index, bool sampler_dynamic) {
+                          uint32_t array_index) {
 	const auto& image_resource = state.program.info.images.at(resource);
 	EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled);
 	const auto  image          = LoadImageDescriptor(state, resource, mip, array_index);
 	const auto  sampled_image = state.builder.AllocateId();
-	auto& definition = ImageDescriptorDefinition(state, image_resource,
-	                                             *IR::DescriptorBindingForImage(image_resource));
-	if (definition.sampled_type == 0) {
-		definition.sampled_type = state.builder.Type(spv::OpTypeSampledImage, definition.type);
-	}
-	state.builder.AddFunction(spv::OpSampledImage, definition.sampled_type, sampled_image, image,
-	                          sampler_id);
-	if (array_index != 0u || sampler_dynamic) {
-		DecorateNonUniformDescriptor(state, sampled_image, spv::CapabilitySampledImageArrayNonUniformIndexing);
+	const auto  sampled_type =
+	    state.builder.Type(spv::OpTypeSampledImage, ImageType(state, image_resource));
+	state.builder.AddFunction(spv::OpSampledImage, sampled_type, sampled_image, image, sampler_id);
+	if (array_index != 0u || image_resource.bindless || state.bindless_sampler_slot != 0u) {
+		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
+		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+		state.builder.AddAnnotation(spv::OpDecorate, sampled_image, spv::DecorationNonUniform);
 	}
 	return sampled_image;
 }
@@ -216,31 +233,41 @@ uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t
 	const auto& image = state.program.info.images.at(resource);
 	EXIT_IF(mip >= image.mip_count);
 	const auto kind = IR::DescriptorBindingForImage(image);
-	EXIT_IF(!kind.has_value() || (image.heap && array_index == 0u));
+	EXIT_IF(!kind.has_value());
 	if (array_index == 0u) {
-		array_index = ConstantU32(state, image.descriptor_index + mip);
+		array_index = ConstantU32(state, ResourceForDescriptor(state, *kind, resource) + mip);
 	}
-	const auto& definition = ImageDescriptorDefinition(state, image, *kind);
-	return DescriptorElementPointer(state, definition.pointer_type, definition.variable,
-	                                array_index, *kind, resource,
+	const auto pointer_type = state.builder.Type(
+	    spv::OpTypePointer, spv::StorageClassUniformConstant, ImageType(state, image));
+	const auto variable = state.image_variables[IR::ImageBindingIndex(*kind)];
+	return DescriptorElementPointer(state, pointer_type, variable, array_index, *kind, resource,
 	                                "image descriptor array was not emitted");
 }
 
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
-                           uint32_t texel, uint32_t array_index, uint32_t sample) {
+                           uint32_t texel, uint32_t array_index) {
 	const auto& image = state.program.info.images.at(resource);
 	EXIT_IF(image.resource_class != IR::ImageResourceClass::Storage);
 	if (!image.atomic) {
 		state.builder.RequireCapability(spv::CapabilityStorageImageWriteWithoutFormat);
 	}
-	const auto EmitWrite = [&](uint32_t mip) {
-		const auto descriptor = LoadImageDescriptor(state, resource, mip, array_index);
-		if (sample == 0u) {
-			state.builder.AddFunction(spv::OpImageWrite, descriptor, coord, texel);
-		} else {
-			state.builder.AddFunction(spv::OpImageWrite, descriptor, coord, texel,
-			                          spv::ImageOperandsSampleMask, sample);
+	if (image.clamp_half_float) {
+		// The guest GPU's float-to-half store (ShaderRecompiler::FloatStoreClampEnabled).
+		uint32_t components[4] {};
+		for (uint32_t component = 0; component < 4u; component++) {
+			const auto scalar = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), scalar, texel,
+			                          component);
+			components[component] = EmitClampToHalfRange(state, scalar);
 		}
+		texel = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), texel,
+		                          components[0], components[1], components[2], components[3]);
+	}
+	const auto EmitWrite = [&](uint32_t mip) {
+		state.builder.AddFunction(spv::OpImageWrite,
+		                          LoadImageDescriptor(state, resource, mip, array_index), coord,
+		                          texel);
 	};
 	if (image.mip_mode != IR::ImageMipMode::Dynamic) {
 		EmitWrite(0);
@@ -259,6 +286,288 @@ spv::ExecutionModel ExecutionModelForStage(ShaderType stage) {
 		case ShaderType::Pixel: return spv::ExecutionModelFragment;
 		default: return spv::ExecutionModelGLCompute;
 	}
+}
+
+namespace {
+
+// A branch on whether any lane's predicate is set, which the guest takes or skips for the whole
+// wave. Scalar subvector loops branch on a uniform value instead.
+bool IsWaveCondition(const IR::Inst& inst) {
+	if (inst.GetOpcode() != IR::ValueOpcode::ConditionRef) {
+		return false;
+	}
+	switch (inst.Flags<CFG::BranchCondition>()) {
+		case CFG::BranchCondition::SccZero:
+		case CFG::BranchCondition::SccNonZero:
+		case CFG::BranchCondition::VccZero:
+		case CFG::BranchCondition::VccNonZero:
+		case CFG::BranchCondition::ExecZero:
+		case CFG::BranchCondition::ExecNonZero: return true;
+		default: return false;
+	}
+}
+
+// A waterfall loop's read: the loop compares each lane's value with the one read, handles the
+// lanes that match and repeats for the rest.
+bool IsWaterfallRead(const IR::Inst& inst) {
+	if (inst.GetOpcode() != IR::ValueOpcode::ReadFirstLane) {
+		return false;
+	}
+	const auto source = inst.Arg(0).Resolve();
+	return !source.IsImmediate() && std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
+		return use.user->GetOpcode() == IR::ValueOpcode::IEqual32 && use.operand < 2 &&
+		       use.user->Arg(1 - use.operand).Resolve() == source;
+	});
+}
+
+// A set of wave conditions, by index.
+struct ConditionSet {
+	std::vector<uint64_t> words;
+
+	explicit ConditionSet(size_t count = 0): words((count + 63) / 64) {}
+
+	void Set(size_t index) { words[index / 64] |= uint64_t {1} << (index % 64); }
+	bool Test(size_t index) const { return (words[index / 64] >> (index % 64) & 1u) != 0; }
+	bool Merge(const ConditionSet& other) {
+		bool changed = false;
+		for (size_t word = 0; word < words.size() && word < other.words.size(); word++) {
+			changed |= (other.words[word] & ~words[word]) != 0;
+			words[word] |= other.words[word];
+		}
+		return changed;
+	}
+};
+
+// The immediate post-dominator of each block, with blocks.size() standing for the exit, or an
+// empty result when some block never reaches the exit.
+std::vector<size_t> PostDominators(const IR::BlockList&                            blocks,
+                                   const std::unordered_map<const IR::Block*, size_t>& index) {
+	const auto count = blocks.size();
+	const auto exit  = count;
+	constexpr auto none = SIZE_MAX;
+	// The post-dominators are the dominators of the reversed graph, rooted at the exit.
+	const auto successors = [&](size_t block) {
+		std::vector<size_t> result;
+		if (block == exit) {
+			return result;
+		}
+		for (const auto* successor: blocks[block]->ImmSuccessors()) {
+			result.push_back(index.at(successor));
+		}
+		if (result.empty()) {
+			result.push_back(exit);
+		}
+		return result;
+	};
+	std::vector<std::vector<size_t>> reverse(count + 1);
+	for (size_t block = 0; block < count; block++) {
+		for (const auto successor: successors(block)) {
+			reverse[successor].push_back(block);
+		}
+	}
+	std::vector<size_t> order(count + 1, none);
+	std::vector<size_t> postorder;
+	std::vector<std::pair<size_t, size_t>> stack {{exit, 0}};
+	order[exit] = 0;
+	while (!stack.empty()) {
+		auto& [node, next] = stack.back();
+		if (next < reverse[node].size()) {
+			const auto child = reverse[node][next++];
+			if (order[child] == none) {
+				order[child] = 0;
+				stack.emplace_back(child, 0);
+			}
+			continue;
+		}
+		order[node] = postorder.size();
+		postorder.push_back(node);
+		stack.pop_back();
+	}
+	if (postorder.size() != count + 1) {
+		return {};
+	}
+	std::vector<size_t> idom(count + 1, none);
+	idom[exit] = exit;
+	const auto intersect = [&](size_t lhs, size_t rhs) {
+		while (lhs != rhs) {
+			while (order[lhs] < order[rhs]) lhs = idom[lhs];
+			while (order[rhs] < order[lhs]) rhs = idom[rhs];
+		}
+		return lhs;
+	};
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (auto node = postorder.rbegin() + 1; node != postorder.rend(); ++node) {
+			auto dominator = none;
+			for (const auto successor: successors(*node)) {
+				if (idom[successor] != none) {
+					dominator = dominator == none ? successor : intersect(successor, dominator);
+				}
+			}
+			if (idom[*node] != dominator) {
+				idom[*node] = dominator;
+				changed     = true;
+			}
+		}
+	}
+	return idom;
+}
+
+} // namespace
+
+std::unordered_set<const IR::Inst*> SplitWaveLocalInstructions(
+    const IR::Program& program, const std::unordered_set<const IR::Block*>& sync_blocks, bool all) {
+	// Each half of a split wave may branch on its own lanes where the guest branched on all of
+	// them: a half whose lanes are all inactive then skips code the guest ran with them masked,
+	// which only changes what the guest's compiler already treats as undefined there. The halves
+	// must still meet at every barrier together, so a branch stays whole-wave when a block it
+	// controls synchronizes them, directly or through another whole-wave branch.
+	std::unordered_set<const IR::Inst*> result;
+	std::vector<const IR::Inst*>        conditions;
+	std::unordered_map<const IR::Inst*, size_t> condition_index;
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (IsWaterfallRead(inst)) {
+				result.insert(&inst);
+			} else if (IsWaveCondition(inst)) {
+				condition_index.emplace(&inst, conditions.size());
+				conditions.push_back(&inst);
+			}
+		}
+	}
+	if (all || program.dispatcher_fallback) {
+		if (all) {
+			result.insert(conditions.begin(), conditions.end());
+		}
+		return result;
+	}
+
+	const auto& blocks = program.blocks;
+	const auto  count  = blocks.size();
+	// Each block's terminator and branch condition live in program.block_info, by block index.
+	if (program.block_info.size() != count) {
+		return {};
+	}
+	std::unordered_map<const IR::Block*, size_t> index;
+	for (size_t block = 0; block < count; block++) {
+		index.emplace(blocks[block], block);
+	}
+	const auto idom = PostDominators(blocks, index);
+	if (idom.empty()) {
+		return result;
+	}
+	// A block depends on a branch when one of the branch's successors leads to it but the
+	// branch's block does not always reach it.
+	std::vector<std::vector<size_t>> controllers(count);
+	for (size_t block = 0; block < count; block++) {
+		const auto successors = blocks[block]->ImmSuccessors();
+		if (successors.size() < 2) {
+			continue;
+		}
+		for (const auto* successor: successors) {
+			for (auto runner = index.at(successor); runner != idom[block] && runner != count;
+			     runner = idom[runner]) {
+				if (std::ranges::find(controllers[runner], block) == controllers[runner].end()) {
+					controllers[runner].push_back(block);
+				}
+			}
+		}
+	}
+
+	std::vector<bool> local(conditions.size(), true);
+	for (;;) {
+		// The local conditions each branch condition and each block's execution depends on.
+		std::unordered_map<const IR::Inst*, ConditionSet> values;
+		std::vector<ConditionSet> control(count, ConditionSet(conditions.size()));
+		const auto value_of = [&](IR::Value value) {
+			value = value.Resolve();
+			const auto* inst = value.IsImmediate() ? nullptr : value.TryInstruction();
+			const auto  found = inst != nullptr ? values.find(inst) : values.end();
+			return found != values.end() ? found->second : ConditionSet(conditions.size());
+		};
+		const auto branch_of = [&](size_t block) {
+			const auto& info = program.block_info[block];
+			return info.terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
+			               !info.condition.IsEmpty()
+			           ? value_of(info.condition)
+			           : ConditionSet(conditions.size());
+		};
+		for (bool changed = true; changed;) {
+			changed = false;
+			for (size_t block = 0; block < count; block++) {
+				for (const auto controller: controllers[block]) {
+					changed |= control[block].Merge(branch_of(controller));
+					changed |= control[block].Merge(control[controller]);
+				}
+				for (const auto& inst: *blocks[block]) {
+					ConditionSet set(conditions.size());
+					switch (inst.GetOpcode()) {
+						case IR::ValueOpcode::ConditionRef:
+							if (const auto found = condition_index.find(&inst);
+							    found != condition_index.end() && local[found->second]) {
+								set.Set(found->second);
+							}
+							break;
+						case IR::ValueOpcode::Phi:
+							if (inst.GetType() != IR::Type::U1) {
+								continue;
+							}
+							// A merged value also depends on which predecessor the wave came from.
+							for (size_t arg = 0; arg < inst.NumArgs(); arg++) {
+								set.Merge(value_of(inst.Arg(arg)));
+								const auto predecessor = index.at(inst.PhiBlock(arg));
+								set.Merge(control[predecessor]);
+								set.Merge(branch_of(predecessor));
+							}
+							break;
+						case IR::ValueOpcode::LogicalAnd:
+						case IR::ValueOpcode::LogicalOr:
+						case IR::ValueOpcode::LogicalXor:
+						case IR::ValueOpcode::LogicalNot:
+						case IR::ValueOpcode::SelectU1:
+						case IR::ValueOpcode::Identity:
+							for (size_t arg = 0; arg < inst.NumArgs(); arg++) {
+								set.Merge(value_of(inst.Arg(arg)));
+							}
+							break;
+						default: continue;
+					}
+					changed |= values.try_emplace(&inst, conditions.size()).first->second.Merge(set);
+				}
+			}
+		}
+		// Synchronizing blocks keep the branches they depend on whole-wave. A half that leaves
+		// the program early would leave the other waiting at its next barrier.
+		ConditionSet whole(conditions.size());
+		for (size_t block = 0; block < count; block++) {
+			bool syncs = sync_blocks.contains(blocks[block]) || blocks[block]->ImmSuccessors().empty();
+			for (const auto& inst: *blocks[block]) {
+				if (const auto found = condition_index.find(&inst);
+				    found != condition_index.end() && !local[found->second]) {
+					syncs = true;
+				}
+			}
+			if (syncs) {
+				whole.Merge(control[block]);
+			}
+		}
+		bool removed = false;
+		for (size_t condition = 0; condition < conditions.size(); condition++) {
+			if (local[condition] && whole.Test(condition)) {
+				local[condition] = false;
+				removed          = true;
+			}
+		}
+		if (!removed) {
+			break;
+		}
+	}
+	for (size_t condition = 0; condition < conditions.size(); condition++) {
+		if (local[condition]) {
+			result.insert(conditions[condition]);
+		}
+	}
+	return result;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

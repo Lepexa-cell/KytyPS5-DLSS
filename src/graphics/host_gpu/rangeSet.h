@@ -5,32 +5,32 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <iterator>
 #include <map>
 
 namespace Libs::Graphics {
 
 class RangeSet final {
 public:
-	void Add(uint64_t address, uint64_t size) {
+	// Returns whether the set gained addresses.
+	bool Add(uint64_t address, uint64_t size) {
 		const auto end = End(address, size);
 		auto       it  = m_ranges.lower_bound(address);
 		if (it != m_ranges.begin() && std::prev(it)->second >= address) {
 			it = std::prev(it);
 		}
-		if (it == m_ranges.end() || it->first > address) {
-			it = m_ranges.emplace_hint(it, address, end);
-		} else {
-			if (it->second >= end) {
-				return;
-			}
-			it->second = end;
+		// Draws add the same written range again and again: a covered range changes nothing.
+		if (it != m_ranges.end() && it->first <= address && it->second >= end) {
+			return false;
 		}
-		auto next = std::next(it);
-		while (next != m_ranges.end() && next->first <= it->second) {
-			it->second = std::max(it->second, next->second);
-			next       = m_ranges.erase(next);
+		uint64_t begin = address;
+		uint64_t last  = end;
+		while (it != m_ranges.end() && it->first <= last) {
+			begin = std::min(begin, it->first);
+			last  = std::max(last, it->second);
+			it    = m_ranges.erase(it);
 		}
+		m_ranges.emplace(begin, last);
+		return true;
 	}
 
 	void Subtract(uint64_t address, uint64_t size) {
@@ -52,6 +52,8 @@ public:
 			}
 		}
 	}
+
+	void Clear() { m_ranges.clear(); }
 
 	template <typename Func>
 	void ForEach(Func&& func) const {

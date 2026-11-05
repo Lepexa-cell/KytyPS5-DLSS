@@ -2,12 +2,10 @@
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/logging/log.h"
-#include "common/stringUtils.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "loader/symbolDatabase.h"
 
-#include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -379,7 +377,7 @@ struct FontWritingLineStep {
 };
 
 struct FontWritingState {
-	FontCharacterState*   next;
+	FontStringState*      string;
 	FontCharacterState*   character;
 	FontWritingStep       step;
 	FontWritingLetterStep letter_step;
@@ -563,12 +561,12 @@ static uint32_t count_characters_until(FontCharacterState* first, FontCharacterS
 
 	uint32_t count = 0;
 	for (auto* c = first; c != nullptr; c = get_next_character(c)) {
-		count++;
-		if (c == last) {
-			return count;
+		if (last != nullptr && c == last) {
+			break;
 		}
+		count++;
 	}
-	return last == nullptr ? count : 0;
+	return count;
 }
 
 static void fill_text_codes(FontTextCodes* text_codes, FontCharacterState* character,
@@ -601,25 +599,41 @@ static void fill_writing_metrics(FontWritingMetrics* metrics, uint32_t character
 	metrics->extent.right  = advance;
 }
 
-static void fill_writing_step(FontWritingStep* step, const FontCharacterState* character, float x) {
+static void fill_writing_step(FontWritingStep* step, FontCharacterState* character) {
+	if (step == nullptr) {
+		return;
+	}
+
 	std::memset(step, 0, sizeof(FontWritingStep));
-	step->x                       = x;
-	step->font                    = character->font;
-	step->profile.character_count = 1;
-	step->glyph_code              = character->code;
-	step->positioning.x           = x;
-	fill_metrics_for_code(&step->glyph_metrics, static_cast<FontState*>(character->font),
-	                      character->code);
-	step->advance_x = step->glyph_metrics.horizontal.advance;
+	step->advance_x               = 8.0f;
+	step->advance_y               = 0.0f;
+	step->font                    = character != nullptr ? character->font : nullptr;
+	step->profile.character_count = character != nullptr ? 1u : 0u;
+	step->profile.invisible_glyph = 0u;
+	step->glyph_code              = character != nullptr ? character->code : 0u;
+	fill_metrics_for_code(&step->glyph_metrics,
+	                      static_cast<FontState*>(character != nullptr ? character->font : nullptr),
+	                      character != nullptr ? character->code : static_cast<uint32_t>('?'));
 }
 
 static void fill_writing_letter_step(FontWritingLetterStep* letter_step,
-                                     const FontWritingStep* step) {
+                                     FontCharacterState*    character) {
+	if (letter_step == nullptr) {
+		return;
+	}
+
 	std::memset(letter_step, 0, sizeof(FontWritingLetterStep));
-	letter_step->x                                = step->x;
-	letter_step->advance_x                        = step->advance_x;
+	letter_step->advance_x = 8.0f;
+	letter_step->advance_y = 0.0f;
+
+	if (character == nullptr) {
+		return;
+	}
+
 	letter_step->components.texts_count           = 1;
+	letter_step->components.texts_index           = character->index;
 	letter_step->components.glyphs_count          = 1;
+	letter_step->components.glyphs_index          = 0;
 	letter_step->components.base_components_count = 1;
 	letter_step->components.base_focus_count      = 1;
 	letter_step->components.character_text_count  = 1;
@@ -661,6 +675,19 @@ static bool font_is_italic(const FontState* font) {
 	       font->render_effect_slant != 0.0f;
 }
 
+static const char* fallback_font_file_name(bool bold, bool italic) {
+	if (bold && italic) {
+		return "Roboto-BoldItalic.ttf";
+	}
+	if (bold) {
+		return "Roboto-Bold.ttf";
+	}
+	if (italic) {
+		return "Roboto-Italic.ttf";
+	}
+	return "Roboto-Regular.ttf";
+}
+
 static std::vector<uint8_t> read_file_bytes(const std::filesystem::path& path) {
 	std::ifstream file(path, std::ios::binary | std::ios::ate);
 	if (!file) {
@@ -682,34 +709,49 @@ static std::vector<uint8_t> read_file_bytes(const std::filesystem::path& path) {
 	return data;
 }
 
-static std::vector<uint8_t> load_fallback_font_data(const char* file_name) {
-	const char* base_path = SDL_GetBasePath();
-	if (base_path == nullptr) {
-		LOGF("Font: SDL_GetBasePath failed: %s\n", SDL_GetError());
-		return {};
+static std::vector<std::filesystem::path> fallback_font_candidates(const char* file_name) {
+	const auto rel =
+	    std::filesystem::path("3rdparty") / "tracy" / "profiler" / "src" / "font" / file_name;
+	std::vector<std::filesystem::path> paths;
+
+	auto source_root = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path();
+	paths.push_back(source_root / rel);
+
+	std::error_code ec;
+	auto            cwd = std::filesystem::current_path(ec);
+	if (!ec) {
+		paths.push_back(cwd / rel);
+		paths.push_back(cwd / ".." / rel);
+		paths.push_back(cwd / ".." / ".." / rel);
 	}
-	// SDL returns UTF-8; path(const char*) would read it in the Windows ANSI code page.
-	const auto path = Common::PathFromUtf8(base_path) / "assets" / "fonts" / file_name;
-	auto       data = read_file_bytes(path);
-	if (data.empty()) {
-		LOGF("Font: fallback font not found: %s\n", Common::PathToString(path).c_str());
+
+	return paths;
+}
+
+static std::vector<uint8_t> load_fallback_font_data(bool bold, bool italic) {
+	for (const auto& path: fallback_font_candidates(fallback_font_file_name(bold, italic))) {
+		auto data = read_file_bytes(path);
+		if (!data.empty()) {
+			return data;
+		}
 	}
-	return data;
+
+	return {};
 }
 
 static const std::vector<uint8_t>& fallback_font_data(bool bold, bool italic) {
-	static const auto regular     = load_fallback_font_data("NotoSans-Regular.ttf");
-	static const auto bold_data   = load_fallback_font_data("NotoSans-Bold.ttf");
-	static const auto italic_data = load_fallback_font_data("NotoSans-Italic.ttf");
-	static const auto bold_italic = load_fallback_font_data("NotoSans-BoldItalic.ttf");
+	static const auto regular     = load_fallback_font_data(false, false);
+	static const auto bold_data   = load_fallback_font_data(true, false);
+	static const auto italic_data = load_fallback_font_data(false, true);
+	static const auto bold_italic = load_fallback_font_data(true, true);
 
-	if (bold && italic) {
+	if (bold && italic && !bold_italic.empty()) {
 		return bold_italic;
 	}
-	if (bold) {
+	if (bold && !bold_data.empty()) {
 		return bold_data;
 	}
-	if (italic) {
+	if (italic && !italic_data.empty()) {
 		return italic_data;
 	}
 	return regular;
@@ -1628,17 +1670,17 @@ FontStringRefersRenderCharacters(FontString font_string, FontTextCharacter start
 		first = &state->characters.front();
 	}
 
-	const uint32_t count = count_characters_until(first, last);
 	if (character_count != nullptr) {
-		*character_count = count;
+		*character_count = count_characters_until(first, last);
 	}
 
 	LOGF("\t string = 0x%016" PRIx64 ", start = 0x%016" PRIx64 ", last = 0x%016" PRIx64
 	     ", count = %" PRIu32 "\n",
 	     reinterpret_cast<uint64_t>(font_string), reinterpret_cast<uint64_t>(start_character),
-	     reinterpret_cast<uint64_t>(last_character), count);
+	     reinterpret_cast<uint64_t>(last_character),
+	     character_count != nullptr ? *character_count : count_characters_until(first, last));
 
-	return count != 0 ? first : nullptr;
+	return first;
 }
 
 FontTextCharacter KYTY_SYSV_ABI FontCharacterRefersTextNext(FontTextCharacter text_character) {
@@ -1786,17 +1828,23 @@ int KYTY_SYSV_ABI FontWritingInit(FontWriting* font_writing, FontString font_str
 	}
 	std::memset(font_writing, 0, sizeof(FontWriting));
 
-	auto* string = static_cast<FontStringState*>(font_string);
-	auto* state  = new FontWritingState {};
-	state->next  = get_character(font_character);
-	if (state->next == nullptr && string != nullptr && !string->characters.empty()) {
-		state->next = &string->characters.front();
+	auto* state           = new FontWritingState {};
+	state->string         = static_cast<FontStringState*>(font_string);
+	state->character      = get_character(font_character);
+	state->invisible_mask = 0;
+	if (state->character == nullptr && state->string != nullptr &&
+	    !state->string->characters.empty()) {
+		state->character = &state->string->characters.front();
 	}
+
+	fill_writing_step(&state->step, state->character);
+	fill_writing_letter_step(&state->letter_step, state->character);
+	fill_writing_metrics(&state->metrics, state->step.profile.character_count);
 	register_writing_state(state);
 
 	font_writing->system_use[0] = state;
 	font_writing->system_use[1] = &state->step;
-	font_writing->system_use[2] = state->next;
+	font_writing->system_use[2] = state->character;
 	font_writing->system_use[3] = &state->letter_step;
 	font_writing->system_use[4] = &state->metrics;
 
@@ -1825,60 +1873,26 @@ const FontWritingStep* KYTY_SYSV_ABI FontWritingRefersRenderStep(FontWriting* fo
 	PRINT_NAME();
 
 	auto* state = get_writing_state(font_writing);
-	if (state == nullptr) {
-		return nullptr;
-	}
-
-	state->character = state->next;
-	if (state->character == nullptr) {
-		return nullptr;
-	}
-	state->next = get_next_character(state->character);
-
-	// The step stays zeroed until the first character is written.
-	const bool first = state->step.profile.character_count == 0;
-	fill_writing_step(&state->step, state->character, state->metrics.advance_x);
-	fill_writing_letter_step(&state->letter_step, &state->step);
-
-	const auto& glyph  = state->step.glyph_metrics;
-	const float left   = state->step.x + glyph.horizontal.bearing_x;
-	const float right  = left + glyph.width;
-	const float top    = -glyph.horizontal.bearing_y;
-	const float bottom = top + glyph.height;
-	auto&       extent = state->metrics.extent;
-	if (first) {
-		extent = {top, bottom, left, right};
-	} else {
-		extent.top    = std::min(extent.top, top);
-		extent.bottom = std::max(extent.bottom, bottom);
-		extent.left   = std::min(extent.left, left);
-		extent.right  = std::max(extent.right, right);
-	}
-	state->metrics.advance_x += state->step.advance_x;
-
+	auto* step  = state != nullptr ? &state->step : nullptr;
 	LOGF("\t writing = 0x%016" PRIx64 ", step = 0x%016" PRIx64 "\n",
-	     reinterpret_cast<uint64_t>(font_writing), reinterpret_cast<uint64_t>(&state->step));
-	return &state->step;
+	     reinterpret_cast<uint64_t>(font_writing), reinterpret_cast<uint64_t>(step));
+	return step;
 }
 
 FontTextCharacter KYTY_SYSV_ABI FontWritingRefersRenderStepCharacter(FontWriting* font_writing,
                                                                      const void** letter_step) {
 	PRINT_NAME();
 
-	auto*               state     = get_writing_state(font_writing);
-	FontCharacterState* character = nullptr;
-	if (state != nullptr) {
-		character        = state->character;
-		state->character = nullptr;
-	}
+	auto* state = get_writing_state(font_writing);
 	if (letter_step != nullptr) {
-		*letter_step = character != nullptr ? &state->letter_step : nullptr;
+		*letter_step = state != nullptr ? &state->letter_step : nullptr;
 	}
 	LOGF("\t writing = 0x%016" PRIx64 ", character = 0x%016" PRIx64 ", letter_step = 0x%016" PRIx64
 	     "\n",
-	     reinterpret_cast<uint64_t>(font_writing), reinterpret_cast<uint64_t>(character),
+	     reinterpret_cast<uint64_t>(font_writing),
+	     reinterpret_cast<uint64_t>(state != nullptr ? state->character : nullptr),
 	     reinterpret_cast<uint64_t>(letter_step != nullptr ? *letter_step : nullptr));
-	return character;
+	return state != nullptr ? state->character : nullptr;
 }
 
 int KYTY_SYSV_ABI FontWritingGetRenderMetrics(FontWriting*        font_writing,

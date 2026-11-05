@@ -2,7 +2,6 @@
 
 #include "common/assert.h"
 #include "common/common.h"
-#include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
@@ -36,7 +35,7 @@ public:
 	bool     GetParamInt(const char* name, int32_t* value);
 	bool     GetParamString(const char* name, std::string* value);
 	bool     GetParamString(const char* name, char* value, size_t value_size);
-	MemoryParams GetMemoryParams();
+	uint64_t GetFlexibleMemorySize();
 
 	void DbgPrint();
 
@@ -62,7 +61,7 @@ private:
 	Common::Mutex      m_mutex;
 	bool               m_opened = false;
 	std::vector<Param> m_params;
-	MemoryParams       m_memory_params;
+	uint64_t           m_flexible_memory_size = 0;
 };
 
 class PlayGo {
@@ -91,7 +90,6 @@ private:
 };
 
 struct SystemContent {
-	bool                  trinity_mode = false;
 	std::filesystem::path psf_path;
 	Psf                   psf;
 	std::filesystem::path playgo_path;
@@ -174,21 +172,11 @@ void Psf::OpenJson(const std::filesystem::path& file_name) {
 	add_int_param("userDefinedParam3", "USER_DEFINED_PARAM_3");
 	add_int_param("userDefinedParam4", "USER_DEFINED_PARAM_4");
 
-	auto read_size = [](const nlohmann::ordered_json& object, const char* key, uint64_t* size,
-	                    uint64_t unit = 1) {
-		if (auto it = object.find(key); it != object.end()) {
-			*size = it->get<uint64_t>() * unit;
-		}
-	};
 	if (auto kernel = param_json.find("kernel");
 	    kernel != param_json.end() && kernel->is_object()) {
-		read_size(*kernel, "flexibleMemorySize", &m_memory_params.flexible_size);
-		read_size(*kernel, "cpuPageTableSize", &m_memory_params.cpu_table_memory);
-		read_size(*kernel, "gpuPageTableSize", &m_memory_params.gpu_table_memory);
-	}
-	if (auto amm = param_json.find("amm"); amm != param_json.end() && amm->is_object()) {
-		read_size(*amm, "pagetableMemorySizeInMib", &m_memory_params.amm_table_memory,
-		          1024ull * 1024ull);
+		if (auto it = kernel->find("flexibleMemorySize"); it != kernel->end()) {
+			m_flexible_memory_size = it->get<uint64_t>();
+		}
 	}
 
 	auto localized = param_json.find("localizedParameters");
@@ -239,8 +227,8 @@ void Psf::Close() {
 	Common::LockGuard lock(m_mutex);
 
 	m_params.clear();
-	m_memory_params = {};
-	m_opened        = false;
+	m_flexible_memory_size = 0;
+	m_opened               = false;
 }
 
 bool Psf::IsValid() {
@@ -351,10 +339,10 @@ bool Psf::GetParamString(const char* name, char* value, size_t value_size) {
 	return false;
 }
 
-MemoryParams Psf::GetMemoryParams() {
+uint64_t Psf::GetFlexibleMemorySize() {
 	Common::LockGuard lock(m_mutex);
 
-	return m_memory_params;
+	return m_flexible_memory_size;
 }
 
 PlayGo::~PlayGo() {
@@ -605,14 +593,6 @@ void SystemContentLoadParamSfo(const std::filesystem::path& file_name) {
 
 	sc->psf_path = file_name;
 	sc->psf.DbgPrint();
-	int32_t attribute3 = 0;
-	const bool title_supports_trinity = sc->psf.GetParamInt("ATTRIBUTE3", &attribute3) &&
-	                                    (static_cast<uint32_t>(attribute3) & (1u << 22u)) != 0;
-	sc->trinity_mode = Config::Ps5ProEnabled() && title_supports_trinity;
-	if (Config::Ps5ProEnabled()) {
-		Log::WriteToConsoleAndLog(fmt::format("[PS5] title Trinity support={}\n",
-		                                    title_supports_trinity ? "yes" : "no"));
-	}
 
 	sc->icon_path = file_name.parent_path() / "icon0.png";
 
@@ -634,10 +614,6 @@ void SystemContentLoadParamSfo(const std::filesystem::path& file_name) {
 	if (sc->playgo.IsValid()) {
 		sc->playgo.DbgPrint();
 	}
-}
-
-bool SystemContentIsTrinityMode() {
-	return Common::Singleton<SystemContent>::Instance()->trinity_mode;
 }
 
 bool SystemContentParamSfoGetInt(const char* name, int32_t* value) {
@@ -670,10 +646,10 @@ bool SystemContentParamSfoGetString(const char* name, char* value, size_t value_
 	return sc->psf.GetParamString(name, value, value_size);
 }
 
-MemoryParams SystemContentGetMemoryParams() {
+uint64_t SystemContentGetFlexibleMemorySize() {
 	auto* sc = Common::Singleton<SystemContent>::Instance();
 
-	return sc->psf.GetMemoryParams();
+	return sc->psf.GetFlexibleMemorySize();
 }
 
 bool SystemContentGetIconPath(std::filesystem::path* path) {

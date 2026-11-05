@@ -131,7 +131,6 @@ LIB_DEFINE(InitAudio_1_AudioOut) {
 	LIB_FUNC("QOQtbeDqsT4", AudioOut::AudioOutOutput);
 	LIB_FUNC("s1--uE9mBFw", AudioOut::AudioOutClose);
 	LIB_FUNC("GrQ9s4IrNaQ", AudioOut::AudioOutGetPortState);
-	LIB_FUNC("R5hemoKKID8", AudioOut::AudioOutGetSystemState);
 }
 
 } // namespace LibAudioOut
@@ -579,7 +578,6 @@ LIB_DEFINE(InitAudio_1_Acm) {
 	LIB_FUNC("8fe55ktlNVo", Acm::AcmBatchStartBuffers);
 	LIB_FUNC("RLN3gRlXJLE", Acm::AcmBatchWait);
 	LIB_FUNC("r7z5YQFZo+U", Acm::AcmBatchJobNotification);
-	LIB_FUNC("GTfJ64qFCPw", Acm::AcmBatchJobPriority);
 	LIB_FUNC("u70oWo92SYQ", Acm::AcmConvReverbSharedInput);
 	LIB_FUNC("9nLbWmRDpa8", Acm::AcmConvReverbSharedIr);
 	LIB_FUNC("KovqaFbmtsM", Acm::AcmFft);
@@ -1149,8 +1147,6 @@ LIB_DEFINE(InitAudio_1_Ngs2) {
 	LIB_FUNC("mPYgU4oYpuY", Ngs2::Ngs2SystemCreateWithAllocator);
 	LIB_FUNC("u-WrYDaJA3k", Ngs2::Ngs2SystemDestroy);
 	LIB_FUNC("vU7TQ62pItw", Ngs2::Ngs2SystemGetInfo);
-	LIB_FUNC("gThZqM5PYlQ", Ngs2::Ngs2SystemLock);
-	LIB_FUNC("JXRC5n0RQls", Ngs2::Ngs2SystemUnlock);
 	LIB_FUNC("U546k6orxQo", Ngs2::Ngs2RackCreateWithAllocator);
 	LIB_FUNC("cLV4aiT9JpA", Ngs2::Ngs2RackCreate);
 	LIB_FUNC("0eFLVCfWVds", Ngs2::Ngs2RackQueryBufferSize);
@@ -1162,8 +1158,6 @@ LIB_DEFINE(InitAudio_1_Ngs2) {
 	LIB_FUNC("AbYvTOZ8Pts", Ngs2::Ngs2VoiceRunCommands);
 	LIB_FUNC("-TOuuAQ-buE", Ngs2::Ngs2VoiceGetState);
 	LIB_FUNC("rEh728kXk3w", Ngs2::Ngs2VoiceGetStateFlags);
-	LIB_FUNC("9eic4AmjGVI", Ngs2::Ngs2VoiceQueryInfo);
-	LIB_FUNC("WCayTgob7-o", Ngs2::Ngs2VoiceGetPortInfo);
 	LIB_FUNC("i0VnXM-C9fc", Ngs2::Ngs2SystemRender);
 	LIB_FUNC("l4Q2dWEH6UM", Ngs2::Ngs2SystemSetGrainSamples);
 	LIB_FUNC("hyVLT2VlOYk", Ngs2::Ngs2ParseWaveformData);

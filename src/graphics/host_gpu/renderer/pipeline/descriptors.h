@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
@@ -31,6 +32,52 @@ struct PreparedBindings {
 		uint64_t address = 0;
 		uint64_t size    = 0;
 		BufferId id;
+		// KYTY_BUFFER_KEEP: what found this source and what the last rebind made of it, so that
+		// the next draw binding the same descriptor skips both while nothing they read changed
+		// (see FindBuffers, RebindBuffers). map_generation 0: the source is not kept.
+		ShaderRecompiler::IR::DescriptorValue descriptor;
+		uint64_t                              map_generation = 0;
+		uint64_t                              buffer_set     = 0;
+		// Set by FindBuffers: this draw took the source from the previous one.
+		bool                                  found_kept     = false;
+		// The last rebind: a read-only binding served by buffer `id` itself (no stream copy, no
+		// image copied into it) under image set generation `image_set` (0: not reusable) for
+		// `program`, and its result.
+		uint64_t                              image_set      = 0;
+		const void*                           program        = nullptr;
+		vk::DescriptorBufferInfo              info;
+		uint32_t                              buffer_offset  = 0;
+	};
+	// A view FindTexture returned for a binding of `image` with `info`, and the image set's
+	// generation then (see TextureCache::IsTextureCurrent); generation 0: none.
+	struct ViewMemo {
+		vk::ImageView view;
+		ImageId       image;
+		ImageViewInfo info;
+		uint64_t      generation = 0;
+	};
+	// What an image binding was resolved from, so that the next draw binding the same descriptor
+	// can keep it (see TextureCache::RefindImage).
+	struct ImageSource {
+		ShaderRecompiler::IR::ImageResource   resource;
+		ShaderRecompiler::IR::DescriptorValue value;
+		ImageId                               found;          // FindImage's result.
+		uint64_t                              generation = 0; // 0: not reusable.
+		// A null descriptor's binding: the texture cache's null image for the resource's format,
+		// which lives as long as the cache and has no guest memory to refresh.
+		bool                                  null_image = false;
+		uint32_t                              metadata_base_layer = 0;
+		// The view FindTexture last returned for a sampled binding of view_image, and the image
+		// set's generation then (see TextureCache::IsTextureCurrent); generation 0: none.
+		vk::ImageView                         view;
+		ImageId                               view_image;
+		ImageViewInfo                         view_info;
+		uint64_t                              view_generation = 0;
+		// The same memo kept with the texture description that resolved this binding, so another
+		// slot or draw resolving that description starts from the view (see ResolveTextureInto).
+		// The entry may describe another texture by now: a memo is only used for its own image
+		// and view, and IsTextureCurrent checks it as the slot's own.
+		ViewMemo*                             view_memo = nullptr;
 	};
 
 	// The draw owns the immutable compiled-program/runtime-snapshot association through commit.
@@ -40,16 +87,55 @@ struct PreparedBindings {
 	std::vector<BufferSource>             buffer_sources;
 	std::vector<vk::DescriptorBufferInfo> buffers;
 	std::vector<TextureBinding>           images;
+	std::vector<ImageSource>              image_sources;
 	std::vector<vk::Sampler>              samplers;
 	vk::DescriptorBufferInfo              gds {nullptr, 0, VK_WHOLE_SIZE};
 	vk::DescriptorBufferInfo              flattened_srt;
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
+	// Bindless: flattened-SRT words to patch (offset, region, entries) and resolved images to
+	// keep readable for this draw.
+	std::vector<std::array<uint32_t, 3>>  bindless_patches;
+	std::vector<ImageId>                  bindless_images;
+	// KYTY_DEBUG_DRAW_PHASES: the previous draw's program and descriptor hashes (see
+	// NoteBindingRepeat).
+	// The stage's images as its last draw left them, for a draw with the same program and image
+	// descriptors (see RenderExecutor::ReuseImageGroup): the bindings and views stand while no
+	// lookup could find another image (TextureCache::CurrentTargetState) and each image stays
+	// clean. program nullptr: no group (a storage image, or a view that is not kept).
+	struct ImageGroup {
+		const void*                                        program = nullptr;
+		std::vector<ShaderRecompiler::IR::DescriptorValue> images;
+		std::vector<uint32_t>                              mip_counters;
+		TextureCache::TargetState                          state {};
+		// g_image_clean_epoch when ImageGroupStands last found every image clean (0: not since
+		// the group was recorded), and whether no image's request has color metadata, so that
+		// IsColorClearCurrent holds without looking (KYTY_CLEAN_EPOCH).
+		uint64_t                                           clean_epoch = 0;
+		bool                                               clear_free  = false;
+		// KYTY_DEBUG_BIND_STATS: why the last draw recorded no group (BindStats::Refusal).
+		uint8_t                                            refused = 0;
+	} image_group;
+	// This draw kept the group so far: PrepareBindings resolved nothing, and RebindImages keeps
+	// the views if the group still stands then.
+	bool image_group_kept = false;
+
+	struct RepeatKey {
+		const void* program  = nullptr;
+		uint64_t    images   = 0;
+		uint64_t    buffers  = 0;
+		uint64_t    samplers = 0;
+	} repeat_key;
 };
+
+// KYTY_STAGE_RECORDS (see descriptors.cpp).
+[[nodiscard]] bool StageRecordsEnabled() noexcept;
 
 [[nodiscard]] vk::DescriptorType
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);
+[[nodiscard]] uint32_t
+NativeDescriptorCount(const ShaderRecompiler::IR::DescriptorBinding& binding);
 [[nodiscard]] vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture,
                                                     uint32_t              element = 0);
 

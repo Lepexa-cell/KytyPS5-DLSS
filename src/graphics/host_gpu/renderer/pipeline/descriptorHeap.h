@@ -7,6 +7,7 @@
 #include <array>
 #include <deque>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -24,20 +25,25 @@ public:
 private:
 	static constexpr uint32_t DescriptorSetBatch = 32;
 
-	struct Batch {
-		std::array<vk::DescriptorSet, DescriptorSetBatch> sets {};
-		uint32_t                                          size       = 0;
-		uint32_t                                          allocation = DescriptorSetBatch;
+	// Sets are never returned to the driver: a set is handed out again once the GPU has finished
+	// the tick it was last used in. In steady state no set is allocated at all (allocation was
+	// about 4% of the GPU thread in ASTRO BOT's Sky Garden).
+	struct Used {
+		vk::DescriptorSet set;
+		uint64_t          tick = 0;
+	};
+	struct Sets {
+		std::vector<vk::DescriptorSet> fresh;
+		std::deque<Used>               used; // In tick order.
 	};
 
-	[[nodiscard]] bool Allocate(vk::DescriptorSetLayout layout, Batch& batch);
-	void               CreateDescriptorPool();
+	void Allocate(vk::DescriptorSetLayout layout, std::vector<vk::DescriptorSet>& sets);
+	void CreateDescriptorPool();
 
-	GraphicContext&                                     m_graphics;
-	MasterSemaphore&                                    m_master_semaphore;
-	vk::DescriptorPool                                  m_current_pool = nullptr;
-	std::deque<std::pair<vk::DescriptorPool, uint64_t>> m_pending_pools;
-	std::unordered_map<vk::DescriptorSetLayout, Batch>  m_sets;
+	GraphicContext&                                   m_graphics;
+	MasterSemaphore&                                  m_master_semaphore;
+	std::vector<vk::DescriptorPool>                   m_pools;
+	std::unordered_map<vk::DescriptorSetLayout, Sets> m_sets;
 };
 
 } // namespace Libs::Graphics

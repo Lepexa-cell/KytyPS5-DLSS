@@ -124,6 +124,19 @@ static int KYTY_SYSV_ABI PadSetTiltCorrectionState(int handle, bool enabled) {
 }
 
 // PPSA02385
+static int KYTY_SYSV_ABI PadOpenExtStub(int user_id, int type, int index, const void* param) {
+	PRINT_NAME();
+
+	LOGF("\t user_id = %d\n"
+	     "\t type    = %d\n"
+	     "\t index   = %d\n"
+	     "\t param   = 0x%016" PRIx64 "\n",
+	     user_id, type, index, reinterpret_cast<uint64_t>(param));
+
+	return OK;
+}
+
+// PPSA02385
 static int KYTY_SYSV_ABI PadGetExtControllerInformationStub(int handle, void* info) {
 	PRINT_NAME();
 
@@ -154,7 +167,7 @@ LIB_DEFINE(InitPad_1) {
 
 	LIB_FUNC("hv1luiJrqQM", Controller::PadInit);
 	LIB_FUNC("xk0AcarP3V4", Controller::PadOpen);
-	LIB_FUNC("WFIiSfXGUq8", Controller::PadOpenExt);
+	LIB_FUNC("WFIiSfXGUq8", PadOpenExtStub);
 	LIB_FUNC("u1GRHp+oWoY", Controller::PadGetHandle);
 	LIB_FUNC("AcslpN1jHR8", PadDeviceClassGetExtendedInformation);
 	LIB_FUNC("IHPqcbc0zCA", PadDeviceClassParseData);
@@ -176,8 +189,6 @@ LIB_DEFINE(InitPad_1) {
 	LIB_FUNC("RR4novUEENY", Controller::PadSetLightBar);
 	LIB_FUNC("6ncge5+l5Qs", Controller::PadClose);
 	LIB_FUNC("n3kSX62fgNo", PadUnknownN3kSX62fgNo);
-	LIB_FUNC("iA-DdobUen8", Controller::PadVrControllerReadState);
-	LIB_FUNC("v8P+9PRqg10", Controller::PadVrControllerSetTriggerEffects);
 }
 
 namespace LibMouse {

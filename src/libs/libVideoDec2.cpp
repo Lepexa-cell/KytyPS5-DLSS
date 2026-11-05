@@ -4,7 +4,11 @@
 #include "libs/videoDec2Decoder.h"
 #include "loader/symbolDatabase.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
@@ -40,8 +44,6 @@ constexpr int32_t VIDEODEC2_ERROR_ACCESS_UNIT          = -2128805119; // 0x811d0
 constexpr int32_t VIDEODEC2_ERROR_OVERSIZE_DECODE      = -2128805118; // 0x811d0302
 
 constexpr uint32_t VIDEODEC2_RESOURCE_TYPE_COMPUTE = 1;
-constexpr uint32_t VIDEODEC2_CODEC_TYPE_AVC        = 1;
-constexpr uint32_t VIDEODEC2_CODEC_TYPE_VP9        = 2382845;
 constexpr size_t   VIDEODEC2_MIN_MEMORY_SIZE       = 16ull * 1024ull * 1024ull;
 constexpr uint32_t VIDEODEC2_FRAME_FORMAT_DEFAULT  = 0;
 
@@ -113,8 +115,69 @@ struct Videodec2FrameBuffer {
 	bool   is_accepted;
 };
 
-using Videodec2AvcPictureInfo = Decoder::AvcPictureInfo;
-using Videodec2Vp9PictureInfo = Decoder::Vp9PictureInfo;
+struct Videodec2AvcPictureInfo {
+	size_t this_size;
+	bool   is_valid;
+
+	uint64_t pts_data;
+	uint64_t dts_data;
+	uint64_t attached_data;
+
+	uint8_t  idr_picture_flag;
+	uint8_t  profile_idc;
+	uint8_t  level_idc;
+	uint32_t pic_width_in_mbs_minus1;
+	uint32_t pic_height_in_map_units_minus1;
+	uint8_t  frame_mbs_only_flag;
+
+	uint8_t  frame_cropping_flag;
+	uint32_t frame_crop_left_offset;
+	uint32_t frame_crop_right_offset;
+	uint32_t frame_crop_top_offset;
+	uint32_t frame_crop_bottom_offset;
+
+	uint8_t  aspect_ratio_info_present_flag;
+	uint8_t  aspect_ratio_idc;
+	uint16_t sar_width;
+	uint16_t sar_height;
+
+	uint8_t video_signal_type_present_flag;
+	uint8_t video_format;
+	uint8_t video_full_range_flag;
+	uint8_t colour_description_present_flag;
+	uint8_t colour_primaries;
+	uint8_t transfer_characteristics;
+	uint8_t matrix_coefficients;
+
+	uint8_t  timing_info_present_flag;
+	uint32_t num_units_in_tick;
+	uint32_t time_scale;
+	uint8_t  fixed_frame_rate_flag;
+
+	uint8_t bitstream_restriction_flag;
+	uint8_t max_dec_frame_buffering;
+
+	uint8_t pic_struct_present_flag;
+	uint8_t pic_struct;
+	uint8_t field_pic_flag;
+	uint8_t bottom_field_flag;
+
+	uint8_t sequence_parameter_set_present_flag;
+	uint8_t picture_parameter_set_present_flag;
+	uint8_t au_delimiter_present_flag;
+	uint8_t end_of_sequence_present_flag;
+	uint8_t end_of_stream_present_flag;
+	uint8_t filler_data_present_flag;
+	uint8_t picture_timing_sei_present_flag;
+	uint8_t buffering_period_sei_present_flag;
+
+	uint8_t constraint_set0_flag;
+	uint8_t constraint_set1_flag;
+	uint8_t constraint_set2_flag;
+	uint8_t constraint_set3_flag;
+	uint8_t constraint_set4_flag;
+	uint8_t constraint_set5_flag;
+};
 
 struct Videodec2ComputeMemoryInfo {
 	size_t this_size;
@@ -176,8 +239,6 @@ static void FillNoPictureOutput(const Videodec2FrameBuffer* frame_buffer,
 static int32_t MapDecoderResult(Decoder::Result result) {
 	switch (result) {
 		case Decoder::Result::Ok: return OK;
-		case Decoder::Result::InputFull:
-		case Decoder::Result::NoFrame:
 		case Decoder::Result::ApiFail: return VIDEODEC2_ERROR_API_FAIL;
 		case Decoder::Result::AccessUnit: return VIDEODEC2_ERROR_ACCESS_UNIT;
 		case Decoder::Result::FrameBufferSize: return VIDEODEC2_ERROR_FRAME_BUFFER_SIZE;
@@ -304,17 +365,6 @@ static int32_t KYTY_SYSV_ABI ReleaseComputeQueue(Videodec2ComputeQueue compute_q
 	return compute_queue != nullptr ? OK : VIDEODEC2_ERROR_COMPUTE_QUEUE_ID;
 }
 
-static size_t FrameBufferSize(const Videodec2DecoderConfigInfo& config) {
-	if (config.codec_type != VIDEODEC2_CODEC_TYPE_AVC || config.max_frame_width <= 0 ||
-	    config.max_frame_height <= 0) {
-		return VIDEODEC2_MIN_MEMORY_SIZE;
-	}
-	// AVC output: 256-byte pitch, 16-line maximum height, and 4096 bytes of metadata.
-	const auto pitch  = (static_cast<size_t>(config.max_frame_width) + 255u) & ~size_t {255};
-	const auto height = (static_cast<size_t>(config.max_frame_height) + 15u) & ~size_t {15};
-	return pitch * height * 3 / 2 + 4096;
-}
-
 static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,
                                                     Videodec2DecoderMemoryInfo*       memory_info) {
 	PRINT_NAME();
@@ -339,7 +389,17 @@ static int32_t KYTY_SYSV_ABI QueryDecoderMemoryInfo(const Videodec2DecoderConfig
 	memory_info->gpu_memory             = nullptr;
 	memory_info->cpu_gpu_memory_size    = VIDEODEC2_MIN_MEMORY_SIZE;
 	memory_info->cpu_gpu_memory         = nullptr;
-	memory_info->max_frame_buffer_size  = FrameBufferSize(*config);
+	// One NV12 frame as the decoder writes it (luma pitch aligned to 256 bytes, half-height
+	// chroma). Games carve their frame pool by this size and need several frames: Ghost of Yotei
+	// gives up on every movie (no frame decoded) when fewer than four 16 MiB frames fit.
+	if (config->max_frame_width > 0 && config->max_frame_height > 0) {
+		const uint64_t pitch  = (static_cast<uint64_t>(config->max_frame_width) + 255u) & ~uint64_t {255u};
+		const uint64_t height = static_cast<uint64_t>(config->max_frame_height);
+		memory_info->max_frame_buffer_size =
+		    static_cast<size_t>((pitch * height + pitch * ((height + 1u) / 2u) + 0xffu) & ~uint64_t {0xffu});
+	} else {
+		memory_info->max_frame_buffer_size = VIDEODEC2_MIN_MEMORY_SIZE;
+	}
 	memory_info->frame_buffer_alignment = 0x100;
 	memory_info->reserved0              = 0;
 
@@ -368,7 +428,7 @@ static int32_t KYTY_SYSV_ABI CreateDecoder(const Videodec2DecoderConfigInfo* con
 	if (memory_info->cpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
 	    memory_info->cpu_gpu_memory_size < VIDEODEC2_MIN_MEMORY_SIZE ||
-	    memory_info->max_frame_buffer_size < FrameBufferSize(*config)) {
+	    memory_info->max_frame_buffer_size == 0) {
 		return VIDEODEC2_ERROR_MEMORY_SIZE;
 	}
 
@@ -546,21 +606,48 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 		return OK;
 	};
 
-	if (output_info->codec_type == VIDEODEC2_CODEC_TYPE_AVC) {
+	if (output_info->codec_type == 1) {
 		const auto requested_size = *static_cast<const size_t*>(first_picture_info);
 		if (requested_size != sizeof(Videodec2AvcPictureInfo) &&
 		    (requested_size | 16u) != sizeof(Videodec2AvcPictureInfo)) {
 			return VIDEODEC2_ERROR_STRUCT_SIZE;
 		}
 
-		const auto picture = Decoder::MakeAvcPictureInfo(decoded, requested_size);
+		Videodec2AvcPictureInfo picture {};
+		picture.this_size                      = requested_size;
+		picture.is_valid                       = true;
+		picture.pts_data                       = decoded.pts;
+		picture.dts_data                       = decoded.dts;
+		picture.attached_data                  = decoded.attached_data;
+		picture.idr_picture_flag               = decoded.key_frame ? 1 : 0;
+		picture.profile_idc                    = static_cast<uint8_t>(decoded.profile);
+		picture.level_idc                      = static_cast<uint8_t>(decoded.level);
+		picture.pic_width_in_mbs_minus1        = (decoded.width + 15u) / 16u - 1u;
+		picture.pic_height_in_map_units_minus1 = (decoded.height + 15u) / 16u - 1u;
+		picture.frame_mbs_only_flag            = 1;
+		picture.frame_cropping_flag      = decoded.crop_left != 0 || decoded.crop_right != 0 ||
+		                                           decoded.crop_top != 0 || decoded.crop_bottom != 0
+		                                       ? 1
+		                                       : 0;
+		picture.frame_crop_left_offset   = decoded.crop_left;
+		picture.frame_crop_right_offset  = decoded.crop_right;
+		picture.frame_crop_top_offset    = decoded.crop_top;
+		picture.frame_crop_bottom_offset = decoded.crop_bottom;
+		picture.aspect_ratio_info_present_flag =
+		    decoded.sar_width != 0 && decoded.sar_height != 0 ? 1 : 0;
+		picture.aspect_ratio_idc               = picture.aspect_ratio_info_present_flag ? 255 : 0;
+		picture.sar_width                      = decoded.sar_width;
+		picture.sar_height                     = decoded.sar_height;
+		picture.video_signal_type_present_flag = 1;
+		picture.video_format                   = 5;
+		picture.video_full_range_flag          = decoded.color_range == 2 ? 1 : 0;
+		picture.colour_description_present_flag =
+		    decoded.color_primaries != 0 || decoded.color_trc != 0 || decoded.color_space != 0 ? 1
+		                                                                                       : 0;
+		picture.colour_primaries         = decoded.color_primaries;
+		picture.transfer_characteristics = decoded.color_trc;
+		picture.matrix_coefficients      = decoded.color_space;
 		std::memcpy(first_picture_info, &picture, requested_size);
-	} else if (output_info->codec_type == VIDEODEC2_CODEC_TYPE_VP9) {
-		auto* picture = static_cast<Videodec2Vp9PictureInfo*>(first_picture_info);
-		if (picture->this_size != sizeof(Videodec2Vp9PictureInfo)) {
-			return VIDEODEC2_ERROR_STRUCT_SIZE;
-		}
-		*picture = Decoder::MakeVp9PictureInfo(decoded);
 	} else {
 		const auto result = fill_common(first_picture_info, true);
 		if (result != OK) {
@@ -577,18 +664,124 @@ static int32_t KYTY_SYSV_ABI GetPictureInfo(const Videodec2OutputInfo* output_in
 	return OK;
 }
 
+// KYTY_DEBUG_VIDEODEC=1 prints each Videodec2 call with its arguments of interest and result.
+static bool VideodecDebug() {
+	static const bool enabled = std::getenv("KYTY_DEBUG_VIDEODEC") != nullptr;
+	return enabled;
+}
+
+static int32_t KYTY_SYSV_ABI LoggedQueryComputeMemoryInfo(Videodec2ComputeMemoryInfo* info) {
+	const auto r = QueryComputeMemoryInfo(info);
+	if (VideodecDebug()) {
+		std::printf("videodec: QueryComputeMemoryInfo -> %08x\n", static_cast<uint32_t>(r));
+	}
+	return r;
+}
+
+static int32_t KYTY_SYSV_ABI LoggedAllocateComputeQueue(const Videodec2ComputeConfigInfo* config,
+                                                        const Videodec2ComputeMemoryInfo* memory,
+                                                        Videodec2ComputeQueue*            queue) {
+	const auto r = AllocateComputeQueue(config, memory, queue);
+	if (VideodecDebug()) {
+		std::printf("videodec: AllocateComputeQueue -> %08x\n", static_cast<uint32_t>(r));
+	}
+	return r;
+}
+
+static int32_t KYTY_SYSV_ABI LoggedQueryDecoderMemoryInfo(const Videodec2DecoderConfigInfo* config,
+                                                          Videodec2DecoderMemoryInfo*       memory) {
+	const auto r = QueryDecoderMemoryInfo(config, memory);
+	if (VideodecDebug()) {
+		std::printf("videodec: QueryDecoderMemoryInfo codec=%u size=%dx%d -> %08x\n",
+		            config != nullptr ? config->codec_type : 0u,
+		            config != nullptr ? config->max_frame_width : 0,
+		            config != nullptr ? config->max_frame_height : 0, static_cast<uint32_t>(r));
+	}
+	return r;
+}
+
+// Decodes since the last CreateDecoder (KYTY_DEBUG_VIDEODEC tracing).
+static std::atomic<uint32_t> g_decodes_since_create {0};
+
+static int32_t KYTY_SYSV_ABI LoggedCreateDecoder(const Videodec2DecoderConfigInfo* config,
+                                                 const Videodec2DecoderMemoryInfo* memory,
+                                                 Videodec2Decoder*                 decoder) {
+	const auto r = CreateDecoder(config, memory, decoder);
+	g_decodes_since_create = 0;
+	if (VideodecDebug()) {
+		std::printf("videodec: CreateDecoder codec=%u size=%dx%d -> %08x caller=%p\n",
+		            config != nullptr ? config->codec_type : 0u,
+		            config != nullptr ? config->max_frame_width : 0,
+		            config != nullptr ? config->max_frame_height : 0, static_cast<uint32_t>(r),
+		            __builtin_return_address(0));
+	}
+	return r;
+}
+
+static int32_t KYTY_SYSV_ABI LoggedDeleteDecoder(Videodec2Decoder decoder) {
+	const auto r = DeleteDecoder(decoder);
+	if (VideodecDebug()) {
+		std::printf("videodec: DeleteDecoder -> %08x caller=%p\n", static_cast<uint32_t>(r),
+		            __builtin_return_address(0));
+	}
+	return r;
+}
+
+static int32_t KYTY_SYSV_ABI LoggedDecode(Videodec2Decoder decoder, const Videodec2InputData* input,
+                                          Videodec2FrameBuffer* frame, Videodec2OutputInfo* output) {
+	const auto start = std::chrono::steady_clock::now();
+	const auto r     = Decode(decoder, input, frame, output);
+	// Every decode is logged (with its duration, output flags and the time since the previous
+	// call), so a movie the game cuts short shows whether decoding or the caller is the bottleneck.
+	static std::atomic<int64_t> previous_us {0};
+	const auto end    = std::chrono::steady_clock::now();
+	const auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(end.time_since_epoch()).count();
+	const auto gap_us = now_us - previous_us.exchange(now_us);
+	if (VideodecDebug()) {
+		std::printf(
+		    "videodec: Decode au_size=%u pts=%llu -> %08x in %.1f ms (gap %.1f ms) accepted=%d "
+		    "valid=%d pictures=%u error=%d discarded=%d\n",
+		    input != nullptr ? static_cast<uint32_t>(input->au_size) : 0u,
+		    input != nullptr ? static_cast<unsigned long long>(input->pts_data) : 0ull,
+		    static_cast<uint32_t>(r),
+		    std::chrono::duration<double, std::milli>(end - start).count(), gap_us / 1000.0,
+		    frame != nullptr && frame->is_accepted ? 1 : 0,
+		    output != nullptr && output->is_valid ? 1 : 0,
+		    output != nullptr ? static_cast<uint32_t>(output->picture_count) : 0u,
+		    output != nullptr && output->is_error_frame ? 1 : 0,
+		    output != nullptr && output->is_discarded_frame ? 1 : 0);
+		std::fflush(stdout);
+		// With KYTY_DEBUG_CALL_COUNTS: after a movie's 12th decode (where Ghost of Yotei's decode
+		// thread stops for seconds), the decoding thread's next calls and 1.5 s of every thread's.
+		if (g_decodes_since_create.fetch_add(1) == 11u) {
+			Libs::TraceCalls(300);
+			Libs::TraceAllCalls(std::chrono::milliseconds(1500));
+		}
+	}
+	return r;
+}
+
+static int32_t KYTY_SYSV_ABI LoggedReset(Videodec2Decoder decoder) {
+	const auto r = Reset(decoder);
+	if (VideodecDebug()) {
+		std::printf("videodec: Reset -> %08x caller=%p\n", static_cast<uint32_t>(r),
+		            __builtin_return_address(0));
+	}
+	return r;
+}
+
 LIB_DEFINE(InitVideoDec2_1) {
 	PRINT_NAME_ENABLE(true);
 
-	LIB_FUNC("RnDibcGCPKw", QueryComputeMemoryInfo);
-	LIB_FUNC("eD+X2SmxUt4", AllocateComputeQueue);
+	LIB_FUNC("RnDibcGCPKw", LoggedQueryComputeMemoryInfo);
+	LIB_FUNC("eD+X2SmxUt4", LoggedAllocateComputeQueue);
 	LIB_FUNC("UvtA3FAiF4Y", ReleaseComputeQueue);
-	LIB_FUNC("qqMCwlULR+E", QueryDecoderMemoryInfo);
-	LIB_FUNC("CNNRoRYd8XI", CreateDecoder);
-	LIB_FUNC("jwImxXRGSKA", DeleteDecoder);
-	LIB_FUNC("852F5+q6+iM", Decode);
+	LIB_FUNC("qqMCwlULR+E", LoggedQueryDecoderMemoryInfo);
+	LIB_FUNC("CNNRoRYd8XI", LoggedCreateDecoder);
+	LIB_FUNC("jwImxXRGSKA", LoggedDeleteDecoder);
+	LIB_FUNC("852F5+q6+iM", LoggedDecode);
 	LIB_FUNC("l1hXwscLuCY", Flush);
-	LIB_FUNC("wJXikG6QFN8", Reset);
+	LIB_FUNC("wJXikG6QFN8", LoggedReset);
 	LIB_FUNC("NtXRa3dRzU0", GetPictureInfo);
 	LIB_FUNC("kjrLbcyhEiw", GetPictureInfo);
 }

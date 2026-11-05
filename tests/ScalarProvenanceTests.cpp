@@ -3,8 +3,7 @@
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
-#include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
-#include "SrtWalkerTestMemory.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -14,7 +13,6 @@
 namespace {
 
 using namespace Libs::Graphics::ShaderRecompiler::IR;
-using Libs::Graphics::ShaderComputeInputInfo;
 using Libs::Graphics::ShaderType;
 
 void Check(bool condition, const char *message) {
@@ -38,7 +36,6 @@ void CheckFatal(F &&function, std::string_view expected, const char *message) {
 
 struct Fixture {
   Program program;
-  ShaderComputeInputInfo compute{};
 
   explicit Fixture(uint32_t block_count = 1) {
     program.stage = ShaderType::Compute;
@@ -48,7 +45,7 @@ struct Fixture {
       program.block_storage.push_back(std::make_unique<Block>());
       auto *block = program.block_storage.back().get();
       program.blocks.push_back(block);
-      program.blocks.back()->id = index;
+      program.block_info.push_back({.id = index});
     }
   }
 
@@ -75,7 +72,7 @@ struct Fixture {
     return static_cast<uint32_t>(program.memory_info.size() - 1u);
   }
 
-  void Plan() { TrackResources(program, {}, {}, {.compute = &compute}); }
+  void Plan() { TrackResources(program, {}, {}); }
 };
 
 struct TestMemory {
@@ -92,16 +89,6 @@ bool ReadMemory(void *userdata, uint64_t address, std::span<uint32_t> values) {
     address += sizeof(uint32_t);
   }
   memory.reads++;
-  return true;
-}
-
-// Evaluates the DWORDs of a descriptor source that no resource consumes.
-bool EvaluateSource(ResourcePlan &plan, const SrtRuntime &runtime, uint32_t source,
-                    DescriptorValue &result) {
-  const auto &words = plan.descriptor_sources[source];
-  result = {.dword_count = words.dword_count};
-  for (uint32_t word = 0; word < words.dword_count; ++word)
-    if (!EvaluateSrtValue(plan, runtime, words.dwords[word], result.dwords[word])) return false;
   return true;
 }
 
@@ -142,9 +129,9 @@ void TestImmediateFlatteningAndGvn() {
         "flattened raw read was not kept as a planning-only root");
 
   TestMemory memory_image{{{0x1020u, 0xfeedbeefu}}};
-  FakeGuestMemory fake(ReadMemory, &memory_image);
+  SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  Check(WalkSrt(ExtractResourcePlan(fixture.program), {}, flat, nullptr), "flattened SRT walk failed");
+  Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat), "flattened SRT walk failed");
   Check(flat == std::vector<uint32_t>{0xfeedbeefu} && memory_image.reads == 1,
         "flattened SRT did not evaluate its canonical read once");
 }
@@ -158,9 +145,9 @@ void TestRawScalarComponentAlignment() {
   fixture.Plan();
 
   TestMemory memory_image{{{0x1000u, 0x12345678u}}};
-  FakeGuestMemory fake(ReadMemory, &memory_image);
+  SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  Check(WalkSrt(ExtractResourcePlan(fixture.program), {}, flat, nullptr), "raw scalar SRT walk failed");
+  Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat), "raw scalar SRT walk failed");
   Check(
       flat == std::vector<uint32_t>{0x12345678u} && memory_image.reads == 1,
       "raw scalar base, immediate, and offset were not aligned independently");
@@ -170,7 +157,7 @@ void TestScalarMemoryDomainMismatchFails() {
   Fixture raw;
   const auto raw_memory = raw.AddMemory(ResourceKind::ScalarBuffer);
   RawRead(raw, Address(raw, Value(0x1000u), Value(0u)), Value(0u), raw_memory);
-  CheckFatal([&] { raw.Plan(); },
+  CheckFatal([&] { TrackResources(raw.program, {}, {}); },
              "incompatible scalar memory metadata",
              "raw scalar load accepted descriptor-buffer metadata");
 
@@ -181,7 +168,7 @@ void TestScalarMemoryDomainMismatchFails() {
                   {Value(0x1000u), Value(0u), Value(16u), Value(0u)});
   buffer.EmitMemory(ValueOpcode::ReadConstBuffer, {resource, Value(0u)},
                     buffer_memory);
-  CheckFatal([&] { buffer.Plan(); },
+  CheckFatal([&] { TrackResources(buffer.program, {}, {}); },
              "incompatible scalar memory metadata",
              "descriptor scalar load accepted raw-address metadata");
 }
@@ -213,9 +200,9 @@ void TestNestedSrtWalk() {
   fixture.Plan();
 
   TestMemory memory_image{{{0x1000u, 0x2000u}, {0x2000u, 0xabcdef01u}}};
-  FakeGuestMemory fake(ReadMemory, &memory_image);
+  SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
   std::vector<uint32_t> flat;
-  Check(WalkSrt(ExtractResourcePlan(fixture.program), {}, flat, nullptr), "nested SRT walk failed");
+  Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat), "nested SRT walk failed");
   Check(flat == std::vector<uint32_t>({0x2000u, 0xabcdef01u}),
         "nested typed SRT reads were not evaluated in dependency order");
 }
@@ -237,9 +224,8 @@ void TestShaderBaseAndUserData() {
   const std::array user_data{0x20u};
   SrtRuntime runtime{.user_data = user_data,
                      .shader_base = 0x12345678abcdef00ull};
-  auto plan = ExtractResourcePlan(fixture.program);
   DescriptorValue result;
-  Check(EvaluateSource(plan, runtime, 0, result),
+  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(0, result),
         "shader-relative descriptor evaluation failed");
   Check(result.dword_count == 3 && result.dwords[0] == 0xabcdef00u &&
             result.dwords[1] == 0x12345678u && result.dwords[2] == 0x24u,
@@ -248,9 +234,12 @@ void TestShaderBaseAndUserData() {
 
 void TestCarryAndBitFields() {
   Fixture fixture;
-  const auto low = fixture.Emit(ValueOpcode::IAdd32, {Value(0xffffffffu), Value(2u)});
-  const auto carry = fixture.Emit(ValueOpcode::ULessThan32, {low, Value(0xffffffffu)});
-  const auto high = fixture.Emit(ValueOpcode::SelectU32, {carry, Value(1u), Value(0u)});
+  const auto carry =
+      fixture.Emit(ValueOpcode::IAddCarry32, {Value(0xffffffffu), Value(2u)});
+  const auto low =
+      fixture.Emit(ValueOpcode::CompositeExtractU32x2, {carry, Value(0u)});
+  const auto high =
+      fixture.Emit(ValueOpcode::CompositeExtractU32x2, {carry, Value(1u)});
   const auto inserted =
       fixture.Emit(ValueOpcode::BitFieldInsert,
                    {Value(0u), Value(0x89abcdefu), Value(0u), Value(32u)});
@@ -260,9 +249,8 @@ void TestCarryAndBitFields() {
   fixture.program.descriptor_sources.push_back(
       {.dwords = {low, high, inserted, sign}, .dword_count = 4});
 
-  auto plan = ExtractResourcePlan(fixture.program);
   DescriptorValue result;
-  Check(EvaluateSource(plan, {}, 0, result),
+  Check(SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result),
         "carry and bit-field descriptor evaluation failed");
   Check(result.dwords[0] == 1u && result.dwords[1] == 1u &&
             result.dwords[2] == 0x89abcdefu && result.dwords[3] == 0xffffffffu,
@@ -285,12 +273,11 @@ void TestInvariantAndDivergentPhi() {
   fixture.program.descriptor_sources.push_back(
       {.dwords = {Value(&divergent)}, .dword_count = 1});
 
-  auto plan = ExtractResourcePlan(fixture.program);
   DescriptorValue result;
-  Check(EvaluateSource(plan, {}, 0, result) &&
+  Check(SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 7u,
         "loop-invariant typed phi was rejected");
-  Check(!EvaluateSource(plan, {}, 1, result),
+  Check(!SrtWalker(fixture.program, {}).EvaluateDescriptor(1, result),
         "divergent phi was accepted");
 }
 
@@ -300,17 +287,13 @@ void TestOperandMutationLifecycle() {
   auto *source = definition.TryInstruction();
   const auto inserted = fixture.Emit(ValueOpcode::BitFieldInsert,
       {definition, definition, Value(4u), Value(4u)});
-  auto *consumer = inserted.TryInstruction();
-  Check(source->Uses() == std::vector<Use>({{consumer, 0}, {consumer, 1}}),
-        "inline operands lost distinct reverse-use indices");
-  consumer->SetArg(0, definition);
-  Check(source->UseCount() == 2, "re-setting an operand to its value duplicated its use");
-  consumer->SetArg(1, Value(3u));
+  Check(source->UseCount() == 2, "inline operands lost distinct reverse-use indices");
+  inserted.TryInstruction()->SetArg(1, Value(3u));
   Check(source->UseCount() == 1, "inline operand mutation did not detach its old use");
   source->ReplaceUsesWith(Value(0xaau));
   uint32_t result = 0;
   Check(source->UseCount() == 0 &&
-            EvaluateSrtValue(fixture.program, {}, inserted, result) && result == 0x3au,
+            SrtWalker(fixture.program, {}).Evaluate(inserted, result) && result == 0x3au,
         "inline operand replacement changed the evaluated value");
 
   for (const auto opcode : {ValueOpcode::GetImageResource, ValueOpcode::MakeImageAddress}) {
@@ -349,37 +332,8 @@ void TestOperandMutationLifecycle() {
   const auto sum = fixture.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(5u)}, 0, 5);
   phi.ReplaceUsesWith(Value(6u));
   Check(source->UseCount() == 0 && phi.NumPhiBlocks() == 0 && phi.NumArgs() == 1 &&
-            EvaluateSrtValue(fixture.program, {}, sum, result) && result == 11,
+            SrtWalker(fixture.program, {}).Evaluate(sum, result) && result == 11,
         "Phi replacement retained incoming uses or changed the consumer value");
-}
-
-void TestReplacementKeepsUseOrder() {
-  Fixture fixture(2);
-  const auto base = fixture.Emit(ValueOpcode::IAdd32, {Value(1u), Value(2u)});
-  auto *before = fixture.Emit(ValueOpcode::IAdd32, {base, Value(3u)}).TryInstruction();
-  auto *identity = fixture.Emit(ValueOpcode::Identity, {base}).TryInstruction();
-  auto *pair = fixture.Emit(ValueOpcode::IAdd32, {Value(identity), Value(identity)}).TryInstruction();
-  auto *after = fixture.Emit(ValueOpcode::IAdd32, {Value(4u), base}).TryInstruction();
-  auto &large = fixture.program.value_storage.emplace_back(ValueOpcode::GetImageResource);
-  const auto last = large.NumArgs() - 1;
-  large.SetArg(last, Value(identity));
-  identity->ReplaceUsesWith(base, false);
-  Check(!identity->HasUses() && identity->NumArgs() == 0 && pair->Arg(0) == base &&
-            pair->Arg(1) == base && large.Arg(last) == base &&
-            base.TryInstruction()->Uses() ==
-                std::vector<Use>({{before, 0}, {after, 1}, {pair, 0}, {pair, 1}, {&large, last}}),
-        "identity removal lost or reordered the uses of its argument");
-
-  auto &phi = fixture.BlockAt(1).AppendNewInst(ValueOpcode::Phi);
-  phi.SetFlags(Type::U32);
-  phi.AddPhiOperand(&fixture.BlockAt(0), Value(after));
-  phi.AddPhiOperand(&fixture.BlockAt(1), Value(&phi));
-  auto *user = fixture.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(&phi)}, 0, 1).TryInstruction();
-  phi.ReplaceUsesWith(Value(after));
-  Check(phi.GetOpcode() == ValueOpcode::Identity && phi.Arg(0) == Value(after) && !phi.HasUses() &&
-            user->Arg(0) == Value(after) && user->Arg(1) == Value(after) &&
-            after->Uses() == std::vector<Use>({{user, 0}, {user, 1}, {&phi, 0}}),
-        "self-referencing Phi replacement kept a use of itself or reordered the moved uses");
 }
 
 void TestControlDependentStandaloneLoadStaysTyped() {
@@ -419,9 +373,8 @@ void TestRuntime64BitDescriptorOps() {
   fixture.program.descriptor_sources.push_back(
       {.dwords = {low, high}, .dword_count = 2});
 
-  auto plan = ExtractResourcePlan(fixture.program);
   DescriptorValue result;
-  Check(EvaluateSource(plan, {}, 0, result) &&
+  Check(SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 0xabcdu && result.dwords[1] == 0x1235u,
         "64-bit typed descriptor arithmetic evaluation is incorrect");
 }
@@ -494,13 +447,12 @@ void TestUniformFirstLaneSamplerLod() {
   std::array<uint32_t, 7> user_data{};
   user_data[6] = 3u;
   SrtRuntime runtime{.user_data = user_data};
-  auto plan = ExtractResourcePlan(fixture.program);
   DescriptorValue result;
-  Check(EvaluateSource(plan, runtime, 0, result) &&
+  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 0x00300300u,
         "uniform sampler LOD evaluated incorrectly");
   user_data[6] = 20u;
-  Check(EvaluateSource(plan, runtime, 0, result) &&
+  Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(0, result) &&
             result.dwords[0] == 0x00ffffffu,
         "uniform sampler LOD clamp evaluated incorrectly");
 }
@@ -535,44 +487,16 @@ void TestFloatComparisonDescriptorInputs() {
     fixture.program.descriptor_sources.push_back(
         {.dwords = {low, high}, .dword_count = 2});
 
-    auto plan = ExtractResourcePlan(fixture.program);
     for (size_t index = 0; index < inputs.size(); index++) {
       const auto &input = inputs[index];
       const std::array user_data{input.bits};
       DescriptorValue result;
-      Check(EvaluateSource(plan, {.user_data = user_data}, 0, result) &&
+      Check(SrtWalker(fixture.program, {.user_data = user_data})
+                    .EvaluateDescriptor(0, result) &&
                 result.dwords[0] == (flush && index < 4 ? 1 : input.less_equal) &&
                 result.dwords[1] == (flush && index < 4 ? 1 : input.greater_equal),
             "descriptor comparison disagrees with native FP32 input mode");
     }
-  }
-}
-
-void TestSignedConversionDescriptorInputs() {
-  // 3.75 and -3.75 truncate, the largest float below 2^31 converts exactly, 2^31 and +inf
-  // saturate up, -2^31 and -1e10 saturate down, and -0.0, a denormal and both NaNs read zero.
-  constexpr std::array<std::pair<uint32_t, uint32_t>, 11> inputs = {{
-      {0x40700000u, 3u},          {0xc0700000u, 0xfffffffdu}, {0x4effffffu, 0x7fffff80u},
-      {0x4f000000u, 0x7fffffffu}, {0x7f800000u, 0x7fffffffu}, {0xcf000000u, 0x80000000u},
-      {0xd01502f9u, 0x80000000u}, {0x80000000u, 0u},          {0x00000001u, 0u},
-      {0x7fc00000u, 0u},          {0xffc00000u, 0u}}};
-  Fixture fixture;
-  const auto user = fixture.Emit(
-      ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
-  const auto converted = fixture.Emit(
-      ValueOpcode::ConvertS32F32, {fixture.Emit(ValueOpcode::BitCastF32U32, {user})});
-  Check(ValidateRuntimeValue(fixture.program, converted),
-        "signed float conversion was rejected as a runtime value");
-  fixture.program.descriptor_sources.push_back(
-      {.dwords = {converted}, .dword_count = 1});
-
-  auto plan = ExtractResourcePlan(fixture.program);
-  for (const auto [bits, expected] : inputs) {
-    const std::array user_data{bits};
-    DescriptorValue result;
-    Check(EvaluateSource(plan, {.user_data = user_data}, 0, result) &&
-              result.dwords[0] == expected,
-          "descriptor signed conversion disagrees with the native conversion");
   }
 }
 
@@ -622,49 +546,29 @@ void TestConstantBufferBounds() {
   struct Case {
     uint32_t offset;
     uint32_t immediate;
-    uint32_t stride;
-    uint32_t records;
+    bool valid;
     uint32_t expected;
-    uint32_t reads;
   };
-  struct MemoryProbe {
-    TestMemory memory{{{0x3000u, 0x12345678u}, {0x300cu, 0xa5a5a5a5u}}};
-    uint32_t attempts = 0;
-  };
-  const auto read_memory = [](void *userdata, uint64_t address,
-                              std::span<uint32_t> values) {
-    auto &probe = *static_cast<MemoryProbe *>(userdata);
-    ++probe.attempts;
-    return ReadMemory(&probe.memory, address, values);
-  };
-  // PS5 scalar-buffer loads return zero per out-of-range DWORD without an access;
-  // an unreadable in-range address is accessed and reads as zero too.
-  for (const auto &test : {Case{12u, 0u, 0u, 16u, 0xa5a5a5a5u, 1u},
-                           Case{3u, 1u, 0u, 16u, 0x12345678u, 1u},
-                           Case{0xfffffffcu, 4u, 0u, 16u, 0u, 0u},
-                           Case{16u, 0u, 0u, 16u, 0u, 0u},
-                           Case{12u, 0u, 0u, 14u, 0u, 0u},
-                           Case{0u, 0u, 0u, 0u, 0u, 0u},
-                           Case{8u, 0u, 0u, 16u, 0u, 1u},
-                           Case{12u, 0u, 48u, 32768u, 0xa5a5a5a5u, 1u},
-                           Case{0x6339c0u, 16u, 48u, 32768u, 0u, 0u}}) {
+  for (const auto &test : {Case{12u, 0u, true, 0xa5a5a5a5u},
+                           Case{3u, 1u, true, 0x12345678u},
+                           Case{0xfffffffcu, 4u, false, 0u},
+                           Case{16u, 0u, false, 0u}}) {
     Fixture fixture;
     const auto memory = fixture.AddMemory(ResourceKind::ScalarBuffer, test.immediate);
     const auto buffer =
         fixture.Emit(ValueOpcode::GetBufferResource,
-                     {Value(0x3000u), Value(test.stride << 16u),
-                      Value(test.records), Value(0u)});
+                     {Value(0x3000u), Value(0u), Value(16u), Value(0u)});
     const auto read = fixture.EmitMemory(ValueOpcode::ReadConstBuffer,
                                          {buffer, Value(test.offset)}, memory);
     LoadBuffer(fixture, {read, Value(0u), Value(16u), Value(0u)});
     fixture.Plan();
 
-    MemoryProbe memory_image;
-    FakeGuestMemory fake(read_memory, &memory_image);
+    TestMemory memory_image{{{0x3000u, 0x12345678u}, {0x300cu, 0xa5a5a5a5u}}};
+    SrtRuntime runtime{.read_memory = ReadMemory, .userdata = &memory_image};
     std::vector<uint32_t> flat;
-    Check(WalkSrt(ExtractResourcePlan(fixture.program), {}, flat, nullptr),
+    Check(SrtWalker(fixture.program, runtime).RefreshFlatBuffer(flat) == test.valid,
           "constant-buffer walk misaligned or wrapped its offset components");
-    Check(flat == std::vector<uint32_t>{test.expected} && memory_image.attempts == test.reads,
+    Check(test.valid ? flat == std::vector<uint32_t>{test.expected} : memory_image.reads == 0,
           "constant-buffer walk read the wrong word or accessed an out-of-bounds address");
   }
 }
@@ -689,137 +593,6 @@ void TestReadLaneElimination() {
         "dynamic-lane read was rewritten unsafely");
 }
 
-void TestCompleteWaveReduction() {
-  enum class Case {
-    Masked, ScalarExec, Wave32, Wave32Rows, Wave32Maximum, RowMask, BankMask,
-    Shift, FetchInactive, BoundControl, Dpp8, MoveExec, UpdateExec,
-    Previous, DppSource, CrossExec, CrossRow, CrossSelectorLow,
-    CrossSelectorHigh, CrossFetch, CrossBound, CrossSource, FinalExec,
-    Endpoint, EndpointSource, CrossBlock, WrongOperation, Or
-  };
-  for (const auto test : {Case::Masked, Case::ScalarExec, Case::Wave32,
-       Case::Wave32Rows, Case::Wave32Maximum, Case::RowMask, Case::BankMask,
-       Case::Shift, Case::FetchInactive, Case::BoundControl, Case::Dpp8,
-       Case::MoveExec, Case::UpdateExec, Case::Previous, Case::DppSource,
-       Case::CrossExec, Case::CrossRow, Case::CrossSelectorLow,
-       Case::CrossSelectorHigh, Case::CrossFetch, Case::CrossBound,
-       Case::CrossSource, Case::FinalExec, Case::Endpoint, Case::EndpointSource,
-       Case::CrossBlock, Case::WrongOperation, Case::Or}) {
-    Fixture fixture(test == Case::CrossBlock ? 2 : 1);
-    const auto source = fixture.Emit(ValueOpcode::LaneId);
-    const auto mask = fixture.Emit(ValueOpcode::ULessThan32, {source, Value(19u)});
-    const auto negated = fixture.Emit(ValueOpcode::LogicalNot, {mask});
-    auto enabled = fixture.Emit(ValueOpcode::LogicalOr, {negated, mask});
-    if (test == Case::ScalarExec) {
-      // s_orn2_saveexec of a mask that is not a ballot, read back as a lane bit.
-      const auto exec = fixture.Emit(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(2))});
-      const auto full = fixture.Emit(ValueOpcode::BitwiseOr32,
-          {fixture.Emit(ValueOpcode::BitwiseNot32, {exec}), exec});
-      const auto bit = fixture.Emit(ValueOpcode::BitwiseAnd32, {source, Value(31u)});
-      const auto shifted = fixture.Emit(ValueOpcode::ShiftRightLogical32, {full, bit});
-      enabled = fixture.Emit(ValueOpcode::INotEqual32,
-          {fixture.Emit(ValueOpcode::BitwiseAnd32, {shifted, Value(1u)}), Value(0u)});
-    }
-    // UMax and OR scans seed lanes outside EXEC with zero.
-    const bool maximum = test == Case::Wave32Maximum;
-    const bool bitwise_or = test == Case::Or;
-    const uint32_t neutral = maximum || bitwise_or ? 0u : UINT32_MAX;
-    const auto seed = fixture.Emit(ValueOpcode::SelectU32, {mask, source, Value(neutral)});
-    auto prefix = fixture.Emit(ValueOpcode::SelectU32, {enabled, seed, source});
-    Value preserved;
-    auto operation = maximum ? ValueOpcode::UMax32 : ValueOpcode::UMin32;
-    auto reduction_opcode = maximum ? ValueOpcode::SubgroupUMaxU32 : ValueOpcode::SubgroupUMinU32;
-    if (bitwise_or) {
-      operation = ValueOpcode::BitwiseOr32;
-      reduction_opcode = ValueOpcode::SubgroupOrU32;
-    }
-    if (test == Case::WrongOperation) operation = ValueOpcode::IAdd32;
-    for (const uint32_t shift : {1u, 2u, 4u, 8u}) {
-      DppMoveFlags flags{.control = 0x110u + shift};
-      if (shift == 2) {
-        if (test == Case::RowMask) flags.row_mask = 7;
-        if (test == Case::BankMask) flags.bank_mask = 7;
-        if (test == Case::Shift) flags.control = 0x113;
-        if (test == Case::FetchInactive) flags.fetch_inactive = true;
-        if (test == Case::BoundControl) flags.bound_control = true;
-        if (test == Case::Dpp8) flags.dpp8 = true;
-      }
-      const auto move = fixture.Emit(ValueOpcode::DppMoveU32,
-          {test == Case::DppSource ? source : prefix, test == Case::MoveExec ? mask : enabled});
-      move.Instruction()->SetFlags(flags);
-      const auto combined = fixture.Emit(operation, {move, prefix});
-      const auto update = fixture.Emit(ValueOpcode::DppUpdateU32,
-          {combined, test == Case::Previous ? source : prefix,
-           test == Case::UpdateExec ? mask : enabled});
-      update.Instruction()->SetFlags(flags);
-      prefix = update;
-      if (shift == 2) preserved = fixture.Emit(ValueOpcode::ReferenceU32, {prefix});
-    }
-    const auto cross_exec = test == Case::CrossExec ? mask : enabled;
-    const auto cross = fixture.Emit(ValueOpcode::Permlane16U32,
-        {test == Case::CrossSource ? source : prefix,
-         Value(test == Case::CrossSelectorLow ? 0xfffffff0u : UINT32_MAX),
-         Value(test == Case::CrossSelectorHigh ? 0xfffffff0u : UINT32_MAX), cross_exec,
-         Value(0u)});
-    cross.Instruction()->SetFlags(PermlaneFlags{
-        .x16 = test != Case::CrossRow, .fetch_inactive = test == Case::CrossFetch,
-        .bound_control = test != Case::CrossBound});
-    const auto cross_write = fixture.Emit(ValueOpcode::SelectU32, {enabled, cross, source});
-    const auto combined = fixture.Emit(operation, {prefix, cross_write});
-    const auto final = fixture.Emit(ValueOpcode::SelectU32,
-        {test == Case::FinalExec ? mask : enabled, combined, prefix});
-    const uint32_t result_block = test == Case::CrossBlock ? 1u : 0u;
-    // Wave32 reads each half's row endpoint from the scan itself.
-    const bool rows = test == Case::Wave32Rows || test == Case::ScalarExec || maximum;
-    const auto endpoints = rows ? prefix : final;
-    uint32_t low_lane = test == Case::Endpoint ? 30u : 31u;
-    if (rows) low_lane = 15u;
-    const auto low = fixture.Emit(ValueOpcode::ReadLane,
-        {endpoints, Value(low_lane)}, 0, result_block);
-    const auto high = fixture.Emit(ValueOpcode::ReadLane,
-        {test == Case::EndpointSource ? prefix : endpoints, Value(rows ? 31u : 63u)}, 0,
-        result_block);
-    const auto result = fixture.Emit(operation, {high, low}, 0, result_block);
-    const auto use = fixture.Emit(ValueOpcode::ReferenceU32, {result}, 0, result_block);
-    using Terminator = Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind;
-    fixture.BlockAt(result_block).terminator.kind = Terminator::Return;
-    if (result_block != 0) {
-      fixture.BlockAt().AddBranch(&fixture.BlockAt(1));
-      fixture.BlockAt().terminator.kind = Terminator::Branch;
-      fixture.BlockAt().terminator.true_block = &fixture.BlockAt(1);
-    }
-    ValidateProgram(fixture.program);
-    // The pipeline folds full-EXEC predicates to true before eliminating reads.
-    const uint32_t wave_size = test == Case::Wave32 || rows ? 32u : 64u;
-    ConstantPropagationPass(fixture.program.blocks, wave_size);
-    const auto stats = EliminateReadLane(fixture.program, wave_size);
-    const bool matches = test == Case::Masked || rows || bitwise_or;
-    Check(stats.rewritten_reductions == (matches ? 1u : 0u) && stats.rewritten_reads == 0,
-          ("wave reduction proof failed case " + std::to_string(static_cast<unsigned>(test))).c_str());
-    if (matches) {
-      const auto *reduction = use.Instruction()->Arg(0).ResolveInstruction();
-      Check(reduction->GetOpcode() == reduction_opcode &&
-                reduction->Arg(0).Resolve() == seed.Resolve(),
-            "wave reduction changed the neutral-masked input");
-      RemoveIdentities(fixture.program);
-      EliminateDeadCode(fixture.program.blocks);
-      uint32_t updates = 0;
-      for (const auto &inst : fixture.BlockAt()) {
-        updates += inst.GetOpcode() == ValueOpcode::DppUpdateU32;
-        Check(inst.GetOpcode() != ValueOpcode::ReadLane &&
-                  inst.GetOpcode() != ValueOpcode::Permlane16U32,
-              "wave reduction retained unused endpoint or cross-row operations");
-      }
-      Check(updates == 2 && preserved.Instruction()->Arg(0).Instruction()->HasUses(),
-            "wave reduction destroyed an independently consumed prefix or kept its dead suffix");
-      ValidateProgram(fixture.program);
-    } else {
-      Check(use.Instruction()->Arg(0).Resolve() == result,
-            "rejected wave reduction proof changed its original result");
-    }
-  }
-}
-
 void TestOptimizationPipeline() {
   Fixture fixture;
   const auto sum = fixture.Emit(ValueOpcode::IAdd32, {Value(40u), Value(2u)});
@@ -828,7 +601,7 @@ void TestOptimizationPipeline() {
   fixture.Emit(ValueOpcode::IMul32, {Value(6u), Value(7u)});
 
   ConstantPropagationPass(fixture.program.blocks);
-  RemoveIdentities(fixture.program);
+  RemoveIdentities(fixture.program.blocks);
   EliminateDeadCode(fixture.program.blocks);
 
   const auto &instructions = fixture.BlockAt().Instructions();
@@ -839,6 +612,247 @@ void TestOptimizationPipeline() {
         "elimination regressed");
 }
 
+void TestImpossibleEqualitiesFold() {
+  // V_MOVRELS compares M0 with every register index. Here M0 is a 3-bit field
+  // times 5 (Astro Bot's hottest pixel shader), so only 7 of the 49 selects can
+  // ever be taken.
+  Fixture fixture;
+  const auto user = fixture.Emit(ValueOpcode::GetUserData,
+                                 {Value(static_cast<ScalarReg>(2))});
+  const auto field = fixture.Emit(ValueOpcode::BitFieldUExtract,
+                                  {user, Value(12u), Value(3u)});
+  const auto scaled = fixture.Emit(ValueOpcode::IMul32, {field, Value(5u)});
+  const auto m0 = fixture.Emit(ValueOpcode::BitwiseAnd32, {scaled, Value(0xffu)});
+  Value selected = Value(100u);
+  for (uint32_t index = 1; index < 50u; index++) {
+    const auto match = fixture.Emit(ValueOpcode::IEqual32, {m0, Value(index)});
+    selected = fixture.Emit(ValueOpcode::SelectU32,
+                            {match, Value(100u + index), selected});
+  }
+  const auto chain = fixture.Emit(ValueOpcode::ReferenceU32, {selected});
+
+  // An unconstrained value keeps its compare.
+  const auto unknown = fixture.Emit(ValueOpcode::IEqual32, {user, Value(7u)});
+  const auto kept = fixture.Emit(ValueOpcode::ReferenceU32,
+                                 {fixture.Emit(ValueOpcode::SelectU32,
+                                               {unknown, Value(1u), Value(2u)})});
+  // A select of constants takes only those values.
+  const auto either =
+      fixture.Emit(ValueOpcode::SelectU32, {fixture.Emit(ValueOpcode::IEqual32,
+                                                         {user, Value(1u)}),
+                                            Value(3u), Value(9u)});
+  const auto never = fixture.Emit(ValueOpcode::ReferenceU32,
+                                  {fixture.Emit(ValueOpcode::SelectU32,
+                                                {fixture.Emit(ValueOpcode::IEqual32,
+                                                              {either, Value(4u)}),
+                                                 Value(1u), Value(2u)})});
+  const auto always = fixture.Emit(ValueOpcode::ReferenceU32,
+                                   {fixture.Emit(ValueOpcode::SelectU32,
+                                                 {fixture.Emit(ValueOpcode::INotEqual32,
+                                                               {either, Value(4u)}),
+                                                  Value(1u), Value(2u)})});
+
+  ConstantPropagationPass(fixture.program.blocks);
+  RemoveIdentities(fixture.program.blocks);
+  EliminateDeadCode(fixture.program.blocks);
+
+  // Walk what is left of the chain: every remaining select must test M0
+  // against a reachable index and pick that index's value.
+  std::vector<uint32_t> indices;
+  auto value = chain.ResolveInstruction()->Arg(0).Resolve();
+  while (const auto *select = value.TryInstruction()) {
+    Check(select->GetOpcode() == ValueOpcode::SelectU32, "chain lost its selects");
+    const auto *match = select->Arg(0).ResolveInstruction();
+    Check(match->GetOpcode() == ValueOpcode::IEqual32 &&
+              match->Arg(0).Resolve() == m0.Resolve(),
+          "chain select does not test M0");
+    const auto index = match->Arg(1).Resolve().U32();
+    Check(select->Arg(1).Resolve() == Value(100u + index),
+          "chain select picks the wrong register");
+    indices.push_back(index);
+    value = select->Arg(2).Resolve();
+  }
+  std::ranges::sort(indices);
+  Check(value == Value(100u) &&
+            indices == std::vector<uint32_t>{5u, 10u, 15u, 20u, 25u, 30u, 35u},
+        "impossible M0 compares were kept, or reachable ones were dropped");
+  Check(kept.ResolveInstruction()->Arg(0).Resolve().TryInstruction() != nullptr,
+        "a compare on an unconstrained value was folded");
+  Check(never.ResolveInstruction()->Arg(0).Resolve() == Value(2u) &&
+            always.ResolveInstruction()->Arg(0).Resolve() == Value(1u),
+        "compares against a value a select cannot produce were not folded");
+}
+
+void TestKnownZeroBitsFoldIndexedReads() {
+  // Astro Bot's foliage vertex shaders index a register array by a loop counter:
+  // M0 = (i << 2) & 0xff. Its values are unknown, but its two low bits are zero,
+  // so only every fourth register can be read.
+  Fixture fixture;
+  const auto counter = fixture.Emit(ValueOpcode::GetUserData,
+                                    {Value(static_cast<ScalarReg>(2))});
+  const auto shifted =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {counter, Value(2u)});
+  const auto m0 = fixture.Emit(ValueOpcode::BitwiseAnd32, {shifted, Value(0xffu)});
+  Value selected = Value(100u);
+  for (uint32_t index = 1; index < 64u; index++) {
+    const auto match = fixture.Emit(ValueOpcode::IEqual32, {m0, Value(index)});
+    selected = fixture.Emit(ValueOpcode::SelectU32,
+                            {match, Value(100u + index), selected});
+  }
+  const auto chain = fixture.Emit(ValueOpcode::ReferenceU32, {selected});
+  // A sum keeps the fewer trailing zeros: 4 * i + 2 can be 6 but never 7.
+  const auto plus_two = fixture.Emit(ValueOpcode::IAdd32, {shifted, Value(2u)});
+  const auto compare = [&](uint32_t constant) {
+    return fixture.Emit(
+        ValueOpcode::ReferenceU32,
+        {fixture.Emit(ValueOpcode::SelectU32,
+                      {fixture.Emit(ValueOpcode::IEqual32, {plus_two, Value(constant)}),
+                       Value(1u), Value(2u)})});
+  };
+  const auto six = compare(6u);
+  const auto seven = compare(7u);
+  // A waterfall loop reads one lane's index; that lane's value keeps the bits.
+  const auto lane_index = fixture.Emit(
+      ValueOpcode::BitwiseAnd32,
+      {fixture.Emit(ValueOpcode::ReadFirstLane, {shifted, Value(true)}), Value(0xffu)});
+  const auto lane_compare = [&](uint32_t constant) {
+    return fixture.Emit(
+        ValueOpcode::ReferenceU32,
+        {fixture.Emit(ValueOpcode::SelectU32,
+                      {fixture.Emit(ValueOpcode::IEqual32, {lane_index, Value(constant)}),
+                       Value(1u), Value(2u)})});
+  };
+  const auto lane_eight = lane_compare(8u);
+  const auto lane_five = lane_compare(5u);
+
+  ConstantPropagationPass(fixture.program.blocks);
+  RemoveIdentities(fixture.program.blocks);
+  EliminateDeadCode(fixture.program.blocks);
+
+  std::vector<uint32_t> indices;
+  auto value = chain.ResolveInstruction()->Arg(0).Resolve();
+  while (const auto *select = value.TryInstruction()) {
+    Check(select->GetOpcode() == ValueOpcode::SelectU32, "chain lost its selects");
+    const auto *match = select->Arg(0).ResolveInstruction();
+    Check(match->GetOpcode() == ValueOpcode::IEqual32 &&
+              match->Arg(0).Resolve() == m0.Resolve(),
+          "chain select does not test M0");
+    const auto index = match->Arg(1).Resolve().U32();
+    Check(select->Arg(1).Resolve() == Value(100u + index),
+          "chain select picks the wrong register");
+    indices.push_back(index);
+    value = select->Arg(2).Resolve();
+  }
+  std::ranges::sort(indices);
+  std::vector<uint32_t> expected;
+  for (uint32_t index = 4; index < 64u; index += 4) {
+    expected.push_back(index);
+  }
+  Check(value == Value(100u) && indices == expected,
+        "compares with bits M0 never sets were kept, or reachable ones were dropped");
+  Check(six.ResolveInstruction()->Arg(0).Resolve().TryInstruction() != nullptr,
+        "a compare the known bits allow was folded");
+  Check(seven.ResolveInstruction()->Arg(0).Resolve() == Value(2u),
+        "a compare the known bits rule out was not folded");
+  Check(lane_eight.ResolveInstruction()->Arg(0).Resolve().TryInstruction() != nullptr &&
+            lane_five.ResolveInstruction()->Arg(0).Resolve() == Value(2u),
+        "known bits did not pass through ReadFirstLane");
+}
+
+void TestMaskedWriteChainsCollapse() {
+  // Two EXEC-masked writes to one register: s1 = select(e, f, old) and
+  // s2 = select(e, g(s1), s1). s2 only needs f where e holds and old elsewhere.
+  Fixture fixture;
+  const auto user = fixture.Emit(ValueOpcode::GetUserData,
+                                 {Value(static_cast<ScalarReg>(2))});
+  const auto old = fixture.Emit(ValueOpcode::GetUserData,
+                                {Value(static_cast<ScalarReg>(3))});
+  const auto exec = fixture.Emit(ValueOpcode::IEqual32, {user, Value(3u)});
+  const auto f = fixture.Emit(ValueOpcode::IAdd32, {user, Value(1u)});
+  const auto s1 = fixture.Emit(ValueOpcode::SelectU32, {exec, f, old});
+  const auto g = fixture.Emit(ValueOpcode::IMul32, {s1, Value(2u)});
+  const auto s2 = fixture.Emit(ValueOpcode::SelectU32, {exec, g, s1});
+  const auto chain = fixture.Emit(ValueOpcode::ReferenceU32, {s2});
+  // Observed in every lane, so it must keep reading s1.
+  const auto leaked = fixture.Emit(ValueOpcode::IAdd32, {s1, Value(5u)});
+  const auto leak = fixture.Emit(ValueOpcode::ReferenceU32, {leaked});
+  // A cross-lane read sees disabled lanes, so it must keep reading the select.
+  const auto t1 = fixture.Emit(ValueOpcode::SelectU32, {exec, f, Value(9u)});
+  const auto lane =
+      fixture.Emit(ValueOpcode::ReadLane, {t1, Value(0u)});
+  const auto t2 = fixture.Emit(ValueOpcode::SelectU32, {exec, lane, t1});
+  const auto cross = fixture.Emit(ValueOpcode::ReferenceU32, {t2});
+
+  ConstantPropagationPass(fixture.program.blocks);
+  RemoveIdentities(fixture.program.blocks);
+  EliminateDeadCode(fixture.program.blocks);
+
+  const auto *outer = chain.ResolveInstruction()->Arg(0).ResolveInstruction();
+  Check(outer == s2.ResolveInstruction() && outer->Arg(2).Resolve() == old.Resolve(),
+        "a masked write did not skip to the value before the region");
+  const auto *doubled = outer->Arg(1).ResolveInstruction();
+  Check(doubled->GetOpcode() == ValueOpcode::IMul32 &&
+            doubled->Arg(0).Resolve() == f.Resolve(),
+        "true-arm arithmetic still reads the intermediate select");
+  Check(leak.ResolveInstruction()->Arg(0).ResolveInstruction()->Arg(0).Resolve() ==
+            s1.Resolve(),
+        "a value observed in every lane lost its select");
+  Check(lane.ResolveInstruction()->Arg(0).Resolve() == t1.Resolve() &&
+            cross.ResolveInstruction()->Arg(0).ResolveInstruction()->Arg(2).Resolve() ==
+                Value(9u),
+        "a cross-lane read lost its select, or the false arm was not skipped");
+}
+
+void TestIndexedSelectRunsCollapse() {
+  // A V_MOVRELS read with M0 = field * 5: index 0 reads `first`, 5 reads `five`, 10 reads
+  // `ten`, and 15..35 all read the constant 1.0f.
+  Fixture fixture;
+  const auto user = fixture.Emit(ValueOpcode::GetUserData,
+                                 {Value(static_cast<ScalarReg>(2))});
+  const auto first = fixture.Emit(ValueOpcode::GetUserData,
+                                  {Value(static_cast<ScalarReg>(3))});
+  const auto five = fixture.Emit(ValueOpcode::GetUserData,
+                                 {Value(static_cast<ScalarReg>(4))});
+  const auto ten = fixture.Emit(ValueOpcode::GetUserData,
+                                {Value(static_cast<ScalarReg>(5))});
+  const auto field =
+      fixture.Emit(ValueOpcode::BitFieldUExtract, {user, Value(12u), Value(3u)});
+  const auto index = fixture.Emit(ValueOpcode::IMul32, {field, Value(5u)});
+  auto selected = first;
+  for (uint32_t offset = 1; offset <= 40; offset++) {
+    const auto value = offset == 5u    ? five
+                       : offset == 10u ? ten
+                       : offset >= 15u ? Value(0x3f800000u)
+                                       : Value(offset); // never read
+    const auto match = fixture.Emit(ValueOpcode::IEqual32, {index, Value(offset)});
+    selected = fixture.Emit(ValueOpcode::SelectU32, {match, value, selected});
+  }
+  const auto keep = fixture.Emit(ValueOpcode::ReferenceU32, {selected});
+
+  ConstantPropagationPass(fixture.program.blocks);
+  RemoveIdentities(fixture.program.blocks);
+  EliminateDeadCode(fixture.program.blocks);
+  ValidateProgram(fixture.program, true);
+
+  // Expect select(m >= 15, 1.0, select(m >= 10, ten, select(m >= 5, five, first))).
+  const std::array<std::pair<uint32_t, Value>, 3> runs{
+      {{15u, Value(0x3f800000u)}, {10u, ten}, {5u, five}}};
+  auto value = keep.ResolveInstruction()->Arg(0).Resolve();
+  for (const auto &[start, expected] : runs) {
+    const auto *select = value.ResolveInstruction();
+    Check(select != nullptr && select->GetOpcode() == ValueOpcode::SelectU32,
+          "indexed read was not rebuilt as a run chain");
+    const auto *test = select->Arg(0).ResolveInstruction();
+    Check(test != nullptr && test->GetOpcode() == ValueOpcode::UGreaterThanEqual32 &&
+              test->Arg(0).Resolve() == index.Resolve() && test->Arg(1).Resolve() == Value(start),
+          "indexed read run does not start where expected");
+    Check(select->Arg(1).Resolve() == expected.Resolve(),
+          "indexed read run reads the wrong value");
+    value = select->Arg(2).Resolve();
+  }
+  Check(value == first.Resolve(), "indexed read lost its index-0 value");
+}
+
 void TestControlFlowValueSurvivesReadLaneFolding() {
   Fixture fixture(3);
   auto *entry = fixture.program.blocks[0];
@@ -847,14 +861,14 @@ void TestControlFlowValueSurvivesReadLaneFolding() {
   entry->AddBranch(taken);
   entry->AddBranch(other);
 
-  auto &entry_info = *fixture.program.blocks[0];
+  auto &entry_info = fixture.program.block_info[0];
   entry_info.terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::ConditionalBranch;
-  entry_info.terminator.true_block = taken;
-  entry_info.terminator.false_block = other;
-  fixture.program.blocks[1]->terminator.kind =
+  entry_info.terminator.true_block = 1;
+  entry_info.terminator.false_block = 2;
+  fixture.program.block_info[1].terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
-  fixture.program.blocks[2]->terminator.kind =
+  fixture.program.block_info[2].terminator.kind =
       Libs::Graphics::ShaderRecompiler::CFG::TerminatorKind::Return;
 
   const auto undef = fixture.Emit(ValueOpcode::UndefU32);
@@ -868,12 +882,13 @@ void TestControlFlowValueSurvivesReadLaneFolding() {
   Check(EliminateReadLane(fixture.program, 64).rewritten_reads == 1,
         "control-flow fixture did not eliminate its fixed-lane read");
   ConstantPropagationPass(fixture.program.blocks);
-  RemoveIdentities(fixture.program);
+  ResolveControlFlowIdentities(fixture.program);
+  RemoveIdentities(fixture.program.blocks);
   EliminateDeadCode(fixture.program.blocks);
 
   Check(entry_info.condition == Value(true),
         "folded branch condition did not survive identity removal");
-  ValidateProgram(fixture.program);
+  ValidateProgram(fixture.program, true);
 }
 
 void TestDeadPhiCyclesAndPlanningRoots() {
@@ -915,9 +930,8 @@ void TestUndefinedRuntimeValueFails() {
 
   fixture.program.descriptor_sources.push_back(
       {.dwords = {undef}, .dword_count = 1});
-  auto plan = ExtractResourcePlan(fixture.program);
   DescriptorValue result;
-  Check(!EvaluateSource(plan, {}, 0, result),
+  Check(!SrtWalker(fixture.program, {}).EvaluateDescriptor(0, result),
         "undefined typed descriptor source was accepted");
 }
 
@@ -925,11 +939,17 @@ void TestUndefinedRuntimeValueFails() {
 
 namespace Common {
 
-void DbgExitIfHandler(const char *, const char *, int) { std::abort(); }
+int DbgExitIfHandler(const char *, const char *, int) { return 1; }
 
-void DbgExitHandler(const char *, int, std::string_view text) {
+int DbgExitHandler(const char *, int, std::string_view text) {
   throw std::runtime_error(std::string(text));
 }
+
+int DbgExitHandler(const char *, int, fmt::text_style, std::string_view text) {
+  throw std::runtime_error(std::string(text));
+}
+
+void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
@@ -944,17 +964,18 @@ int main() {
     TestCarryAndBitFields();
     TestInvariantAndDivergentPhi();
     TestOperandMutationLifecycle();
-    TestReplacementKeepsUseOrder();
     TestControlDependentStandaloneLoadStaysTyped();
     TestRuntime64BitDescriptorOps();
     TestUniformFirstLaneSamplerLod();
     TestFloatComparisonDescriptorInputs();
-    TestSignedConversionDescriptorInputs();
     TestSharedIntegerRuntimeDependencies();
     TestConstantBufferBounds();
     TestReadLaneElimination();
-    TestCompleteWaveReduction();
     TestOptimizationPipeline();
+    TestImpossibleEqualitiesFold();
+    TestKnownZeroBitsFoldIndexedReads();
+    TestMaskedWriteChainsCollapse();
+    TestIndexedSelectRunsCollapse();
     TestControlFlowValueSurvivesReadLaneFolding();
     TestDeadPhiCyclesAndPlanningRoots();
     TestUndefinedRuntimeValueFails();

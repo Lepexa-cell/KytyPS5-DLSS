@@ -1,6 +1,5 @@
 #pragma once
 
-#include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translate.h"
 #include "graphics/shader/recompiler/ir/IREmitter.h"
 
@@ -8,43 +7,99 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
-inline const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index) {
-	switch (index) {
-		case 0: return inst.src0;
-		case 1: return inst.src1;
-		case 2: return inst.src2;
-		case 3: return inst.src3;
-		default: EXIT("decoded source operand index is out of range");
-	}
-}
+// Debug: KYTY_DEBUG_LOOP_HEAT=<hash>:<pc>[,<pc>[,<pc>]] makes that pixel shader export, in place of
+// every colour target, how many times its wave ran each of those guest PCs (red, green, blue), in
+// bands: 0 black, 1-15 0.0625, 16-63 0.25, 64-255 1, 256-1023 4, 1024 and more 32.
+struct LoopHeat {
+	static constexpr uint32_t FirstRegister = 250; // Spare VGPRs holding the counters.
+	uint64_t                  hash          = 0;
+	std::array<uint32_t, 3>   pcs {UINT32_MAX, UINT32_MAX, UINT32_MAX};
 
-inline Decoder::Operand ConditionOperand(Decoder::OperandKind kind) {
-	Decoder::Operand operand;
-	operand.kind = kind;
-	return operand;
-}
+	[[nodiscard]] bool Active(const IR::Program& program) const {
+		return hash != 0 && program.shader_hash == hash && program.stage == ShaderType::Pixel;
+	}
+};
+const LoopHeat& DebugLoopHeat();
+
+// Debug: KYTY_DEBUG_PS_TAP=<hash>:<pc>:<vgpr>[:<vgpr>[:<vgpr>]] makes that pixel shader export, in
+// place of every colour target, the values those guest VGPRs held right after the instruction at
+// <pc> (red, green, blue; 0 where the wave did not run it): pictures of intermediate values, to
+// find the first one that is wrong. PC and VGPR numbers are hexadecimal and decimal respectively.
+struct PsTap {
+	static constexpr uint32_t FirstRegister = 247; // Spare VGPRs holding the tapped values.
+	uint64_t                  hash          = 0;
+	uint32_t                  pc            = UINT32_MAX;
+	std::array<uint32_t, 3>   vgprs {UINT32_MAX, UINT32_MAX, UINT32_MAX};
+
+	[[nodiscard]] bool Active(const IR::Program& program) const {
+		return hash != 0 && program.shader_hash == hash && program.stage == ShaderType::Pixel;
+	}
+};
+const PsTap& DebugPsTap();
+
+// Debug: KYTY_DEBUG_CS_TAP=<hash>:<item>[:<item>...] (up to four) makes that compute shader's
+// IMAGE_STORE write, in place of its data, one value per item. <pc>v<reg>: the VGPR's float
+// after the last time the wave ran <pc>; <pc>i<reg> / <pc>h<reg>: its bits 0-10 / 11-21 as a
+// number; <pc>c: how often the wave ran <pc>. PC is hexadecimal, the register decimal.
+struct CsTap {
+	static constexpr uint32_t FirstRegister = 240; // Spare VGPRs holding the tapped values.
+	struct Item {
+		uint32_t pc   = UINT32_MAX;
+		char     kind = 0;
+		uint32_t reg  = 0;
+	};
+	uint64_t            hash = 0;
+	std::array<Item, 4> items {};
+
+	[[nodiscard]] bool Active(const IR::Program& program) const {
+		return hash != 0 && program.shader_hash == hash && program.stage == ShaderType::Compute;
+	}
+};
+const CsTap& DebugCsTap();
+
+// Whether a wave32 guest program may run in a 64-lane host subgroup: pixel and compute pipelines
+// require the guest's wave size, but drivers need not take a required size for vertex stages
+// (AMD runs them as wave64). Host lanes 32-63 are then a second guest wave: their EXEC, VCC and
+// ballots are the host ballot's upper word, and MBCNT counts within their own 32 lanes.
+[[nodiscard]] bool WaveHalvesInHostSubgroup(const IR::Program& program);
+// The guest wave's 32-lane mask from a host ballot, per WaveHalvesInHostSubgroup.
+[[nodiscard]] IR::U32 GuestWaveMask(IR::IREmitter& ir, const IR::Program& program,
+                                    const IR::Value& ballot);
 
 class Translator {
 public:
 	Translator(IR::Program& program, IR::Block* block, uint32_t vector_limit,
-	           bool flush_f32_inputs, bool graphics_compute)
+	           bool flush_f32_inputs)
 	    : program(program), ir(block), current_vector_limit(vector_limit),
-	      flush_f32_inputs(flush_f32_inputs), graphics_compute(graphics_compute) {}
+	      flush_f32_inputs(flush_f32_inputs) {}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
+	// See entry_live_exec.
+	void SetEntryLiveExec(bool value) { entry_live_exec = value; }
+	// Packed FP16 add/mul/fma as native 16-bit float vectors (see NativeFloat16).
+	void SetNativeFloat16(bool value) { native_float16 = value; }
+	// See live_lanes.
+	void SetLiveLanes(const std::array<IR::U32, 2>& lanes) {
+		live_lanes     = lanes;
+		has_live_lanes = true;
+	}
+	void CountLoopHeat(uint32_t counter);
+	void CopyPsTap();
+	void CopyCsTap(uint32_t pc);
+	void StoreCsTap(const Decoder::Instruction& store);
+	// Image stores already given tapped data in this block (see StoreCsTap).
+	uint32_t cs_tap_stores = 0;
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
-	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
-	                        IR::Block& info);
+	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source, IR::BlockInfo& info);
 
 private:
+	const Decoder::Operand& SourceAt(const Decoder::Instruction& inst, uint32_t index);
 	Decoder::Operand DestinationOperand(const Decoder::Instruction& inst);
 	Decoder::Operand OffsetOperand(const Decoder::Operand& operand, uint32_t offset);
 	Decoder::Operand ScalarDestinationOperand(const Decoder::Operand& operand, uint32_t offset);
 	Decoder::Operand PlainOperand(const Decoder::Operand& operand);
 	std::array<IR::U32, 2> BallotMask(IR::U1 value);
-	std::array<IR::U32, 2> ExecMask();
-	std::array<IR::U32, 2> VectorMask(IR::U1 value);
 	IR::U32                ReadRawU32(const Decoder::Operand& operand);
 	IR::U32                ReadScalarCode(uint32_t code);
 	IR::U32                ApplyBitSourceModifiers(const Decoder::Operand& operand, IR::U32 value);
@@ -65,14 +120,17 @@ private:
 	IR::U32 ReadU16LaneAsU32(const Decoder::Operand& operand, bool high_lane, bool sign_extend);
 	IR::U32 ReadU16AsU32(const Decoder::Operand& operand, bool sign_extend);
 	IR::U32 Read16LaneBits(const Decoder::Operand& operand, bool high_lane);
+	// Both FP16 halves of a packed operand (OP_SEL, OP_SEL_HI and source modifiers applied) in one
+	// U32, low half first.
+	IR::U32 ReadPackedF16Bits(const Decoder::Operand& operand);
 	std::array<IR::U32, 2> ExtractU64(IR::U64 value);
 	void    WriteU32Pair(const Decoder::Operand& operand, const std::array<IR::U32, 2>& value);
 	IR::U32 ConditionBit(const Decoder::Operand& operand);
 	IR::U1  ReadMask(const Decoder::Operand& operand);
 	IR::U1  ReadMaskValid(const Decoder::Operand& operand);
-	void    WriteMask(const Decoder::Operand& operand, IR::U1 value,
-	                  const std::array<IR::U32, 2>& mask, bool write_64 = false);
-	void    WriteVectorMask(const Decoder::Operand& operand, IR::U1 value);
+	std::array<IR::U32, 2> WriteMask(const Decoder::Operand& operand, IR::U1 value,
+	                                 bool write_64 = false);
+	void    WriteCompareResult(const Decoder::Operand& operand, IR::U1 value);
 
 	IR::MemoryFlags AddMemoryInfo(const IR::MemoryInfo& memory, uint32_t pc);
 	IR::ExportFlags AddExportInfo(const Decoder::Instruction& inst);
@@ -107,6 +165,7 @@ private:
 	void          IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode32,
 	                           IR::ValueOpcode opcode64 = IR::ValueOpcode::Count);
 	void DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool returns_value);
+	IR::U32 GdsAddress(const Decoder::Instruction& inst, IR::U32 address);
 	void FLAT_LOAD(const Decoder::Instruction& inst);
 	void FLAT_STORE(const Decoder::Instruction& inst);
 	void IMAGE_GET_RESINFO(const Decoder::Instruction& inst);
@@ -115,7 +174,6 @@ private:
 	void IMAGE_STORE(const Decoder::Instruction& inst);
 	void IMAGE_SAMPLE(const Decoder::Instruction& inst);
 	void IMAGE_GATHER(const Decoder::Instruction& inst);
-	IR::U32   DsAddress(const Decoder::Instruction& inst, IR::U32 address);
 	IR::Value LoadSharedU32(uint32_t width, IR::U32 address, const IR::MemoryInfo& memory,
 	                        uint32_t pc);
 	IR::Value ExtractSharedU32(IR::Value value, uint32_t width, uint32_t index);
@@ -134,17 +192,23 @@ private:
 	void DS_ORDERED_COUNT(const Decoder::Instruction& inst);
 
 	IR::F32 SelectF32(IR::U1 condition, IR::F32 true_value, IR::F32 false_value);
+	IR::U32 ConvertF32ToU32Saturated(IR::F32 value, float upper_bound, float safe_upper,
+	                                 uint32_t high_result);
+	IR::U32 ConvertF32ToI32Saturated(IR::F32 value, float lower_bound, float upper_bound,
+	                                 float safe_upper, uint32_t lower_result,
+	                                 uint32_t upper_result);
 	IR::U32 PackU16Lanes(IR::U32 low, IR::U32 high);
-	IR::U32 Saturate16(IR::U32 value, bool signed_value);
-	void EmitCompareResult(const Decoder::Instruction& inst, IR::U1 value, bool scalar);
-	void EmitCompareConstant(const Decoder::Instruction& inst, bool value, bool scalar);
+	void EmitCompareResult(const Decoder::Instruction& inst, IR::U1 value, bool scalar, bool cmpx);
+	void EmitCompareConstant(const Decoder::Instruction& inst, bool value, bool scalar, bool cmpx);
 	void EmitIntegerCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, IR::Type type,
-	                        bool scalar, bool swap_operands = false);
+	                        bool scalar, bool cmpx, bool swap_operands = false);
 	void EmitInteger16Compare(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
-	                          bool signed_value);
-	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half);
-	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool is64 = false);
-	void EmitFloatClassCompare(const Decoder::Instruction& inst, bool half = false);
+	                          bool signed_value, bool cmpx);
+	void EmitFloatCompare(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool half,
+	                      bool cmpx);
+	void EmitFloatOrderedCompare(const Decoder::Instruction& inst, bool ordered, bool cmpx,
+	                             bool is64 = false);
+	void EmitFloatClassCompare(const Decoder::Instruction& inst, bool cmpx, bool half = false);
 	void V_CVT_F32_UBYTE(const Decoder::Instruction& inst, uint32_t byte_index);
 	void V_CVT_F32_U32(const Decoder::Instruction& inst);
 	void V_CVT_F32_I32(const Decoder::Instruction& inst);
@@ -161,8 +225,9 @@ private:
 	void V_CVT_PKRTZ_F16_F32(const Decoder::Instruction& inst);
 	void V_CVT_PKNORM_F32(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void V_CVT_PK_U8_F32(const Decoder::Instruction& inst);
-	void V_CVT_PK_16_32(const Decoder::Instruction& inst, bool signed_value);
 	void V_PACK_B32_F16(const Decoder::Instruction& inst);
+	bool NativeFloat16Scalar(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
+	                         std::span<const Decoder::Operand* const> sources);
 	void PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                   bool quiet_snan);
 	void Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
@@ -172,7 +237,7 @@ private:
 	void Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                    bool mix);
 	void FloatUnary(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
-	void V_FRACT(const Decoder::Instruction& inst, IR::Type type);
+	void V_FRACT_F32(const Decoder::Instruction& inst);
 	void FloatBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool reverse);
 	void FloatTernary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool accumulator,
 	                  bool mix);
@@ -186,11 +251,12 @@ private:
 	void Integer16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool arithmetic);
 	void Integer16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
 	void Integer16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
-	void Integer16Mad(const Decoder::Instruction& inst, bool sign);
+	void V_MAD_I16(const Decoder::Instruction& inst);
 	void PackedInteger16Shift(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                          bool arithmetic);
-	void PackedInteger16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
+	void PackedInteger16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
 	void PackedInteger16Mad(const Decoder::Instruction& inst, bool sign);
+	void PackedInteger16MinMax(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool sign);
 	void S_U64_MASK(const Decoder::Instruction& inst, IR::ValueOpcode logical_opcode,
 	                IR::ValueOpcode bit_opcode, bool negate_rhs, bool negate_result, bool unary);
 	IR::U1 U64MaskBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool negate_rhs,
@@ -200,20 +266,25 @@ private:
 	void S_ASHR_I64(const Decoder::Instruction& inst);
 	void ComposedIntegerBinary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
 	                           bool negate_rhs, bool negate_result, bool update_scc);
-	void Integer3(const Decoder::Instruction& inst, IR::ValueOpcode inner, IR::ValueOpcode outer);
-	void S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero, bool from_msb, bool sign);
+	void V_AND_OR_B32(const Decoder::Instruction& inst);
+	void V_OR3_B32(const Decoder::Instruction& inst);
+	void V_XOR3_B32(const Decoder::Instruction& inst);
+	void S_FF_I32_B64(const Decoder::Instruction& inst, bool find_zero);
 	void V_FFBH_32(const Decoder::Instruction& inst, bool sign);
-	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend, bool high = false);
+	void S_FLBIT_I32_B64(const Decoder::Instruction& inst);
+	void Integer24(const Decoder::Instruction& inst, bool sign, bool addend);
 	void V_MAD_U64_U32(const Decoder::Instruction& inst);
 	void V_SAD_U32(const Decoder::Instruction& inst);
+	void V_ADD3_U32(const Decoder::Instruction& inst);
 	void S_BITSET_B32(const Decoder::Instruction& inst, bool set);
 	void S_BITSET_B64(const Decoder::Instruction& inst, bool set);
 	void V_BCNT_U32_B32(const Decoder::Instruction& inst);
 	void V_MBCNT_U32_B32(const Decoder::Instruction& inst, bool low);
 	void S_BITREPLICATE_B64_B32(const Decoder::Instruction& inst);
-	void S_QUADMASK(const Decoder::Instruction& inst, bool is64);
+	void S_QUADMASK_B64(const Decoder::Instruction& inst);
 	void BFM_B32(const Decoder::Instruction& inst);
 	IR::U32 RightMask32(IR::U32 count);
+	IR::U64 RightMask64(IR::U32 count);
 	void    S_BFM_B64(const Decoder::Instruction& inst);
 	void    S_BFE_U32(const Decoder::Instruction& inst, bool sign);
 	void    S_BFE_U64(const Decoder::Instruction& inst);
@@ -222,6 +293,10 @@ private:
 	void    S_BITCMP_B32(const Decoder::Instruction& inst, bool expected);
 	void    S_BITCMP_B64(const Decoder::Instruction& inst, bool expected);
 	void    V_ALIGN_B32(const Decoder::Instruction& inst, bool byte_offset);
+	void    V_LSHL_ADD_U32(const Decoder::Instruction& inst);
+	void    V_ADD_LSHL_U32(const Decoder::Instruction& inst);
+	void    V_XAD_U32(const Decoder::Instruction& inst);
+	void    V_LSHL_OR_B32(const Decoder::Instruction& inst);
 	void    V_CNDMASK_B32(const Decoder::Instruction& inst);
 	void    PackB16(const Decoder::Instruction& inst, bool high0, bool high1);
 
@@ -238,6 +313,7 @@ private:
 	                    IR::ValueOpcode compare_opcode);
 	void EmitControlNop();
 	void S_WAITCNT_VSCNT(const Decoder::Instruction& inst);
+	void S_WAITCNT(const Decoder::Instruction& inst);
 	void S_BARRIER();
 	void S_SENDMSG(const Decoder::Instruction& inst);
 	void S_TTRACEDATA();
@@ -254,8 +330,8 @@ private:
 	void V_READLANE_B32(const Decoder::Instruction& inst);
 	void V_WRITELANE_B32(const Decoder::Instruction& inst);
 	void V_PERMLANE16_B32(const Decoder::Instruction& inst, bool x16);
+	void V_INTERP_P1_F32();
 	void V_INTERP_P2_F32(const Decoder::Instruction& inst);
-	void V_INTERP_P2_F16(const Decoder::Instruction& inst);
 	void V_INTERP_MOV_F32(const Decoder::Instruction& inst);
 	void EXP(const Decoder::Instruction& inst);
 
@@ -272,7 +348,18 @@ private:
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;
 	bool            flush_f32_inputs;
-	bool            graphics_compute;
+	bool            native_float16 = false;
+	// A pixel shader's entry block before its first EXEC write (usually S_WQM): EXEC holds the
+	// live pixels only, so a copy of it leaves out helper invocations, which the host runs
+	// from the start.
+	bool            entry_live_exec = false;
+	// The lanes the host runs (the entry ballot), outside pixel shaders: EXEC written from a
+	// scalar value keeps only these. An NGG shader sets EXEC from its vertex count
+	// (s_lshr_b64 exec, -1, 64 - n); host subgroups hold fewer lanes than the guest wave, and a
+	// waterfall loop over EXEC (s_ff1, v_readlane, v_cmp, s_andn2) waited forever for lanes that
+	// do not exist (Yotei vs af2ffc6bd2815379, a GPU hang).
+	std::array<IR::U32, 2> live_lanes {};
+	bool                   has_live_lanes = false;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::Frontend

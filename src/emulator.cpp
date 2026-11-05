@@ -11,6 +11,7 @@
 #include "common/subsystems.h"
 #include "common/systemInfo.h"
 #include "common/threads.h"
+#include "common/switches.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/window.h"
 #include "kernel/fileSystem.h"
@@ -22,9 +23,9 @@
 #include "libs/controller.h"
 #include "libs/libs.h"
 #include "libs/network.h"
-#include "loader/additionalContent.h"
 #include "loader/runtimeLinker.h"
 #include "loader/systemContent.h"
+#include "loader/timer.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -88,6 +89,42 @@ static void MountSandboxDirs() {
 	MountOrCreateDir("_TempData/" + title_id, "/temp");
 }
 
+static bool ClearDirectoryContents(const std::filesystem::path& dir) {
+	bool ok = true;
+
+	for (const auto& entry: Common::File::GetDirEntries(dir)) {
+		if (entry.name == "." || entry.name == "..") {
+			continue;
+		}
+
+		auto path = dir / entry.name;
+
+		if (entry.is_file) {
+			Common::File::RemoveReadonly(path);
+			ok = Common::File::DeleteFile(path) && ok;
+		} else {
+			ok = ClearDirectoryContents(path) && ok;
+			ok = Common::File::DeleteDirectory(path) && ok;
+		}
+	}
+
+	return ok;
+}
+
+static void ClearDebugTextureFolder() {
+	const std::string debug_texture_folder = "_Textures";
+
+	if (!Common::File::IsDirectoryExisting(debug_texture_folder)) {
+		Common::File::CreateDirectories(debug_texture_folder);
+		return;
+	}
+
+	if (!ClearDirectoryContents(debug_texture_folder)) {
+		LOGF_COLOR(Log::Color::BrightYellow, "TextureDump: failed to completely clear %s\n",
+		           debug_texture_folder.c_str());
+	}
+}
+
 static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& param_json,
                  Common::Subsystems& subsystems) {
 	EXIT_IF(!Common::Thread::IsMainThread());
@@ -98,12 +135,17 @@ static void Init(const Config::ConfigOptions& cfg, const std::filesystem::path& 
 
 	if (Common::File::IsFileExisting(param_json)) {
 		Loader::SystemContentLoadParamSfo(param_json);
+		if (const auto flexible_memory_size = Loader::SystemContentGetFlexibleMemorySize();
+		    flexible_memory_size != 0) {
+			Libs::LibKernel::Memory::SetFlexibleMemorySize(flexible_memory_size);
+		}
 	}
 	if (cfg.splash_enabled) {
 		Libs::Graphics::InitializeSplashScreen(param_json.parent_path());
 	}
 
 	// Initialization order is explicit; destruction is automatic and reversed.
+	subsystems.Initialize<Loader::Timer::Lifecycle>();
 	subsystems.Initialize<Libs::LibKernel::PthreadLifecycle>();
 	subsystems.Initialize<Profiler::Lifecycle>();
 	subsystems.Initialize<Libs::Network::Lifecycle>();
@@ -126,15 +168,18 @@ static void LoadElf(const std::filesystem::path& elf, bool dbg_print_reloc = fal
 	}
 
 	if (!save_name.empty()) {
-		rt->SaveProgram(program, Libs::LibKernel::FileSystem::GetRealFilename(
-		                             Common::PathToGenericString(save_name)));
+		rt->SaveProgram(program, save_name);
 	}
 }
 
 static void Execute(const std::filesystem::path& game_patch) {
-	std::thread([game_patch] {
-		Common::Singleton<Loader::RuntimeLinker>::Instance()->Execute(game_patch);
-	}).detach();
+	auto           patch_path = game_patch;
+	Common::Thread guest_thread(
+	    [](void* param) {
+		    auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
+		    rt->Execute(*static_cast<const std::filesystem::path*>(param));
+	    },
+	    &patch_path);
 	Libs::Graphics::WindowRun();
 	std::quick_exit(0);
 }
@@ -152,17 +197,11 @@ void Run(const RunOptions& options) {
 	Common::Subsystems subsystems(true);
 	Init(options.config, param_json, subsystems);
 
+	ClearDebugTextureFolder();
+
 	PrintSystemInfo();
 	std::string title_id;
-	Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id);
-	if (title_id.empty()) {
-		std::string content_id;
-		if (Loader::SystemContentParamSfoGetString("CONTENT_ID", &content_id) &&
-		    content_id.size() == 36 && content_id[6] == '-' && content_id[16] == '_') {
-			title_id = content_id.substr(7, 9);
-		}
-	}
-	if (!title_id.empty()) {
+	if (Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) && !title_id.empty()) {
 		Log::WriteToConsoleAndLog(fmt::format("Title ID: {}\n", title_id));
 	}
 
@@ -178,11 +217,14 @@ void Run(const RunOptions& options) {
 
 	MountSandboxDirs();
 
-	Loader::AddContentLoad(options.addcont_dir, options.addcont, title_id);
 	auto* rt = Common::Singleton<Loader::RuntimeLinker>::Instance();
 	Libs::InitAll(rt->Symbols());
 
-	LoadElf(options.elf);
+	// KYTY_DEBUG_SAVE_ELF=<host path> also writes the executable as a plain ELF, to disassemble the
+	// guest code that KYTY_DEBUG_CALL_COUNTS traces point at.
+	const char* save_elf = KYTY_GETENV("KYTY_DEBUG_SAVE_ELF");
+	LoadElf(options.elf, false,
+	        save_elf != nullptr ? std::filesystem::path(save_elf) : std::filesystem::path());
 
 	Execute(options.game_patch);
 }

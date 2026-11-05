@@ -1,0 +1,54 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+// KYTY_GPU_DIRTY_TRACK: copies the 4-byte words of a Standard64KB image that guest shaders wrote as
+// a buffer (one bit per word in `bitmap`, set by the recompiled stores) from the tiled guest bytes
+// into the image; the image keeps its own texels elsewhere. TEXEL_WORDS (1 or 2) comes from the
+// build (-D) and picks the element size and the storage view's format.
+#define ELEMENT_BYTES (TEXEL_WORDS * 4u)
+const uint BLOCK_BYTES = 65536u;
+#include "gpu_tiler_standard64.inc"
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Source { uint data[]; } source;
+layout(set = 0, binding = 1, std430) readonly buffer Bitmap { uint data[]; } bitmap;
+#if TEXEL_WORDS == 2
+layout(set = 0, binding = 2, rg32ui) uniform uimage2D target;
+#else
+layout(set = 0, binding = 2, r32ui) uniform uimage2D target;
+#endif
+
+layout(push_constant) uniform Push {
+	uint source_word;   // The image's first word in `source`.
+	uint bitmap_word;   // The image's first bitmap word in `bitmap`.
+	uint width;
+	uint height;
+	uint blocks_per_row;
+} params;
+
+void main() {
+	uvec2 p = gl_GlobalInvocationID.xy;
+	if (p.x >= params.width || p.y >= params.height) {
+		return;
+	}
+	const uint block_width  = ELEMENT_BYTES <= 8u ? 128u : 64u;
+	const uint block_height = BLOCK_BYTES / (block_width * ELEMENT_BYTES);
+	uvec2 block = p / uvec2(block_width, block_height);
+	uint  tiled = (block.y * params.blocks_per_row + block.x) * BLOCK_BYTES + standard64_offset(p);
+	uint  word  = tiled >> 2;
+	uint  bits  = (bitmap.data[params.bitmap_word + (word >> 5)] >> (word & 31u)) &
+	              (ELEMENT_BYTES == 8u ? 3u : 1u);
+	if (bits == 0u) {
+		return;
+	}
+	ivec2 at    = ivec2(p);
+	uint  first = params.source_word + word;
+#if TEXEL_WORDS == 2
+	uvec4 texel = bits == 3u ? uvec4(0u) : imageLoad(target, at);
+	if ((bits & 1u) != 0u) texel.x = source.data[first];
+	if ((bits & 2u) != 0u) texel.y = source.data[first + 1u];
+	imageStore(target, at, texel);
+#else
+	imageStore(target, at, uvec4(source.data[first], 0u, 0u, 0u));
+#endif
+}

@@ -3,24 +3,32 @@
 
 #include "common/abi.h"
 #include "common/common.h"
+#include "common/switches.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 
 #include <array>
+#include <cstdlib>
+#include <vector>
 
 namespace Libs::Graphics::HW {
 
 struct ColorBase {
 	uint64_t addr = 0;
+
+	bool operator==(const ColorBase&) const = default;
 };
 
 struct ColorView {
 	uint32_t base_array_slice_index = 0;
 	uint32_t last_array_slice_index = 0;
 	uint32_t current_mip_level      = 0;
+
+	bool operator==(const ColorView&) const = default;
 };
 
 struct ColorInfo {
-	bool                    fmask_compression_enable       = false;
+	bool fmask_compression_enable = false;
+	// uint32_t fmask_compression_mode   = 0;
 	bool                    fmask_data_compression_disable = false;
 	bool                    fmask_one_frag_mode            = false;
 	bool                    cmask_fast_clear_enable        = false;
@@ -31,18 +39,24 @@ struct ColorInfo {
 	Prospero::ChannelLayout format                         = Prospero::ChannelLayout::kInvalid;
 	Prospero::ChannelType   channel_type                   = Prospero::ChannelType::kUNorm;
 	Prospero::ChannelOrder  channel_order                  = Prospero::ChannelOrder::kStandard;
+
+	bool operator==(const ColorInfo&) const = default;
 };
 
 struct ColorAttrib {
 	bool     force_dest_alpha_to_one = false;
 	uint32_t num_samples             = 0;
 	uint32_t num_fragments           = 0;
+
+	bool operator==(const ColorAttrib&) const = default;
 };
 
 struct ColorAttrib2 {
 	uint32_t height         = 0;
 	uint32_t width          = 0;
 	uint32_t num_mip_levels = 0;
+
+	bool operator==(const ColorAttrib2&) const = default;
 };
 
 struct ColorAttrib3 {
@@ -51,6 +65,8 @@ struct ColorAttrib3 {
 	uint32_t           dimension                    = 0;
 	bool               metadata_pipe_aligned        = false;
 	bool               write_vrs_rate_hint_to_cmask = false;
+
+	bool operator==(const ColorAttrib3&) const = default;
 };
 
 struct ColorDccControl {
@@ -63,26 +79,38 @@ struct ColorDccControl {
 	bool                 overwrite_combiner_disable     = false;
 	IndependentBlockSize independent_block_size         = IndependentBlockSize::Disabled;
 	bool                 data_write_on_dcc_clear_to_reg = false;
+
+	bool operator==(const ColorDccControl&) const = default;
 };
 
 struct ColorCmask {
 	uint64_t addr = 0;
+
+	bool operator==(const ColorCmask&) const = default;
 };
 
 struct ColorFmask {
 	uint64_t addr = 0;
+
+	bool operator==(const ColorFmask&) const = default;
 };
 
 struct ColorClearWord0 {
 	uint32_t word0 = 0;
+
+	bool operator==(const ColorClearWord0&) const = default;
 };
 
 struct ColorClearWord1 {
 	uint32_t word1 = 0;
+
+	bool operator==(const ColorClearWord1&) const = default;
 };
 
 struct ColorDccAddr {
 	uint64_t addr = 0;
+
+	bool operator==(const ColorDccAddr&) const = default;
 };
 
 struct RenderTarget {
@@ -98,6 +126,8 @@ struct RenderTarget {
 	ColorClearWord0 clear_word0;
 	ColorClearWord1 clear_word1;
 	ColorDccAddr    dcc_addr;
+
+	bool operator==(const RenderTarget&) const = default;
 };
 
 struct DepthZInfo {
@@ -133,6 +163,8 @@ struct DepthZInfo {
 			default: return false;
 		}
 	}
+
+	bool operator==(const DepthZInfo&) const = default;
 };
 
 struct DepthStencilInfo {
@@ -161,6 +193,8 @@ struct DepthStencilInfo {
 			default: return false;
 		}
 	}
+
+	bool operator==(const DepthStencilInfo&) const = default;
 };
 
 struct DepthDepthView {
@@ -169,12 +203,16 @@ struct DepthDepthView {
 	uint8_t  current_mip_level     = 0;
 	bool     depth_write_disable   = false;
 	bool     stencil_write_disable = false;
+
+	bool operator==(const DepthDepthView&) const = default;
 };
 
 struct DepthDepthSizeXY {
 	uint16_t x_max = 0;
 	uint16_t y_max = 0;
 	bool     valid = false;
+
+	bool operator==(const DepthDepthSizeXY&) const = default;
 };
 
 struct DepthRenderTarget {
@@ -189,6 +227,8 @@ struct DepthRenderTarget {
 	uint64_t stencil_write_base_addr = 0;
 	uint64_t htile_data_base_addr    = 0;
 	uint8_t  shading_rate_encoding   = 0;
+
+	bool operator==(const DepthRenderTarget&) const = default;
 };
 
 struct RenderControl {
@@ -208,6 +248,27 @@ struct DepthRenderOverride {
 	bool force_z_dirty       = false;
 	bool force_stencil_valid = false;
 	bool force_stencil_dirty = false;
+};
+
+struct GdsOaCounter {
+	uint32_t counter = 0;
+	uint32_t address = 0;
+
+	[[nodiscard]] uint32_t GetSpaceAvailable() const { return counter; }
+	[[nodiscard]] uint32_t GetAddressBytes() const { return address & 0x0000ffffu; }
+	[[nodiscard]] uint32_t GetCrawlerType() const { return (address >> 16u) & 0x3u; }
+	[[nodiscard]] uint32_t GetCrawlerId() const { return (address >> 20u) & 0xfu; }
+	[[nodiscard]] bool     IsCounterEnabled() const { return (address & 0x80000000u) != 0; }
+	[[nodiscard]] bool IsAllocationCrawlerDisabled() const { return (address & 0x40000000u) != 0; }
+};
+
+struct GdsOaState {
+	static constexpr uint32_t COUNTERS_NUM = 8;
+
+	uint32_t     cntl = 0;
+	GdsOaCounter counters[COUNTERS_NUM];
+
+	[[nodiscard]] uint32_t GetIndex() const { return cntl & (COUNTERS_NUM - 1u); }
 };
 
 struct ClipControl {
@@ -328,13 +389,15 @@ struct AaSampleControl {
 };
 
 struct DepthShaderControl {
-	uint8_t shader_z_behavior         = 0;
-	bool    shader_kill_enable        = false;
-	bool    shader_z_export_enable    = false;
-	bool    shader_mask_export_enable = false;
-	bool    shader_dual_export_enable = false;
-	bool    shader_execute_on_noop    = false;
-	bool    alpha_to_mask_disable     = false;
+	uint32_t other_bits                  = 0;
+	uint8_t  conservative_z_export_value = 0;
+	uint8_t  shader_z_behavior           = 0;
+	bool     shader_kill_enable          = false;
+	bool     shader_z_export_enable      = false;
+	bool     shader_mask_export_enable   = false;
+	bool     shader_dual_export_enable   = false;
+	bool     shader_execute_on_noop      = false;
+	bool     alpha_to_mask_disable       = false;
 };
 
 struct AaConfig {
@@ -388,8 +451,8 @@ struct ScreenViewport {
 	uint16_t clip_rect_rule                       = 0xffffu;
 	int      clip_rect_left[4]                    = {};
 	int      clip_rect_top[4]                     = {};
-	int      clip_rect_right[4]                   = {16384, 16384, 16384, 16384};
-	int      clip_rect_bottom[4]                  = {16384, 16384, 16384, 16384};
+	int      clip_rect_right[4]                   = {};
+	int      clip_rect_bottom[4]                  = {};
 	bool     clip_rect_window_offset_enable[4]    = {};
 };
 
@@ -436,6 +499,9 @@ struct PsShaderResource2 {
 
 struct PsStageRegisters {
 	uint64_t          data_addr = 0;
+	uint64_t          user_data_addr = 0;
+	// Hades II uses PS offsets 4:5 for a byte-addressed descriptor table.
+	uint64_t          auxiliary_table_addr = 0;
 	PsShaderResource1 rsrc1;
 	PsShaderResource2 rsrc2;
 };
@@ -513,19 +579,30 @@ struct GsStageRegisters {
 };
 
 struct ShaderRegisters {
-	uint32_t m_paClVsOutCntl = 0;
+	uint32_t m_spiVsOutConfig     = 0;
+	uint32_t m_spiShaderPosFormat = 0;
+	uint32_t m_paClVsOutCntl      = 0;
 
 	uint32_t ps_interpolator_settings[32] = {0};
+	// uint32_t ps_input_num                 = 0;
 
+	uint32_t m_spiShaderIdxFormat     = 0;
 	uint32_t m_geNggSubgrpCntl        = 0;
+	uint32_t m_vgtGsInstanceCnt       = 0;
+	uint32_t m_vgtGsOnchipCntl        = 0;
+	uint32_t m_vgtHosMaxTessLevel     = 0;
+	uint32_t m_vgtHosMinTessLevel     = 0;
 	uint32_t m_geMaxOutputPerSubgroup = 0;
+	uint32_t m_vgtEsgsRingItemsize    = 0;
 	uint32_t m_vgtGsMaxVertOut        = 0;
 	uint32_t m_vgtGsOutPrimType       = 0;
-	uint32_t m_vgtDrawPayloadCntl     = 0;
-	uint32_t m_paClObjprimIdCntl      = 0;
+	uint32_t m_vgtPrimitiveIdEn       = 0;
+	uint32_t m_vgtReuseOff            = 0;
+	uint32_t m_vgtTessDistribution    = 0;
 	uint32_t m_vgtLsHsConfig          = 0;
 	uint32_t m_vgtTfParam             = 0;
 
+	uint32_t shader_z_format       = 0;
 	uint8_t  target_output_mode[8] = {};
 	uint32_t ps_input_ena          = 0;
 	uint32_t ps_input_addr         = 0;
@@ -533,19 +610,38 @@ struct ShaderRegisters {
 	uint32_t baryc_cntl            = 0;
 	uint32_t m_cbShaderMask        = 0;
 
+	uint32_t m_paScShaderControl = 0;
+
 	DepthShaderControl db_shader_control;
 	bool               alpha_to_mask_enable = false;
 
-	// DB_SHADER_CONTROL.ALPHA_TO_MASK_DISABLE overrides DB_ALPHA_TO_MASK per shader.
+	// DB_SHADER_CONTROL.ALPHA_TO_MASK_DISABLE overrides DB_ALPHA_TO_MASK per shader (upstream 13b291f99).
 	[[nodiscard]] bool AlphaToMask() const {
 		return alpha_to_mask_enable && !db_shader_control.alpha_to_mask_disable;
 	}
+
+	[[nodiscard]] uint32_t GetExportCount() const {
+		return 1u + ((m_spiVsOutConfig >> 1u) & 0x1Fu);
+	}
+	[[nodiscard]] uint32_t GetEsVertsPerSubgrp() const {
+		return (m_vgtGsOnchipCntl >> 0u) & 0x7FFu;
+	}
+	[[nodiscard]] uint32_t GetGsPrimsPerSubgrp() const {
+		return (m_vgtGsOnchipCntl >> 11u) & 0x7FFu;
+	}
+	[[nodiscard]] uint32_t GetGsInstPrimsInSubgrp() const {
+		return (m_vgtGsOnchipCntl >> 22u) & 0x3FFu;
+	}
 };
+
+enum class UserSgprType { Unknown, Region, Vsharp };
 
 struct UserSgprInfo {
 	static constexpr int SGPRS_MAX = 32;
 
-	uint32_t value[SGPRS_MAX] = {0};
+	uint32_t     value[SGPRS_MAX] = {0};
+	UserSgprType type[SGPRS_MAX]  = {};
+	uint32_t     count            = 0;
 };
 
 struct VertexShaderInfo {
@@ -577,6 +673,33 @@ struct GeUserVgprEn {
 	bool vgpr2 = false;
 	bool vgpr3 = false;
 };
+
+// SET_CONTEXT_REG packets and indirect context register pairs handled so far (the command
+// processor thread only): draws between which it did not change kept every context register.
+// Per thread: the draw speculator replays the same handlers on its shadow registers, and its
+// writes must neither race with nor break the GPU thread's chains (ContextUnchanged).
+inline thread_local uint64_t g_context_register_writes = 0;
+
+// KYTY_DEBUG_CX_WRITES=1: the context registers written since the last indexed draw, each with
+// whether the write changed the register's value (the command processor thread only), for the
+// "cx-writes" lines of renderDraw.cpp.
+struct ContextWriteLog {
+	static constexpr uint32_t   ChangedBit = 1u << 31u;
+	bool                        enabled    = KYTY_GETENV("KYTY_DEBUG_CX_WRITES") != nullptr;
+	std::vector<uint32_t>       since_draw;
+	std::array<uint32_t, 0x400> values {};
+	std::array<bool, 0x400>     known {};
+	void                        Note(uint32_t offset, uint32_t value) {
+		if (offset >= values.size()) {
+			return;
+		}
+		const bool changed = !known[offset] || values[offset] != value;
+		known[offset]      = true;
+		values[offset]     = value;
+		since_draw.push_back(offset | (changed ? ChangedBit : 0u));
+	}
+};
+inline ContextWriteLog g_context_write_log;
 
 class Context {
 public:
@@ -630,10 +753,6 @@ public:
 
 	void                   SetRenderTargetMask(uint32_t mask) { m_render_target_mask = mask; }
 	[[nodiscard]] uint32_t GetRenderTargetMask() const { return m_render_target_mask; }
-	[[nodiscard]] bool HasObjectPrimitiveIdOutput() const {
-		return (m_sh_regs.m_vgtDrawPayloadCntl & 1u) != 0 &&
-		       (m_render_target_mask & 0xf0000000u) != 0;
-	}
 
 	void                   SetShaderStages(uint32_t flags) { m_shader_stages = flags; }
 	[[nodiscard]] uint32_t GetShaderStages() const { return m_shader_stages; }
@@ -643,8 +762,12 @@ public:
 		return m_depth_render_target;
 	}
 	void SetDepthZInfo(const DepthZInfo& info) { m_depth_render_target.z_info = info; }
-	void SetDepthStencilInfo(const DepthStencilInfo& info) {
+	[[nodiscard]] const DepthZInfo& GetDepthZInfo() const { return m_depth_render_target.z_info; }
+	void                            SetDepthStencilInfo(const DepthStencilInfo& info) {
 		m_depth_render_target.stencil_info = info;
+	}
+	[[nodiscard]] const DepthStencilInfo& GetDepthStencilInfo() const {
+		return m_depth_render_target.stencil_info;
 	}
 	void SetDepthZReadBase(uint64_t addr) { m_depth_render_target.z_read_base_addr = addr; }
 	void SetDepthStencilReadBase(uint64_t addr) {
@@ -656,7 +779,13 @@ public:
 	}
 	void SetDepthHTileDataBase(uint64_t addr) { m_depth_render_target.htile_data_base_addr = addr; }
 	void SetDepthDepthView(const DepthDepthView& view) { m_depth_render_target.depth_view = view; }
+	[[nodiscard]] const DepthDepthView& GetDepthDepthView() const {
+		return m_depth_render_target.depth_view;
+	}
 	void SetDepthDepthSizeXY(const DepthDepthSizeXY& size) { m_depth_render_target.size = size; }
+	[[nodiscard]] const DepthDepthSizeXY& GetDepthDepthSizeXY() const {
+		return m_depth_render_target.size;
+	}
 
 	void SetViewportZMin(uint32_t viewport_id, float zmin) {
 		m_screen_viewport.viewports[viewport_id].zmin = zmin;
@@ -690,6 +819,15 @@ public:
 	}
 	void SetViewportZOffset(uint32_t viewport_id, float zoffset) {
 		m_screen_viewport.viewports[viewport_id].zoffset = zoffset;
+	}
+	void SetViewportScissor(uint32_t viewport_id, int left, int top, int right, int bottom,
+	                        bool window_offset_enable) {
+		m_screen_viewport.viewports[viewport_id].viewport_scissor_left   = left;
+		m_screen_viewport.viewports[viewport_id].viewport_scissor_top    = top;
+		m_screen_viewport.viewports[viewport_id].viewport_scissor_right  = right;
+		m_screen_viewport.viewports[viewport_id].viewport_scissor_bottom = bottom;
+		m_screen_viewport.viewports[viewport_id].viewport_scissor_window_offset_enable =
+		    window_offset_enable;
 	}
 	void SetViewportScissorTL(uint32_t viewport_id, int left, int top, bool window_offset_enable) {
 		m_screen_viewport.viewports[viewport_id].viewport_scissor_left = left;
@@ -754,11 +892,6 @@ public:
 	void SetBlendColor(const BlendColor& color) { m_blend_color = color; }
 	[[nodiscard]] const ClipControl& GetClipControl() const { return m_clip_control; }
 	void SetClipControl(const ClipControl& control) { m_clip_control = control; }
-	// PA_CL_UCP_0_X..PA_CL_UCP_5_W as raw float bits, four per plane.
-	[[nodiscard]] const std::array<uint32_t, 24>& GetUserClipPlanes() const {
-		return m_user_clip_planes;
-	}
-	void SetUserClipPlane(uint32_t index, uint32_t value) { m_user_clip_planes[index] = value; }
 	[[nodiscard]] const RenderControl& GetRenderControl() const { return m_render_control; }
 	void SetRenderControl(const RenderControl& control) { m_render_control = control; }
 	[[nodiscard]] const DepthRenderOverride& GetDepthRenderOverride() const {
@@ -804,20 +937,32 @@ public:
 
 	[[nodiscard]] const ShaderRegisters& GetShaderRegisters() const { return m_sh_regs; }
 
+	void SetVsOutConfig(uint32_t value) { m_sh_regs.m_spiVsOutConfig = value; }
+	void SetShaderPosFormat(uint32_t value) { m_sh_regs.m_spiShaderPosFormat = value; }
 	void SetClVsOutCntl(uint32_t value) { m_sh_regs.m_paClVsOutCntl = value; }
+	void SetShaderIdxFormat(uint32_t value) { m_sh_regs.m_spiShaderIdxFormat = value; }
 	void SetNggSubgrpCntl(uint32_t value) { m_sh_regs.m_geNggSubgrpCntl = value; }
+	void SetGsInstanceCnt(uint32_t value) { m_sh_regs.m_vgtGsInstanceCnt = value; }
+	void SetGsOnchipCntl(uint32_t value) { m_sh_regs.m_vgtGsOnchipCntl = value; }
+	void SetHosMaxTessLevel(uint32_t value) { m_sh_regs.m_vgtHosMaxTessLevel = value; }
+	void SetHosMinTessLevel(uint32_t value) { m_sh_regs.m_vgtHosMinTessLevel = value; }
 	void SetMaxOutputPerSubgroup(uint32_t value) { m_sh_regs.m_geMaxOutputPerSubgroup = value; }
+	void SetEsgsRingItemsize(uint32_t value) { m_sh_regs.m_vgtEsgsRingItemsize = value; }
 	void SetGsMaxVertOut(uint32_t value) { m_sh_regs.m_vgtGsMaxVertOut = value; }
 	void SetGsOutPrimType(uint32_t value) { m_sh_regs.m_vgtGsOutPrimType = value; }
-	void SetDrawPayloadControl(uint32_t value) { m_sh_regs.m_vgtDrawPayloadCntl = value; }
-	void SetObjprimIdControl(uint32_t value) { m_sh_regs.m_paClObjprimIdCntl = value; }
+	void SetPrimitiveIdEn(uint32_t value) { m_sh_regs.m_vgtPrimitiveIdEn = value; }
+	void SetReuseOff(uint32_t value) { m_sh_regs.m_vgtReuseOff = value; }
+	void SetTessDistribution(uint32_t value) { m_sh_regs.m_vgtTessDistribution = value; }
 	void SetLsHsConfig(uint32_t value) { m_sh_regs.m_vgtLsHsConfig = value; }
 	void SetTfParam(uint32_t value) { m_sh_regs.m_vgtTfParam = value; }
 
 	void SetPsInputSettings(uint32_t id, uint32_t value) {
 		m_sh_regs.ps_interpolator_settings[id] = value;
+		// m_sh_regs.ps_input_num                 = ((id + 1) > m_sh_regs.ps_input_num ? (id + 1) :
+		// m_sh_regs.ps_input_num);
 	}
 
+	void SetShaderZFormat(uint32_t value) { m_sh_regs.shader_z_format = value; }
 	void SetTargetOutputMode(uint32_t slot, uint8_t value) {
 		m_sh_regs.target_output_mode[slot] = value;
 	}
@@ -831,7 +976,47 @@ public:
 	}
 	void SetAlphaToMaskEnable(bool value) { m_sh_regs.alpha_to_mask_enable = value; }
 
+	void SetScShaderControl(uint32_t value) { m_sh_regs.m_paScShaderControl = value; }
+
+	// A hash of every context register value written since the last reset, kept up to date at each
+	// write (SET_CONTEXT_REG, SET_CONTEXT_REG_INDIRECT; see cdd66aede on local/recherche): equal
+	// hashes mean equal written context registers, also across frames, where the write counter
+	// (g_context_register_writes) changes. Every register's state is a function of the values last
+	// written to its offsets, so equal hashes mean equal decoded state. Push/pop and reset copy or
+	// clear the shadow with the rest. KYTY_DRAW_MEMO keys draws on it.
+	void NoteRawWrite(uint32_t offset, uint32_t value) noexcept {
+		if (offset >= RawRegisterCount) {
+			return;
+		}
+		auto&          word    = m_raw_written[offset / 64u];
+		const uint64_t bit     = uint64_t {1} << (offset % 64u);
+		const bool     written = (word & bit) != 0;
+		if (written && m_raw_values[offset] == value) {
+			return;
+		}
+		if (written) {
+			m_content_hash ^= MixRaw(offset, m_raw_values[offset]);
+		}
+		m_content_hash ^= MixRaw(offset, value);
+		m_raw_values[offset] = value;
+		word |= bit;
+	}
+	[[nodiscard]] uint64_t ContentHash() const noexcept { return m_content_hash; }
+
 private:
+	static constexpr uint32_t RawRegisterCount = 0x400;
+	static uint64_t           MixRaw(uint32_t offset, uint32_t value) noexcept {
+		uint64_t x = ((uint64_t {1} << 32u) | value) ^ (uint64_t {offset} * 0x9E3779B97F4A7C15ull);
+		x ^= x >> 30u;
+		x *= 0xBF58476D1CE4E5B9ull;
+		x ^= x >> 27u;
+		x *= 0x94D049BB133111EBull;
+		return x ^ (x >> 31u);
+	}
+	std::array<uint32_t, RawRegisterCount>      m_raw_values {};
+	std::array<uint64_t, RawRegisterCount / 64> m_raw_written {};
+	uint64_t                                    m_content_hash = 0;
+
 	float    m_line_width            = 1.0f;
 	uint32_t m_primitive_reset_index = 0xffffffffu;
 
@@ -843,8 +1028,6 @@ private:
 	ClipControl     m_clip_control;
 	ColorControl    m_color_control;
 	ScanModeControl m_scan_mode_control;
-
-	std::array<uint32_t, 24> m_user_clip_planes {};
 
 	AaSampleControl m_aa_sample_control;
 	AaConfig        m_aa_config;
@@ -869,6 +1052,12 @@ private:
 	ShaderRegisters m_sh_regs;
 };
 
+struct FsrView {
+	uint32_t control_points[2][4] {};
+	uint32_t alphas[2][2] {};
+	uint32_t window[2] {};
+};
+
 class UserConfig {
 public:
 	UserConfig()  = default;
@@ -891,8 +1080,24 @@ public:
 	void                           SetGeControl(const GeControl& control) { m_ge_cntl = control; }
 	[[nodiscard]] const GeUserVgprEn& GetGeUserVgprEn() const { return m_ge_user_vgpr_en; }
 	void SetGeUserVgprEn(const GeUserVgprEn& en) { m_ge_user_vgpr_en = en; }
+	[[nodiscard]] const GdsOaState&   GetGdsOaState() const { return m_gds_oa; }
+	[[nodiscard]] const GdsOaCounter& GetGdsOaCounter(uint32_t index) const {
+		return m_gds_oa.counters[index & 0x0fu];
+	}
+	void SetGdsOaCntl(uint32_t value) { m_gds_oa.cntl = value; }
+	void SetGdsOaCounter(uint32_t value) { m_gds_oa.counters[m_gds_oa.GetIndex()].counter = value; }
+	void SetGdsOaAddress(uint32_t value) { m_gds_oa.counters[m_gds_oa.GetIndex()].address = value; }
+	void SetFsrControlPoint(uint32_t axis, uint32_t index, uint32_t value) {
+		m_fsr_view.control_points[axis][index] = value;
+	}
+	void SetFsrAlpha(uint32_t axis, uint32_t index, uint32_t value) {
+		m_fsr_view.alphas[axis][index] = value;
+	}
+	void SetFsrWindow(uint32_t index, uint32_t value) { m_fsr_view.window[index] = value; }
+	[[nodiscard]] const FsrView& GetFsrView() const { return m_fsr_view; }
 
 private:
+	FsrView m_fsr_view;
 	Prospero::PrimitiveType m_prim_type               = Prospero::PrimitiveType::kNone;
 	uint32_t                m_index_offset            = 0;
 	uint32_t                m_object_id               = 0;
@@ -900,6 +1105,7 @@ private:
 
 	GeControl    m_ge_cntl;
 	GeUserVgprEn m_ge_user_vgpr_en;
+	GdsOaState   m_gds_oa;
 };
 
 class Shader {
@@ -927,16 +1133,42 @@ public:
 	void SetGsShaderResource2(const GsShaderResource2& rsrc2) { m_vs.gs_regs.rsrc2 = rsrc2; }
 
 	void SetPsShaderBase(uint64_t addr) { m_ps.ps_regs.data_addr = addr; }
+	void SetPsUserDataAddress(uint32_t word, uint32_t value) {
+		SetUserDataAddressWord(m_ps.ps_regs.user_data_addr, word, value);
+	}
+	void SetPsAuxiliaryTableAddress(uint32_t word, uint32_t value) {
+		SetUserDataAddressWord(m_ps.ps_regs.auxiliary_table_addr, word, value);
+	}
 	void SetPsShaderResource1(const PsShaderResource1& rsrc1) { m_ps.ps_regs.rsrc1 = rsrc1; }
 	void SetPsShaderResource2(const PsShaderResource2& rsrc2) { m_ps.ps_regs.rsrc2 = rsrc2; }
 
 	void SetCsShader(const CsStageRegisters& cs_regs) { m_cs.cs_regs = cs_regs; }
 	void SetCsWaveSize(uint8_t wave_size) { m_cs.cs_regs.wave_size = wave_size; }
 
-	void SetPsUserSgpr(uint32_t id, uint32_t value) { m_ps.ps_user_sgpr.value[id] = value; }
-	void SetCsUserSgpr(uint32_t id, uint32_t value) { m_cs.cs_user_sgpr.value[id] = value; }
-	void SetHsUserSgpr(uint32_t id, uint32_t value) { m_vs.hs_user_sgpr.value[id] = value; }
-	void SetGsUserSgpr(uint32_t id, uint32_t value) { m_vs.gs_user_sgpr.value[id] = value; }
+	void SetPsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
+		m_ps.ps_user_sgpr.value[id] = value;
+		m_ps.ps_user_sgpr.type[id]  = type;
+		m_ps.ps_user_sgpr.count =
+		    ((id + 1) > m_ps.ps_user_sgpr.count ? (id + 1) : m_ps.ps_user_sgpr.count);
+	}
+	void SetCsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
+		m_cs.cs_user_sgpr.value[id] = value;
+		m_cs.cs_user_sgpr.type[id]  = type;
+		m_cs.cs_user_sgpr.count =
+		    ((id + 1) > m_cs.cs_user_sgpr.count ? (id + 1) : m_cs.cs_user_sgpr.count);
+	}
+	void SetHsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
+		m_vs.hs_user_sgpr.value[id] = value;
+		m_vs.hs_user_sgpr.type[id]  = type;
+		m_vs.hs_user_sgpr.count =
+		    ((id + 1) > m_vs.hs_user_sgpr.count ? (id + 1) : m_vs.hs_user_sgpr.count);
+	}
+	void SetGsUserSgpr(uint32_t id, uint32_t value, UserSgprType type) {
+		m_vs.gs_user_sgpr.value[id] = value;
+		m_vs.gs_user_sgpr.type[id]  = type;
+		m_vs.gs_user_sgpr.count =
+		    ((id + 1) > m_vs.gs_user_sgpr.count ? (id + 1) : m_vs.gs_user_sgpr.count);
+	}
 
 	[[nodiscard]] const PixelShaderInfo&   GetPs() const { return m_ps; }
 	[[nodiscard]] const VertexShaderInfo&  GetVs() const { return m_vs; }

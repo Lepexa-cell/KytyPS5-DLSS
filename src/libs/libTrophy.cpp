@@ -8,15 +8,12 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <string>
-#include <utility>
-#include <variant>
 #include <vector>
 
 namespace Libs {
@@ -108,8 +105,6 @@ struct TrophyState {
 	const Trophies::Package* package = nullptr;
 	Trophies::UnlockData     unlocks;
 	std::filesystem::path    path;
-	// Guests (players 2+) have no profile: nothing is loaded, saved or announced.
-	bool guest = false;
 };
 
 struct TrophyContext {
@@ -158,22 +153,9 @@ static TrophyState* LoadTrophyState(TrophyKey key) {
 			     package.event_rules.size(), uds_filename.c_str());
 		}
 	}
-	const bool guest = Config::IsGuestUserId(key.first);
-	auto       path  = guest ? std::filesystem::path {}
-	                         : Trophies::UnlocksPath({}, title_id, key.first, key.second);
-	auto unlocks = guest ? Trophies::UnlockData {} : Trophies::LoadUnlockData(path);
-	if (!guest) {
-		for (const auto& [event, rules]: package.event_rules) {
-			for (const auto& rule: rules) {
-				if (rule.maximum) {
-					auto& value = unlocks.max_stats[rule.stat_id];
-					value       = std::max(value, rule.initial_value);
-				}
-			}
-		}
-	}
-	return &g_states
-	            .emplace(key, TrophyState {&package, std::move(unlocks), std::move(path), guest})
+	auto path    = Trophies::UnlocksPath({}, title_id, key.first, key.second);
+	auto unlocks = Trophies::LoadUnlockData(path);
+	return &g_states.emplace(key, TrophyState {&package, std::move(unlocks), std::move(path)})
 	            .first->second;
 }
 
@@ -213,10 +195,8 @@ static void FillTrophyInfo(const TrophyState& state, const Trophies::Trophy& tro
 			data->timestamp_tick = timestamp->second;
 		}
 		if (trophy.progressive && trophy.target) {
-			data->progress.type = 1;
-			data->progress.value =
-			    data->unlocked ? *trophy.target
-			                   : Trophies::TrophyProgress(trophy, state.unlocks).value_or(0);
+			data->progress.type  = 1;
+			data->progress.value = data->unlocked ? *trophy.target : 0;
 		}
 	}
 }
@@ -259,17 +239,13 @@ static void FillGroupInfo(const TrophyState& state, int group_id, const std::str
 	}
 }
 
-static void RecordTrophyUnlock(TrophyState& state, int trophy_id, bool from_progress = false) {
-	if (state.guest) {
-		LOGF("[Trophy] guest users cannot earn trophies (trophy %d)\n", trophy_id);
-		return;
-	}
+static void RecordTrophyUnlock(TrophyState& state, int trophy_id, bool from_stat = false) {
 	const auto found = state.package->trophies.find(trophy_id);
 	if (found == state.package->trophies.end()) {
 		LOGF("[Trophy] ignored unknown trophy ID %d\n", trophy_id);
 		return;
 	}
-	if (found->second.grade == 1 || (!from_progress && found->second.progressive) ||
+	if (found->second.grade == 1 || (!from_stat && found->second.progressive) ||
 	    !state.unlocks.unlocked.insert(trophy_id).second) {
 		return;
 	}
@@ -589,11 +565,6 @@ struct NpUniversalDataSystemMemoryStat {
 struct NpUniversalDataSystemEventPropertyObject {
 	std::map<std::string, Common::Trophies::UdsInteger> integers;
 
-	const int32_t* Int32(const char* key) const {
-		const auto property = integers.find(key);
-		return property == integers.end() ? nullptr : std::get_if<int32_t>(&property->second);
-	}
-
 	void SetInteger(const char* key, std::optional<Common::Trophies::UdsInteger> value) {
 		if (value) {
 			integers.insert_or_assign(key, *value);
@@ -724,42 +695,22 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemPostEvent(int context, int handle,
 	const auto& uds_event = *static_cast<const NpUniversalDataSystemEvent*>(event);
 	LOGF("[UDS] posted event: %s\n", uds_event.name.c_str());
 	if (uds_event.name == "_UnlockTrophy") {
-		const auto* trophy_id = uds_event.properties.Int32("_trophy_id");
+		const auto  property  = uds_event.properties.integers.find("_trophy_id");
+		const auto* trophy_id = property == uds_event.properties.integers.end()
+		                            ? nullptr
+		                            : std::get_if<int32_t>(&property->second);
 		if (trophy_id == nullptr || *trophy_id < 0) {
 			return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 		}
 		if (auto* state = LibNpTrophy2::LoadTrophyState(it->second.key); state != nullptr) {
 			LibNpTrophy2::RecordTrophyUnlock(*state, *trophy_id);
 		}
-	} else if (uds_event.name == "_UpdateTrophyProgress") {
-		const auto* trophy_id = uds_event.properties.Int32("_trophy_id");
-		const auto* progress  = uds_event.properties.Int32("_trophy_progress");
-		if (trophy_id == nullptr || *trophy_id < 0 || progress == nullptr || *progress < 0) {
-			return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
-		}
-		if (auto* state = LibNpTrophy2::LoadTrophyState(it->second.key);
-		    state != nullptr && !state->guest) {
-			bool changed = false;
-			if (LibNpTrophy2::Trophies::UpdateTrophyProgress(*state->package, *trophy_id, *progress,
-			                                                 state->unlocks, changed)) {
-				LibNpTrophy2::RecordTrophyUnlock(*state, *trophy_id, true);
-			} else if (changed &&
-			           !LibNpTrophy2::Trophies::SaveUnlockData(state->path, state->unlocks)) {
-				LOGF("[Trophy] could not save trophy progress to %s\n",
-				     state->path.string().c_str());
-			}
-		}
 	} else if (!uds_event.properties.integers.empty()) {
-		if (auto* state = LibNpTrophy2::LoadTrophyState(it->second.key);
-		    state != nullptr && !state->guest) {
-			const auto result = LibNpTrophy2::Trophies::ApplyUdsEvent(
-			    *state->package, state->unlocks, uds_event.name, uds_event.properties.integers);
-			for (const auto trophy_id: result.trophies) {
+		if (auto* state = LibNpTrophy2::LoadTrophyState(it->second.key); state != nullptr) {
+			const auto ids = LibNpTrophy2::Trophies::FindUdsTrophies(
+			    *state->package, uds_event.name, uds_event.properties.integers);
+			for (const auto trophy_id: ids) {
 				LibNpTrophy2::RecordTrophyUnlock(*state, trophy_id, true);
-			}
-			if (result.trophies.empty() && result.stats_changed &&
-			    !LibNpTrophy2::Trophies::SaveUnlockData(state->path, state->unlocks)) {
-				LOGF("[Trophy] could not save progress to %s\n", state->path.string().c_str());
 			}
 		}
 	}
@@ -941,7 +892,7 @@ static int KYTY_SYSV_ABI NpUniversalDataSystemEventPropertyObjectSetInt64(
 	if (object == nullptr || key == nullptr) {
 		return NP_UNIVERSAL_DATA_SYSTEM_ERROR_INVALID_ARGUMENT;
 	}
-	object->SetInteger(key, value);
+	object->SetInteger(key, std::nullopt);
 
 	LOGF("\t object = 0x%016" PRIx64 "\n"
 	     "\t key    = %s\n"

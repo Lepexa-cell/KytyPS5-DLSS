@@ -35,6 +35,8 @@
 #include <QVBoxLayout>
 #include <QtAlgorithms>
 
+#include <initializer_list>
+
 #if QT_CONFIG(vulkan)
 #include <QVulkanInstance>
 #include <QVulkanWindow>
@@ -226,6 +228,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	}
 	keyboard_player->setCurrentIndex(
 	    qMax(0, keyboard_player->findData(info.controller.keyboard_player)));
+	m_ui->checkBox_dualsense_support->setChecked(info.controller.dualsense_fix);
 	auto* microphone = m_ui->comboBox_audio_input_device;
 	microphone->clear();
 	microphone->addItem(tr("None"), QString {});
@@ -323,6 +326,7 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 #else
 	m_ui->checkBox_red_zone_protection->setVisible(false);
 #endif
+	// ListInit(m_ui->comboBox_shader_optimization_type, info.shader_optimization_type);
 	ListInit(m_ui->comboBox_shader_log_direction, info.shader_log_direction);
 	m_ui->lineEdit_shader_log_folder->setText(info.shader_log_folder);
 	m_ui->lineEdit_shader_log_folder->setEnabled(info.shader_log_direction ==
@@ -335,6 +339,16 @@ void ConfigurationEditDialog::Init(const Configuration& info) {
 	m_ui->lineEdit_printf_file->setEnabled(info.printf_direction ==
 	                                       Configuration::LogDirection::File);
 	m_ui->checkBox_profiler->setChecked(info.profiler_enabled);
+	// This emulator has no option for these.
+	const std::initializer_list<QWidget*> unsupported_widgets = {
+	    m_ui->checkBox_stretch,       m_ui->checkBox_readback_tiled,
+	    m_ui->checkBox_occlusion_queries, m_ui->checkBox_shader_cache,
+	    m_ui->checkBox_psn_emulation, m_ui->spinBox_trophy_duration,
+	    m_ui->checkBox_guest_tsc,     m_ui->comboBox_keyboard_player};
+	for (QWidget* unsupported: unsupported_widgets) {
+		unsupported->setEnabled(false);
+		unsupported->setToolTip(tr("Not available in this emulator build"));
+	}
 }
 
 void ConfigurationEditDialog::InitGameDirectories() {
@@ -517,6 +531,7 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 		info.controller.vibration_intensity = ui.slider_controller_vibration->value();
 		info.controller.speaker_volume      = ui.slider_controller_volume->value();
 		info.controller.keyboard_player     = ui.comboBox_keyboard_player->currentData().toInt();
+		info.controller.dualsense_fix       = ui.checkBox_dualsense_support->isChecked();
 	}
 	info.screen_resolution =
 	    Configuration::NormalizeResolution(ui.comboBox_screen_resolution->currentText());
@@ -550,6 +565,8 @@ static void UpdateInfo(Configuration& info, Ui::ConfigurationEditDialog& ui, boo
 #if defined(_WIN32)
 	info.red_zone_protection_enabled = ui.checkBox_red_zone_protection->isChecked();
 #endif
+	// info.shader_optimization_type = TextToEnum<Configuration::ShaderOptimizationType>(
+	//     ui.comboBox_shader_optimization_type->currentText());
 	info.shader_log_direction = TextToEnum<Configuration::LogDirection>(
 	    ui.comboBox_shader_log_direction->currentText());
 	info.shader_log_folder           = ui.lineEdit_shader_log_folder->text();

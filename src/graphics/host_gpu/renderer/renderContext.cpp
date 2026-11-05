@@ -1,22 +1,42 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/emulatorConfig.h"
+#include "common/logging/log.h"
+#include "common/profiler.h"
+#include "common/switches.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
 #include <algorithm>
+#include <cstring>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace Libs::Graphics {
 
-RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::path& shader_store)
+RenderContext::RenderContext(GraphicContext& graphics)
     : m_graphics(graphics), m_render_executor(*this), m_command_scheduler(*this, graphics),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
-      m_pipeline_cache(graphics, &m_image_heap, shader_store), m_sampler_cache(graphics),
+      m_pipeline_cache(graphics), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
       m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
-      m_image_heap(*this, m_page_manager), m_occlusion_queries(graphics, m_command_scheduler) {
+      m_bindless_table(graphics, m_command_scheduler) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
+	if (Config::AsyncSubmitEnabled()) {
+		// vkQueueSubmit was about 40% of Thread_Gpu in Astro Bot; a queue thread takes it over.
+		m_command_scheduler.EnableAsyncSubmit();
+	}
+	m_texture_cache.on_bindless_unregister = [this](ImageId id) {
+		m_bindless_table.OnImageUnregistered(id);
+	};
+	m_pipeline_cache.OnContextReady();
 }
 
 RenderContext::~RenderContext() {
@@ -61,11 +81,42 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
 	}
+	const bool gpu_thread = GuestGpu::IsGpuThread();
+	struct SiteTimer {
+		bool                                  enabled;
+		bool                                  write;
+		uint64_t                              address;
+		std::chrono::steady_clock::time_point start;
+		~SiteTimer() {
+			if (enabled) {
+				const auto elapsed = std::chrono::steady_clock::now() - start;
+				DrainStats::RecordFaultSite(
+				    DrainStats::t_fault_pc, address, write,
+				    static_cast<uint64_t>(
+				        std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()));
+			}
+		}
+	} site_timer {DrainStats::Enabled(), access == PageFaultAccess::Write, fault_vaddr,
+	              DrainStats::Enabled() ? std::chrono::steady_clock::now()
+	                                    : std::chrono::steady_clock::time_point {}};
 	if (access == PageFaultAccess::Write) {
+		DrainStats::ReasonScope reason(gpu_thread ? DrainStats::Reason::GpuThreadWriteFault
+		                                          : DrainStats::Reason::GuestWriteFault);
+		RecordUpload(UploadSource::Fault, fault_vaddr, 0x1000);
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);
+		m_buffer_cache.ExpandWriteFault(fault_vaddr);
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
+		if (gpu_thread) {
+			// The command stream writes this (WRITE_DATA, fills): later draws must see it.
+			AdvanceBdaEpoch();
+		}
 	} else {
+		DrainStats::ReasonScope reason(gpu_thread ? DrainStats::Reason::GpuThreadReadFault
+		                                          : DrainStats::Reason::GuestReadFault);
+		if (gpu_thread) {
+			DrainStats::NoteQueueReadFault(fault_vaddr);
+			m_buffer_cache.NoteReadSiteFault(fault_vaddr);
+		}
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size);
 	}
 	return true;
@@ -75,9 +126,11 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	if (!IsMapped(vaddr, size)) {
 		return false;
 	}
+	DrainStats::ReasonScope reason(DrainStats::Reason::KernelInvalidate);
+	RecordUpload(UploadSource::Kernel, vaddr, size);
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
-	m_image_heap.InvalidateMemory(vaddr, size);
+	AdvanceBdaEpoch();
 	return true;
 }
 
@@ -92,20 +145,43 @@ bool RenderContext::IsMapped(uint64_t vaddr, uint64_t size) const noexcept {
 void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	std::lock_guard lock(m_mapped_ranges_mutex);
 	m_mapped_ranges.Add(vaddr, size);
-	m_buffer_cache.QueueBdaSync(vaddr, size);
+	m_buffer_cache.PublishBdaHints(vaddr, size);
+	AdvanceBdaEpoch();
+}
+
+// KYTY_UNMAP_SKIP_DRAIN=1: an unmap of memory no buffer or image owns skips the GPU drain
+// (upstream e6fce45d). Off by default until a measurement backs it.
+static bool UnmapSkipDrainEnabled() {
+	static const bool enabled = [] {
+		const char* text = KYTY_GETENV("KYTY_UNMAP_SKIP_DRAIN");
+		return text != nullptr && std::strcmp(text, "1") == 0;
+	}();
+	return enabled;
 }
 
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
+	if (!GuestRange {vaddr, size}.Valid()) {
+		return;
+	}
+	{
+		// Memory the GPU never mapped holds no cache entries: HandleFault and
+		// InvalidateMemory gate on the same set. Skip the full GPU drain for it.
+		std::shared_lock lock(m_mapped_ranges_mutex);
+		if (!m_mapped_ranges.Intersects(vaddr, size)) {
+			return;
+		}
+	}
 	if (CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported memory unmap from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		DrainStats::ReasonScope reason(DrainStats::Reason::Unmap);
 		// Check cache ownership on the GPU thread. Guest-memory callbacks can still
 		// access a range with no cached data, so they must finish before it is unmapped.
 		if (m_command_scheduler.Active() &&
-		    (m_buffer_cache.IsRegionRegistered(vaddr, size) ||
+		    (!UnmapSkipDrainEnabled() || m_buffer_cache.IsRegionRegistered(vaddr, size) ||
 		     m_texture_cache.IsRegionRegistered(vaddr, size) ||
 		     m_command_scheduler.HasPendingPriorityOperations())) {
 			const auto tick = m_command_scheduler.CurrentTick();
@@ -114,9 +190,9 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		m_texture_cache.UnmapMemory(vaddr, size);
-		m_image_heap.UnmapMemory(vaddr, size);
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
+		AdvanceBdaEpoch();
 	};
 	// Shutdown still owns the GPU while queued rendering drains, but its command lane no
 	// longer accepts external work. Use the guest GPU's state for the teardown route.
@@ -127,14 +203,216 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	m_gpu->SendCommandSync(unmap);
 }
 
+// KYTY_DEBUG_BDA_EPOCH=0 synchronizes before every draw that reads memory through addresses;
+// KYTY_DEBUG_AB=bdaepoch alternates.
+static bool BdaEpochEnabled() {
+	static const bool enabled = [] {
+		const char* text = KYTY_GETENV("KYTY_DEBUG_BDA_EPOCH");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	static const bool ab = AbSelected("bdaepoch");
+	return enabled && !(ab && AbFeatureOff());
+}
+
+uint64_t RenderContext::CurrentBdaEpoch() const noexcept {
+	return BdaEpochEnabled() ? m_bda_epoch.load(std::memory_order_acquire) : 0;
+}
+
+// KYTY_DEBUG_AB=cpwrite alternates.
+void RenderContext::AdvanceBdaEpochForGpuWrite() noexcept {
+	static const bool ab = AbSelected("cpwrite");
+	if (!(ab && AbFeatureOff())) {
+		AdvanceBdaEpoch();
+	}
+}
+
+// Draws reading memory through addresses must see the CPU writes made before their submission,
+// so the first such draw of each epoch uploads every CPU-dirty page. Meanwhile guest threads keep
+// writing later frames' data (Astro Bot's Sky Garden faults about 150k pages/s): uploading and
+// re-protecting those pages before every such draw only brings the next fault sooner, since no
+// draw of this submission may read them. Everything that can make newer CPU writes visible to
+// later draws starts an epoch: a submission starting or resuming, packets that read guest memory
+// (waits, conditions, predication), new page-table entries (buffer registration), GPU mappings,
+// kernel invalidations and the GPU thread's own writes.
 void RenderContext::PrepareBda() {
-	std::shared_lock lock(m_mapped_ranges_mutex);
-	m_buffer_cache.TakeBdaSync().ForEach([this](uint64_t begin, uint64_t end) {
-		m_mapped_ranges.ForEachInRange(begin, end - begin, [this](uint64_t start, uint64_t finish) {
-			m_buffer_cache.SynchronizeBuffersInRange(start, finish - start);
-		});
-	});
+	RecordUpload(UploadSource::BdaPass, 0, 0);
 	m_fault_process_pending = true;
+	const auto epoch        = m_bda_epoch.load(std::memory_order_acquire);
+	if (epoch == m_bda_synced_epoch && BdaEpochEnabled()) {
+		return;
+	}
+	// An epoch started during the synchronization below leaves the next call synchronizing.
+	m_bda_synced_epoch = epoch;
+	RecordUpload(UploadSource::BdaSync, 0, 0);
+	g_bda_pass_serial.fetch_add(1, std::memory_order_relaxed);
+	const bool stats = BufferCache::BdaStatsEnabled() || DrainStats::Enabled();
+	const auto start = stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	const auto       mode = Config::GetBdaSyncMode();
+	if (mode == Config::BdaSyncMode::Legacy ||
+	    !m_buffer_cache.SynchronizeBdaSelective(m_mapped_ranges)) {
+		m_buffer_cache.SynchronizeBdaLegacy(m_mapped_ranges);
+	}
+	if (mode == Config::BdaSyncMode::SelectiveChecked) {
+		EXIT_IF(!m_buffer_cache.CheckBdaHintInvariant(m_mapped_ranges));
+	}
+	if (stats) {
+		const auto ns = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+		        .count());
+		if (BufferCache::BdaStatsEnabled()) {
+			m_buffer_cache.NoteBdaPass(ns);
+		}
+		DrainStats::g_frame_bda_ns.fetch_add(ns, std::memory_order_relaxed);
+		DrainStats::g_frame_bda_passes.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+// KYTY_DEBUG_MIP_STATS=1 prints, every 300 reports (every 30 during a relief), whether draws
+// marked a counter since the last report and how many counters report no samples.
+static bool MipStatsDebugEnabled() {
+	static const bool enabled = KYTY_GETENV("KYTY_DEBUG_MIP_STATS") != nullptr;
+	return enabled;
+}
+
+// Whether GET_LOD_STATS reports clamped samples (see RenderContext::ReportMipStats).
+static bool ClampReportEnabled() {
+	static const bool enabled = [] {
+		const char* text = KYTY_GETENV("KYTY_MIP_STATS_CLAMP");
+		return text == nullptr || std::strcmp(text, "0") != 0;
+	}();
+	return enabled;
+}
+
+// The last NoteStreamingThrash, in steady_clock ticks; 0: none yet.
+static std::atomic<int64_t> g_streaming_thrash_time {0};
+
+void NoteStreamingThrash() noexcept {
+	g_streaming_thrash_time.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+	                              std::memory_order_relaxed);
+}
+
+void RenderContext::ReportMipStats(void* dst, uint32_t size, bool reset) {
+	// A report is a 64-byte header, whose first dword marks it complete, then a 64-bit value per
+	// counter, as Astro Bot's texture streamer reads them: the finest mip sampled in bits 56-59
+	// (15: none) and in bits 0-23 the samples the minimum LOD clamped (see the loop below; the
+	// streamer shows them as "MipClamp"). The streamer moves a texture's detail to the mip
+	// reported, and lets textures that report no samples drop to coarser mips.
+	//
+	// Every counter reports mip 0: draws only tell which textures they bind, not the mips they
+	// sample, and reporting no samples for counters that no draw marked kept Astro Bot reloading
+	// textures throughout play (a texture at full detail no longer carries its counter, so the
+	// counter looks unused). But when every texture claims full detail, the streamer can
+	// overflow its memory and reload the same textures in turn forever (Astro Bot at times never
+	// left the warp to a level). So when the game is seen thrashing (NoteStreamingThrash), for
+	// ReliefTime counters that no draw marked in the last InUseReports reports report no
+	// samples, and their textures drop out of the way. The reloads that this causes in turn are
+	// no new thrash: the next relief waits for a thrash noted a Cooldown after this one.
+	constexpr uint32_t HeaderSize   = 64;
+	constexpr uint64_t SampledMip0  = 0;
+	constexpr uint64_t NotSampled   = uint64_t {0xf} << 56u;
+	constexpr uint64_t InUseReports = 300;
+	constexpr std::chrono::steady_clock::duration ReliefTime = std::chrono::seconds(15);
+	constexpr std::chrono::steady_clock::duration Cooldown   = std::chrono::seconds(20);
+
+	m_mip_stats_reports++;
+	bool marked_any = false;
+	for (uint32_t id = 0; id < m_mip_stats_last_marked.size(); id++) {
+		if (((m_mip_stats_counters[id / 64u] >> (id % 64u)) & 1u) != 0) {
+			m_mip_stats_last_marked[id] = m_mip_stats_reports;
+			marked_any                  = true;
+		}
+	}
+	if (marked_any) {
+		m_mip_stats_last_marked_any = m_mip_stats_reports;
+	}
+	const auto clamped = m_mip_stats_clamped;
+	const auto bound   = m_mip_stats_counters;
+	if (reset) {
+		m_mip_stats_counters = {};
+		m_mip_stats_clamped  = {};
+	}
+	const auto in_use = [&](uint64_t last_marked) {
+		return last_marked != 0 && m_mip_stats_reports - last_marked <= InUseReports;
+	};
+	const auto now         = std::chrono::steady_clock::now().time_since_epoch().count();
+	const auto thrash_time = g_streaming_thrash_time.load(std::memory_order_relaxed);
+	if (m_mip_stats_relief_end == 0 && thrash_time != 0 && thrash_time > m_mip_stats_rearm_time) {
+		m_mip_stats_relief_end = now + ReliefTime.count();
+	}
+	if (m_mip_stats_relief_end != 0 && now >= m_mip_stats_relief_end) {
+		m_mip_stats_relief_end = 0;
+		m_mip_stats_rearm_time = now + Cooldown.count();
+	}
+	const bool relief = m_mip_stats_relief_end != 0;
+	// Until draws mark some counter, nothing is known to be unused.
+	const bool counting = relief && in_use(m_mip_stats_last_marked_any);
+
+	std::memset(dst, 0, size);
+	if (size < sizeof(uint32_t)) {
+		return;
+	}
+	*static_cast<uint32_t*>(dst) = 1;
+	const auto counters =
+	    std::min<uint32_t>(size > HeaderSize ? (size - HeaderSize) / 8u : 0u,
+	                       static_cast<uint32_t>(m_mip_stats_last_marked.size()));
+	auto*    values = reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(dst) + HeaderSize);
+	uint32_t unused = 0;
+	// KYTY_EXP_MIP_STATS=none (experiment): every counter reports no samples; =marked: only counters
+	// marked in the last InUseReports reports report mip 0 (relief permanently on); =mip<n>: every
+	// counter reports mip n as its finest sampled mip.
+	static const char* experiment = KYTY_GETENV("KYTY_EXP_MIP_STATS");
+	const bool         exp_none   = experiment != nullptr && std::strcmp(experiment, "none") == 0;
+	const bool         exp_marked = experiment != nullptr && std::strcmp(experiment, "marked") == 0;
+	static const uint64_t exp_mip =
+	    experiment != nullptr && std::strncmp(experiment, "mip", 3) == 0
+	        ? std::min<uint64_t>(std::strtoull(experiment + 3, nullptr, 10), 14u)
+	        : 0u;
+	// The default, as upstream PR 1631 reports them: a counter that a draw or dispatch bound since
+	// the last reset reports mip 0 with a nonzero sample count, every other counter reports no
+	// samples. The streamer then loads what is drawn (it queues a texture only with a nonzero
+	// count, see below) and lets the rest drop to coarser mips, so its pool no longer overflows.
+	// KYTY_MIP_STATS_MODE=legacy: the reports above (every counter mip 0, relief on thrash).
+	static const bool legacy = [] {
+		const char* text = KYTY_GETENV("KYTY_MIP_STATS_MODE");
+		return text != nullptr && std::strcmp(text, "legacy") == 0;
+	}();
+	if (!legacy && experiment == nullptr) {
+		for (uint32_t id = 0; id < counters; id++) {
+			const bool sampled = ((bound[id / 64u] >> (id % 64u)) & 1u) != 0;
+			values[id]         = sampled ? SampledMip0 | 1u : NotSampled;
+			unused += sampled ? 0u : 1u;
+		}
+	}
+	for (uint32_t id = 0; (legacy || experiment != nullptr) && id < counters; id++) {
+		const bool sampled = exp_none     ? false
+		                     : exp_marked ? in_use(m_mip_stats_last_marked[id])
+		                                  : !counting || in_use(m_mip_stats_last_marked[id]);
+		values[id]         = sampled ? SampledMip0 | (exp_mip << 56u) : NotSampled;
+		// Bits 0-23 count the samples the descriptor's minimum LOD clamped. Astro Bot's streamer
+		// queues a texture whose minimum LOD it raised (the mips it has not loaded) for loading only
+		// when its counter reports clamped samples. Draws do not tell the LOD they sample, so a draw
+		// through a raised minimum LOD counts as one clamped sample (KYTY_MIP_STATS_CLAMP=0: none).
+		if (sampled && ClampReportEnabled() && ((clamped[id / 64u] >> (id % 64u)) & 1u) != 0) {
+			values[id] |= 1u;
+		}
+		unused += sampled ? 0u : 1u;
+	}
+	const bool print = m_mip_stats_reports % 300 == 0 || (counting && m_mip_stats_reports % 30 == 0);
+	if (MipStatsDebugEnabled() && print) {
+		std::printf("mip-stats: report %llu marked=%d relief=%d unused=%u of %u\n",
+		            static_cast<unsigned long long>(m_mip_stats_reports), marked_any ? 1 : 0,
+		            relief ? 1 : 0, unused, counters);
+		std::fflush(stdout);
+	}
+}
+
+void RenderContext::TickFrame() {
+	FramePassesFlip();
+	FlightRecorderFlip();
+	DrawMemoFlip();
+	m_texture_cache.TickFrame();
+	m_buffer_cache.TickFrame();
 }
 
 void RenderContext::RunGarbageCollector() {
@@ -142,7 +420,6 @@ void RenderContext::RunGarbageCollector() {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
-	m_image_heap.RunGarbageCollector();
 	m_texture_cache.ProcessDownloadImages();
 	m_texture_cache.RunGarbageCollector();
 	m_buffer_cache.RunGarbageCollector();
@@ -175,6 +452,7 @@ void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, in
 }
 
 void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
+	KYTY_PROFILER_BLOCK("TriggerInterrupt");
 	std::vector<InterruptEqRegistration> registrations;
 	{
 		Common::LockGuard lock(m_interrupt_mutex);

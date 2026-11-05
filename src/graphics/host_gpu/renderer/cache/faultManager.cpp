@@ -2,16 +2,25 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "common/switches.h"
 #include "gpu_tiler_shaders/fault_buffer_process_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
+#include "graphics/host_gpu/renderer/gpuZones.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <algorithm>
+#include <fmt/format.h>
+#include <string>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -20,7 +29,25 @@ namespace {
 constexpr size_t MaxPageFaults    = 1024;
 constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
 
+bool BdaFaultsPrinted() {
+	static const bool print = KYTY_GETENV("KYTY_DEBUG_BDA_FAULTS") != nullptr;
+	return print;
+}
+
+// Shaders that read through addresses since the last fault pass (Thread_Gpu only).
+std::vector<uint64_t> g_bda_shaders;
+
 } // namespace
+
+void NoteBdaShader(uint64_t shader_hash) {
+	if (!BdaFaultsPrinted()) [[likely]] {
+		return;
+	}
+	if (std::find(g_bda_shaders.begin(), g_bda_shaders.end(), shader_hash) == g_bda_shaders.end() &&
+	    g_bda_shaders.size() < 64) {
+		g_bda_shaders.push_back(shader_hash);
+	}
+}
 
 FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler,
                            BufferCache& buffer_cache)
@@ -76,6 +103,7 @@ FaultManager::~FaultManager() {
 
 void FaultManager::ProcessFaultBuffer() {
 	if (const auto wait_tick = m_fault_areas[m_current_area]; wait_tick != 0) {
+		DrainStats::ReasonScope reason(DrainStats::Reason::FaultBuffer);
 		m_scheduler.Wait(wait_tick);
 		m_scheduler.PopPendingOperations();
 	}
@@ -113,6 +141,7 @@ void FaultManager::ProcessFaultBuffer() {
 
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
+	GpuZones::Mark(command, DrainStats::Zone::FaultBuffer);
 	vk::DependencyInfo dependency {};
 	dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
 	dependency.bufferMemoryBarrierCount = 1;
@@ -128,19 +157,43 @@ void FaultManager::ProcessFaultBuffer() {
 	command.pipelineBarrier2(dependency);
 
 	const auto area = m_current_area;
-	m_scheduler.DeferOperation([this, mapped, offset, area] {
+	auto       shaders = std::move(g_bda_shaders);
+	g_bda_shaders.clear();
+	m_scheduler.DeferOperation([this, mapped, offset, area, shaders = std::move(shaders)] {
 		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
 		RangeSet    fault_ranges;
 		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
 		const auto  count  = static_cast<uint32_t>(faults[0]);
+		if (count != 0 && BdaFaultsPrinted()) [[unlikely]] {
+			static uint32_t passes = 0;
+			if (passes++ < 300u) {
+				std::string text = fmt::format("bda-fault-pass: {} pages, shaders since last pass:", count);
+				for (const auto hash: shaders) {
+					text += fmt::format(" {:016x}", hash);
+				}
+				text += "\n";
+				std::fwrite(text.data(), 1, text.size(), stdout);
+				std::fflush(stdout);
+			}
+		}
 		for (uint32_t index = 1; index <= count; ++index) {
 			const auto address = BufferCache::GuestAddress(faults[index]);
 			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
 			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+			// KYTY_DEBUG_BDA_FAULTS=1 prints the pages shaders found missing in the BDA page table.
+			static const bool print   = KYTY_GETENV("KYTY_DEBUG_BDA_FAULTS") != nullptr;
+			static uint32_t   printed = 0;
+			if (print && (printed < 200u || printed % 500u == 0u)) {
+				std::printf("bda-fault: #%u 0x%016" PRIx64 " (%u this pass)\n", printed, address, count);
+				std::fflush(stdout);
+			}
+			printed += print ? 1u : 0u;
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
-			(void)m_buffer_cache.FindBuffer(start, end - start);
+			// Before FindBuffer: its CreateBuffer would book a released range as rebound.
+			m_buffer_cache.NoteBdaFault(start, end - start);
+			m_buffer_cache.PinBda(m_buffer_cache.FindBuffer(start, end - start));
 		});
 		m_fault_areas[area] = 0;
 	});

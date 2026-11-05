@@ -23,12 +23,27 @@ inline bool IsExecute(Mode mode) {
 	        mode == Mode::ExecuteReadWrite);
 }
 
-// Maps committed pages at exactly `address`; fails if any page there is already mapped.
-bool AllocFixed(uint64_t address, uint64_t size, Mode mode);
-// Releases exactly one AllocFixed range.
-bool Free(uint64_t address, uint64_t size);
-bool Protect(uint64_t address, uint64_t size, Mode mode);
-bool FlushInstructionCache(uint64_t address, uint64_t size);
+void Init();
+
+uint64_t Alloc(uint64_t address, uint64_t size, Mode mode);
+uint64_t AllocAligned(uint64_t address, uint64_t size, Mode mode, uint64_t alignment);
+bool     AllocFixed(uint64_t address, uint64_t size, Mode mode);
+bool     Commit(uint64_t address, uint64_t size, Mode mode);
+uint64_t Reserve(uint64_t address, uint64_t size);
+uint64_t ReserveAligned(uint64_t address, uint64_t size, uint64_t alignment);
+bool     ReserveFixed(uint64_t address, uint64_t size);
+bool     Decommit(uint64_t address, uint64_t size);
+bool     Free(uint64_t address);
+bool     FreeRange(uint64_t address, uint64_t size);
+bool     Protect(uint64_t address, uint64_t size, Mode mode);
+// Protect for transient write/access watches: pages of an allocation created executable (the
+// game's code) keep their execute permission under Read and ReadWrite, so a watch on a page that
+// holds code as well as data the GPU uses cannot stop that code from running.
+bool     ProtectPreservingExecute(uint64_t address, uint64_t size, Mode mode);
+// Gives the page holding `address` its execute permission back when its allocation was created
+// executable and the page is readable; false otherwise (a real execute fault).
+bool     RestoreExecute(uint64_t address);
+bool     FlushInstructionCache(uint64_t address, uint64_t size);
 
 } // namespace VirtualMemory
 

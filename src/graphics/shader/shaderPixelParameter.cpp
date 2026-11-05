@@ -11,55 +11,16 @@ constexpr uint32_t PsInputFlatShade  = 0x00000400u;
 
 } // namespace
 
-uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index) {
-	for (uint32_t target = 0; target < 8u; target++) {
-		if (((shader_mask >> (target * 4u)) & 0xfu) == 0u) {
-			continue;
-		}
-		if (export_index == 0u) {
-			return target;
-		}
-		export_index--;
-	}
-	return UINT32_MAX;
-}
-
 uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input) {
 	return input < info.input_num ? info.interpolator_settings[input] & PsInputOffsetMask : input;
 }
 
 uint32_t ShaderPixelParameterLocation(const ShaderPixelInputInfo& info,
-                                      std::span<const uint32_t> active_inputs, uint32_t input) {
-	if (info.parameter_mode != ShaderPixelParameterMode::Rectangle) {
-		return ShaderPixelParameterMappedLocation(info, input);
-	}
-	std::array<bool, 32> used_locations {};
-	for (const auto active_input: active_inputs) {
-		used_locations[ShaderPixelParameterMappedLocation(info, active_input)] = true;
-	}
-	std::array<uint32_t, 64> group_locations;
-	group_locations.fill(UINT32_MAX);
-	for (const auto active_input: active_inputs) {
-		const auto mapped = ShaderPixelParameterMappedLocation(info, active_input);
-		const auto group  = mapped * 2u + ShaderPixelParameterIsFlat(info, active_input);
-		auto&      location = group_locations[group];
-		if (location == UINT32_MAX) {
-			location = mapped;
-			// Rectangle expansion broadcasts flat aliases through separate outputs.
-			if (group_locations[group ^ 1u] != UINT32_MAX) {
-				location = 0;
-				while (location < used_locations.size() && used_locations[location]) {
-					location++;
-				}
-				EXIT_NOT_IMPLEMENTED(location >= used_locations.size());
-			}
-			used_locations[location] = true;
-		}
-
-		if (active_input == input) {
-			return location;
-		}
-	}
+                                      std::span<const uint32_t> /*active_inputs*/, uint32_t input) {
+	// Every input reads the vertex output it is mapped to. A flat input whose vertex output a
+	// smooth input also reads shares that location: both read the raw vertices (PerVertexKHR),
+	// the flat one vertex 0. A location of its own would be one no vertex shader exports
+	// (Ghost of Yotei grass f23f7e7f30362713: its material key read (0,0,0,1)).
 	return ShaderPixelParameterMappedLocation(info, input);
 }
 

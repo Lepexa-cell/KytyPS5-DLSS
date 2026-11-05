@@ -1,10 +1,11 @@
 #include "common/emulatorConfig.h"
 
 #include "common/assert.h"
-#include "common/debugCounters.h"
 
 #include <algorithm>
+#include <atomic>
 #include <memory>
+#include <thread>
 
 namespace Config {
 
@@ -17,7 +18,6 @@ void Initialize() {
 }
 
 void Shutdown() {
-	Common::DebugCounters::SetEnabled(false);
 	g_config.reset();
 }
 
@@ -26,10 +26,11 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(cfg.user_name.empty() || cfg.user_name.size() > MAX_USER_NAME_LENGTH);
 	EXIT_IF(!IsConfiguredUserIdValid(cfg.user_id));
 	EXIT_IF(cfg.controller_speaker_volume > 100 || cfg.controller_vibration_intensity > 100);
-	EXIT_IF(cfg.keyboard_player > static_cast<uint32_t>(MAX_PLAYERS));
+	EXIT_IF(cfg.audio_master_volume > MAX_AUDIO_VOLUME || cfg.audio_main_volume > MAX_AUDIO_VOLUME ||
+	        cfg.audio_music_volume > MAX_AUDIO_VOLUME ||
+	        cfg.audio_pad_speaker_main_volume > MAX_AUDIO_VOLUME);
 
 	*g_config = cfg;
-	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
 }
 
 uint32_t GetScreenWidth() {
@@ -64,29 +65,28 @@ uint32_t GetControllerVibrationIntensity() {
 	return g_config->controller_vibration_intensity;
 }
 
-uint32_t GetKeyboardPlayer() {
-	return g_config->keyboard_player;
+uint32_t GetAudioMasterVolume() {
+	return g_config->audio_master_volume;
 }
 
-int32_t GetPlayerUserId(int player) {
-	return g_config->user_id + player * PLAYER_USER_ID_STEP;
+uint32_t GetAudioMainVolume() {
+	return g_config->audio_main_volume;
 }
 
-int GetPlayerFromUserId(int32_t user_id) {
-	for (int player = 0; player < MAX_PLAYERS; player++) {
-		if (user_id == GetPlayerUserId(player)) {
-			return player;
-		}
-	}
-	return -1;
+uint32_t GetAudioMusicVolume() {
+	return g_config->audio_music_volume;
 }
 
-bool IsGuestUserId(int32_t user_id) {
-	return GetPlayerFromUserId(user_id) > 0;
+uint32_t GetAudioPadSpeakerOnMainVolume() {
+	return g_config->audio_pad_speaker_main_volume;
 }
 
 PresentMode GetPresentMode() {
 	return g_config->present_mode;
+}
+
+BdaSyncMode GetBdaSyncMode() {
+	return g_config->bda_sync_mode;
 }
 
 int32_t GetGpuIndex() {
@@ -105,24 +105,12 @@ bool HideCursorEnabled() {
 	return g_config->hide_cursor_enabled;
 }
 
-bool StretchEnabled() {
-	return g_config->stretch_enabled;
-}
-
 bool VrEnabled() {
 	return g_config->vr_enabled;
 }
 
-bool Ps5ProEnabled() {
-	return g_config->pro_enabled;
-}
-
 bool AmdCpuEnabled() {
 	return g_config->amd_cpu_enabled;
-}
-
-bool GuestTscEnabled() {
-	return g_config->guest_tsc_enabled;
 }
 
 uint32_t GetVblankFrequency() {
@@ -141,16 +129,16 @@ bool IsNetworkConnected() {
 	return g_config->network_connected;
 }
 
-bool PsnEmulationEnabled() {
-	return g_config->psn_emulation_enabled;
-}
-
 bool ShaderValidationEnabled() {
 	return g_config->shader_validation_enabled;
 }
 
-bool ShaderCacheEnabled() {
-	return g_config->shader_cache_enabled;
+bool ShaderPrecompileEnabled() {
+	return g_config->shader_precompile_enabled;
+}
+
+ShaderOptimizationType GetShaderOptimizationType() {
+	return g_config->shader_optimization_type;
 }
 
 LogDirection GetShaderLogDirection() {
@@ -201,10 +189,6 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
-bool ReadbackTiledImagesEnabled() {
-	return g_config->readback_tiled_images;
-}
-
 bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
 }
@@ -213,24 +197,145 @@ bool TessellationEnabled() {
 	return g_config->tessellation_enabled;
 }
 
-bool OcclusionQueriesEnabled() {
-	return g_config->occlusion_queries_enabled;
-}
-
-bool LodStatsEnabled() {
-	return g_config->lod_stats_enabled;
+bool BindlessImagesEnabled() {
+	return g_config->bindless_images_enabled;
 }
 
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }
 
-uint32_t GetTrophyDurationSeconds() {
-	return std::clamp(g_config->trophy_duration_seconds, 5u, 10u);
+bool PerfOverlayEnabled() {
+	return g_config->perf_overlay_enabled;
 }
 
 bool PlayGoHackEnabled() {
 	return g_config->playgo_hack_enabled;
+}
+
+uint32_t GetDrainStatsInterval() {
+	return g_config->drain_stats_interval;
+}
+
+bool DccGpuClearEnabled() {
+	return g_config->dcc_gpu_clear_enabled;
+}
+
+bool AsyncSubmitEnabled() {
+	return g_config->async_submit_enabled;
+}
+
+bool GpuMeshIndirectEnabled() {
+	return g_config->gpu_mesh_indirect_enabled;
+}
+
+uint32_t GetGpuFramesAhead() {
+	return g_config->gpu_frames_ahead;
+}
+
+
+uint32_t GetLabelFlushIntervalUs() {
+	return g_config->label_flush_interval_us;
+}
+
+// A runtime change from the settings panel; 0 means the configured value.
+static std::atomic<uint32_t> g_gpu_timestamp_scale_override {0};
+
+uint32_t GetGpuTimestampScalePercent() {
+	const auto percent = g_gpu_timestamp_scale_override.load(std::memory_order_relaxed);
+	return percent != 0 ? percent : g_config->gpu_timestamp_scale_percent;
+}
+
+void SetGpuTimestampScalePercent(uint32_t percent) {
+	g_gpu_timestamp_scale_override.store(std::clamp(percent, 25u, 200u),
+	                                     std::memory_order_relaxed);
+}
+
+// A runtime change from the settings panel: -1 means the configured value.
+static std::atomic<int> g_pipeline_libraries_override {-1};
+
+bool PipelineLibrariesEnabled() {
+	const auto enabled = g_pipeline_libraries_override.load(std::memory_order_relaxed);
+	return enabled >= 0 ? enabled != 0 : g_config->pipeline_libraries_enabled;
+}
+
+void SetPipelineLibrariesEnabled(bool enabled) {
+	g_pipeline_libraries_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+static std::atomic<int> g_async_pipelines_override {-1};
+
+bool AsyncPipelinesEnabled() {
+	const auto enabled = g_async_pipelines_override.load(std::memory_order_relaxed);
+	return enabled >= 0 ? enabled != 0 : g_config->async_pipelines_enabled;
+}
+
+void SetAsyncPipelinesEnabled(bool enabled) {
+	g_async_pipelines_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+uint32_t PipelineCompileThreads() {
+	if (g_config->pipeline_compile_threads != 0) {
+		return g_config->pipeline_compile_threads;
+	}
+	const auto hardware = std::thread::hardware_concurrency();
+	return hardware > 4 ? hardware - 2 : 2;
+}
+
+uint32_t PipelineCompileReplayThreads() {
+	if (g_config->pipeline_compile_threads_replay != 0) {
+		return std::min(g_config->pipeline_compile_threads_replay, PipelineCompileThreads());
+	}
+	return std::max(PipelineCompileThreads() / 2u, 1u);
+}
+
+bool DispatchLookaheadEnabled() {
+	return g_config->dispatch_lookahead_enabled;
+}
+
+bool DeferDispatchesEnabled() {
+	return g_config->defer_dispatches_enabled;
+}
+
+static std::atomic<int> g_speculative_draws_override {-1};
+
+bool SpeculativeDrawsEnabled() {
+	const auto enabled = g_speculative_draws_override.load(std::memory_order_relaxed);
+	return enabled >= 0 ? enabled != 0 : g_config->speculative_draws_enabled;
+}
+
+void SetSpeculativeDrawsEnabled(bool enabled) {
+	g_speculative_draws_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+bool RecordThreadEnabled() {
+	return g_config->record_thread_enabled;
+}
+
+bool HardwareBufferBoundsEnabled() {
+	return g_config->hardware_buffer_bounds;
+}
+
+static std::atomic<int> g_relaxed_readback_override {-1};
+
+bool RelaxedReadbackEnabled() {
+	const auto enabled = g_relaxed_readback_override.load(std::memory_order_relaxed);
+	return enabled >= 0 ? enabled != 0 : g_config->relaxed_readback_enabled;
+}
+
+void SetRelaxedReadbackEnabled(bool enabled) {
+	g_relaxed_readback_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
+static std::atomic<int> g_fxaa_override {-1};
+
+bool FxaaEnabled() {
+	const auto enabled = g_fxaa_override.load(std::memory_order_relaxed);
+	return enabled >= 0 ? enabled != 0 : g_config->fxaa_enabled;
+}
+
+void SetFxaaEnabled(bool enabled) {
+	g_fxaa_override.store(enabled ? 1 : 0, std::memory_order_relaxed);
 }
 
 bool SkipNoticeScreen() {

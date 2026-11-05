@@ -5,6 +5,8 @@
 
 #include <magic_enum.hpp>
 #include <span>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -13,6 +15,11 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 // PS5 flat stack addresses use these SH_MEM_BASES aperture tags in VA[63:32].
 constexpr uint32_t PrivateApertureHigh = 0x70000000u;
 constexpr uint32_t SharedApertureHigh = 0x80000000u;
+// Thrown for an encoding the decoder does not understand; the shader is then skipped.
+struct DecodeError: std::runtime_error {
+	DecodeError(uint32_t pc, const std::string& message): std::runtime_error(message), pc(pc) {}
+	uint32_t pc;
+};
 
 enum class Family {
 	Unknown,
@@ -61,13 +68,10 @@ enum class Opcode {
 	S_FLBIT_I32_B32,
 	S_FLBIT_I32_B64,
 	S_FLBIT_I32,
-	S_FLBIT_I32_I64,
 	S_BITREPLICATE_B64_B32,
-	S_QUADMASK_B32,
 	S_QUADMASK_B64,
 	S_GETPC_B64,
 	S_SETPC_B64,
-	S_SWAPPC_B64,
 	S_SUBVECTOR_LOOP_BEGIN,
 	S_SUBVECTOR_LOOP_END,
 	S_AND_SAVEEXEC_B32,
@@ -249,9 +253,7 @@ enum class Opcode {
 	V_MIN_I32,
 	V_MAX_I32,
 	V_MUL_I32_I24,
-	V_MUL_HI_I32_I24,
 	V_MUL_U32_U24,
-	V_MUL_HI_U32_U24,
 	V_MUL_LO_U32,
 	V_MUL_HI_U32,
 	V_MUL_LO_I32,
@@ -260,7 +262,6 @@ enum class Opcode {
 	V_CVT_PK_U8_F32,
 	V_MAD_F32,
 	V_MAD_I16,
-	V_MAD_U16,
 	V_MAD_I32_I24,
 	V_MAD_U32_U24,
 	V_MAD_U64_U32,
@@ -281,20 +282,16 @@ enum class Opcode {
 	V_MIN3_I32,
 	V_MIN3_U32,
 	V_MIN3_F16,
-	V_MIN3_I16,
 	V_MIN3_U16,
 	V_MAX3_F32,
 	V_MAX3_I32,
 	V_MAX3_U32,
 	V_MAX3_F16,
-	V_MAX3_I16,
-	V_MAX3_U16,
 	V_MED3_F32,
 	V_MED3_I32,
 	V_MED3_U32,
 	V_MED3_F16,
 	V_MED3_I16,
-	V_MED3_U16,
 	V_SAD_U32,
 	V_ADD3_U32,
 	V_LSHL_ADD_U32,
@@ -362,7 +359,6 @@ enum class Opcode {
 	V_ASHRREV_I32,
 	V_LSHLREV_B64,
 	V_LSHRREV_B64,
-	V_ASHRREV_I64,
 	V_LSHLREV_B16,
 	V_LSHRREV_B16,
 	V_ASHRREV_I16,
@@ -491,7 +487,9 @@ enum class Opcode {
 	V_CMPX_LT_U16,
 	V_CMPX_EQ_U16,
 	V_CMPX_GT_U16,
+	V_CMPX_LE_U16,
 	V_CMPX_NE_U16,
+	V_CMPX_GE_U16,
 	V_CMP_NE_U16,
 	V_CMP_GE_U16,
 	V_CMP_F_U32,
@@ -553,43 +551,42 @@ enum class Opcode {
 	S_BUFFER_LOAD_DWORDX8,
 	S_BUFFER_LOAD_DWORDX16,
 	S_MEMREALTIME,
-	S_DCACHE_INV,
 	BUFFER_LOAD_FORMAT_X,
 	BUFFER_LOAD_FORMAT_XY,
 	BUFFER_LOAD_FORMAT_XYZ,
 	BUFFER_LOAD_FORMAT_XYZW,
 	BUFFER_LOAD_FORMAT_D16_X,
-	BUFFER_LOAD_FORMAT_D16_HI_X,
 	BUFFER_LOAD_FORMAT_D16_XY,
 	BUFFER_LOAD_FORMAT_D16_XYZ,
 	BUFFER_LOAD_FORMAT_D16_XYZW,
-	BUFFER_STORE_FORMAT_X,
-	BUFFER_STORE_FORMAT_XY,
-	BUFFER_STORE_FORMAT_XYZ,
-	BUFFER_STORE_FORMAT_XYZW,
+	BUFFER_LOAD_FORMAT_D16_HI_X,
 	BUFFER_STORE_FORMAT_D16_X,
 	BUFFER_STORE_FORMAT_D16_HI_X,
 	BUFFER_STORE_FORMAT_D16_XY,
 	BUFFER_STORE_FORMAT_D16_XYZ,
 	BUFFER_STORE_FORMAT_D16_XYZW,
-	BUFFER_LOAD_UBYTE,
+	BUFFER_STORE_BYTE_D16_HI,
+	BUFFER_STORE_SHORT_D16_HI,
 	BUFFER_LOAD_UBYTE_D16,
 	BUFFER_LOAD_UBYTE_D16_HI,
-	BUFFER_LOAD_SBYTE,
 	BUFFER_LOAD_SBYTE_D16,
 	BUFFER_LOAD_SBYTE_D16_HI,
-	BUFFER_LOAD_USHORT,
-	BUFFER_LOAD_SSHORT,
 	BUFFER_LOAD_SHORT_D16,
 	BUFFER_LOAD_SHORT_D16_HI,
+	BUFFER_STORE_FORMAT_X,
+	BUFFER_STORE_FORMAT_XY,
+	BUFFER_STORE_FORMAT_XYZ,
+	BUFFER_STORE_FORMAT_XYZW,
+	BUFFER_LOAD_UBYTE,
+	BUFFER_LOAD_SBYTE,
+	BUFFER_LOAD_USHORT,
+	BUFFER_LOAD_SSHORT,
 	BUFFER_LOAD_DWORD,
 	BUFFER_LOAD_DWORDX2,
 	BUFFER_LOAD_DWORDX3,
 	BUFFER_LOAD_DWORDX4,
 	BUFFER_STORE_BYTE,
-	BUFFER_STORE_BYTE_D16_HI,
 	BUFFER_STORE_SHORT,
-	BUFFER_STORE_SHORT_D16_HI,
 	BUFFER_STORE_DWORD,
 	BUFFER_STORE_DWORDX2,
 	BUFFER_STORE_DWORDX3,
@@ -606,11 +603,9 @@ enum class Opcode {
 	BUFFER_ATOMIC_CMPSWAP,
 	BUFFER_ATOMIC_SWAP_X2,
 	BUFFER_ATOMIC_ADD,
-	BUFFER_ATOMIC_ADD_X2,
 	BUFFER_ATOMIC_SUB,
 	BUFFER_ATOMIC_SMIN,
 	BUFFER_ATOMIC_UMIN,
-	BUFFER_ATOMIC_UMIN_X2,
 	BUFFER_ATOMIC_SMAX,
 	BUFFER_ATOMIC_UMAX,
 	BUFFER_ATOMIC_AND,
@@ -620,14 +615,11 @@ enum class Opcode {
 	BUFFER_ATOMIC_XOR,
 	BUFFER_ATOMIC_FMIN,
 	BUFFER_ATOMIC_FMAX,
-	BUFFER_GL0_INV,
-	BUFFER_GL1_INV,
 	FLAT_LOAD_UBYTE,
 	FLAT_LOAD_SBYTE,
 	FLAT_LOAD_USHORT,
 	FLAT_LOAD_SSHORT,
 	FLAT_LOAD_SHORT_D16,
-	FLAT_LOAD_SHORT_D16_HI,
 	FLAT_LOAD_DWORD,
 	FLAT_LOAD_DWORDX2,
 	FLAT_LOAD_DWORDX3,
@@ -655,9 +647,6 @@ enum class Opcode {
 	DS_MIN_RTN_U32,
 	DS_MAX_U32,
 	DS_MAX_RTN_U32,
-	DS_MAX_RTN_U64,
-	DS_CMPST_RTN_B32,
-	DS_CMPST_RTN_B64,
 	DS_AND_B32,
 	DS_AND_RTN_B32,
 	DS_OR_B32,
@@ -689,7 +678,6 @@ enum class Opcode {
 	DS_READ2ST64_B64,
 	DS_READ_B96,
 	DS_READ_B128,
-	DS_BVH_STACK_PUSH8_POP1_RTN_B32,
 	DS_WRITE_B8,
 	DS_WRITE_B16,
 	DS_WRITE_B8_D16_HI,
@@ -705,7 +693,10 @@ enum class Opcode {
 	DS_WRITE_ADDTID_B32,
 	DS_READ_ADDTID_B32,
 	IMAGE_BVH_INTERSECT_RAY,
+	// PS5 Pro (MIMG 0xe5): RDNA4's 8-wide BVH intersection, 10 result DWORDs (see Memory.cpp).
 	IMAGE_BVH8_INTERSECT_RAY,
+	// PS5 Pro (DS 0xe1): RDNA4's LDS traversal stack for BVH8 (see Memory.cpp).
+	DS_BVH_STACK_PUSH8_POP1_RTN_B32,
 	IMAGE_GET_RESINFO,
 	IMAGE_GET_LOD,
 	IMAGE_LOAD,
@@ -725,12 +716,18 @@ enum class Opcode {
 	IMAGE_ATOMIC_FMIN,
 	IMAGE_ATOMIC_FMAX,
 	IMAGE_SAMPLE,
-	IMAGE_GATHER4,
+	IMAGE_GATHER4_L,
+	IMAGE_GATHER4_LZ,
+	IMAGE_GATHER4_C,
+	IMAGE_GATHER4_C_LZ,
+	IMAGE_GATHER4_C_L,
+	IMAGE_GATHER4_LZ_O,
+	IMAGE_GATHER4_C_O,
+	IMAGE_GATHER4_C_LZ_O,
+	IMAGE_GATHER4H,
 	V_INTERP_P1_F32,
 	V_INTERP_P2_F32,
 	V_INTERP_MOV_F32,
-	V_INTERP_P1LL_F16,
-	V_INTERP_P2_F16,
 
 	S_NOP,
 	S_WAITCNT,
@@ -749,13 +746,11 @@ enum class Opcode {
 	S_CBRANCH_CDBGSYS_OR_USER,
 	S_CBRANCH_CDBGSYS_AND_USER,
 	S_SENDMSG,
-	S_GETREG_B32,
 	S_SETREG_B32,
 	S_SLEEP,
 	S_TRAP,
 	S_TTRACEDATA,
 	S_INST_PREFETCH,
-	S_CLAUSE,
 	S_ENDPGM,
 	EXP,
 	COUNT
@@ -777,9 +772,7 @@ enum class OperandKind {
 	M0,
 	PopsExitingWaveId,
 	SharedBase,
-	SharedLimit,
 	PrivateBase,
-	PrivateLimit,
 	Null,
 	Vgpr,
 };
@@ -796,7 +789,6 @@ enum ImageSampleFlag : uint32_t {
 	ImageSampleFlagCd               = 1u << 8u,
 	ImageSampleFlagGatherHorizontal = 1u << 9u,
 	ImageSampleFlagAdjust           = 1u << 10u,
-	ImageSampleFlagUnnormalized     = 1u << 11u,
 };
 
 enum class ImageDimension : uint32_t {
@@ -889,10 +881,14 @@ struct Instruction {
 	std::string_view unsupported_reason;
 };
 
+// Two words after the last instruction of code ShaderCallLink linked: its blocks are ordered for
+// execution, not by PC (see BuildGraph).
+constexpr uint32_t ExecutionOrderMarker = 0x4b4c4e4bu;
+
 struct Program {
 	std::span<const uint32_t> code;
 	std::vector<Instruction>  instructions;
-	bool                     has_swap_pc = false;
+	bool                      execution_order = false;
 };
 
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.
@@ -903,7 +899,6 @@ Program DecodeFrontProgram(std::span<const uint32_t> front);
 void DecodeProgram(std::span<const uint32_t> code, Program& program);
 bool IsConditionalBranch(Opcode opcode);
 bool IsDirectBranch(Opcode opcode);
-bool IsDsWriteOpcode(Opcode opcode);
 
 void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand);
 void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand);

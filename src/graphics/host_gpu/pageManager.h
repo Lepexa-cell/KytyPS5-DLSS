@@ -8,7 +8,7 @@
 
 namespace Libs::Graphics {
 
-enum class PageFaultAccess { Read, Write, Execute };
+enum class PageFaultAccess { Read, Write, Execute, Unknown };
 
 class PageManager final {
 public:
@@ -17,6 +17,23 @@ public:
 	~PageManager();
 
 	KYTY_CLASS_NO_COPY(PageManager);
+
+	[[nodiscard]] uint64_t GetPageSize() const;
+
+	// KYTY_DEBUG_BDA_STATS: this thread's protection changes since the last call.
+	struct ProtectStats {
+		uint64_t calls = 0;
+		uint64_t ns    = 0;
+	};
+	[[nodiscard]] static ProtectStats TakeProtectStats() noexcept;
+
+	// While set, this thread's protection changes are queued instead of made. Only for clearing
+	// CPU-dirty pages before copying them: whoever copies them must RunDeferredProtects first, so
+	// a write that lands before the protection is in the copy, and every later write faults.
+	static void DeferProtects(bool defer) noexcept;
+	static void RunDeferredProtects() noexcept;
+	// How many changes this thread has queued so far.
+	[[nodiscard]] static uint64_t DeferredPushes() noexcept;
 
 	template <bool track>
 	void UpdatePageWatchers(uint64_t vaddr, uint64_t size);

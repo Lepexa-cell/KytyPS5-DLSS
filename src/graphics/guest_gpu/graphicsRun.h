@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <set>
 #include <mutex>
 #include <semaphore>
 #include <span>
@@ -33,7 +34,8 @@ public:
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
 
 	// Submitted command memory is borrowed and must remain valid until GPU execution completes.
-	void Submit(std::span<const uint32_t> commands);
+	void Submit(std::span<const uint32_t> draw_commands,
+	            std::span<const uint32_t> constant_commands);
 	void SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
 	void SubmitFlipPreparation(uint64_t request_id);
 	// Insert an ordered graphics drain; only a previous suspend point can block the caller.
@@ -51,20 +53,34 @@ private:
 	static constexpr uint32_t ComputeQueueBase     = 0x20;
 	static constexpr uint32_t QueueCount           = 1 + ComputeQueueCount;
 
-	enum class SubmissionType { Commands, FlipPreparation, SuspendPoint };
+	enum class SubmissionType { Graphics, Compute, FlipPreparation, SuspendPoint };
 
 	struct Submission {
-		SubmissionType            type     = SubmissionType::Commands;
+		SubmissionType            type     = SubmissionType::Graphics;
+		uint64_t                  sequence = 0; // Enqueue order, for frames-ahead waits.
 		uint32_t                  queue_id = 0;
 		std::span<const uint32_t> commands;
-		Pm4Execution              execution;
-		bool                      blocked         = false;
-		uint64_t                  flip_request_id = 0;
+		std::span<const uint32_t> constant_commands;
+		Pm4Execution              command_execution;
+		Pm4Execution              constant_execution;
+		bool                      started           = false;
+		bool                      command_complete  = false;
+		bool                      constant_complete = false;
+		bool                      blocked           = false;
+		uint64_t                  flip_request_id   = 0;
+		uint64_t                  enqueue_ns        = 0; // KYTY_DEBUG_QUEUE_SYNC: when the game submitted it.
+		// KYTY_DEFER_DIRTY_READS: a dispatch waits for the download of this tick; the submission runs
+		// again once the tick is done (or, with every queue waiting, after waiting for it).
+		uint64_t                  read_tick         = 0;
 	};
 
 	void              Enqueue(Submission submission);
+	// Waits until every submission enqueued before `sequence` has completed.
+	void              WaitForSubmissionsBefore(uint64_t sequence);
 	void              ProcessCommands();
 	bool              Process(Submission& submission);
+	// Submits a slice's commands, or leaves them for later (KYTY_SLICE_FLUSH_DEFER).
+	void              FlushSlice(CommandProcessor& cp, bool complete);
 	static void       ThreadRun(void* data);
 	CommandProcessor& GetProcessor(uint32_t queue_id);
 
@@ -78,6 +94,14 @@ private:
 	std::atomic_uint32_t                           m_pending_commands {0};
 	uint32_t                                       m_next_queue        = 0;
 	uint32_t                                       m_submission_count  = 0;
+	// KYTY_SLICE_FLUSH_DEFER: a blocked slice left its commands unsubmitted (GPU thread only).
+	bool                                           m_slice_flush_pending = false;
+	uint64_t                                       m_slice_flush_tick    = 0; // The tick it left open.
+	// Sequence numbers of submissions not yet completed, and the next one to assign.
+	std::set<uint64_t>                             m_outstanding;
+	uint64_t                                       m_next_sequence     = 1;
+	// Next sequence at each recent suspend point (GuestGpu::Done), oldest first.
+	std::deque<uint64_t>                           m_done_marks;
 	bool                                           m_processing        = false;
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
@@ -89,7 +113,8 @@ private:
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;
 
-	std::atomic_int m_done_num = 0;
+	uint64_t        m_submit_id = 0;
+	std::atomic_int m_done_num  = 0;
 	std::jthread    m_thread;
 
 	friend class CommandProcessor;

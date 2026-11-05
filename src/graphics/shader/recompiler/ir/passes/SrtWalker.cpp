@@ -1,38 +1,60 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
-#include "common/abi.h"
 #include "common/assert.h"
+#include "common/switches.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
-#include <xbyak/xbyak.h>
-
 #include <algorithm>
+#include <cstdlib>
+#include <atomic>
 #include <bit>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
-#include <deque>
+#include <fmt/format.h>
 #include <map>
+#include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-SrtRuntime SrtReadCapture::ObservedRuntime() {
-	auto runtime = m_source;
-	runtime.userdata = this;
-	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
-	                                         ? Read : nullptr;
+SrtRuntime CleanRuntime(SrtRuntime runtime) {
+	if (runtime.read_specialization_memory != nullptr) {
+		runtime.read_memory = runtime.read_specialization_memory;
+		runtime.userdata    = SpecializationUserdata(runtime);
+	} else {
+		runtime.read_memory = +[](void*, uint64_t, std::span<uint32_t>) { return false; };
+	}
 	return runtime;
 }
 
-bool SrtReadCapture::Read(void* userdata, uint64_t address, std::span<uint32_t> values) {
-	auto& capture = *static_cast<SrtReadCapture*>(userdata);
-	if (!capture.m_source.read_specialization_memory(capture.m_source.userdata, address, values)) {
+namespace {
+
+constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
+// Lowest address any host or guest mapping can occupy (matches the default Linux mmap_min_addr
+// and the Windows null-pointer reservation), so direct reads below it always fault.
+constexpr uint64_t NullPageLimit = 0x10000ull;
+
+bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
+	if (base > AddressMask) {
 		return false;
 	}
-	capture.m_ranges.emplace_back(address, values.size_bytes());
+	if (offset < 0) {
+		const auto magnitude = uint64_t {0} - static_cast<uint64_t>(offset);
+		if (magnitude > base) {
+			return false;
+		}
+		result = base - magnitude;
+		return true;
+	}
+	const auto magnitude = static_cast<uint64_t>(offset);
+	if (magnitude > AddressMask - base) {
+		return false;
+	}
+	result = base + magnitude;
 	return true;
 }
-
-namespace {
 
 bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
 	const auto op = inst.GetOpcode();
@@ -76,6 +98,14 @@ bool IsRuntimeSelect(ValueOpcode op) {
 	       op == ValueOpcode::SelectF32;
 }
 
+// The conversion saturates and maps NaN to zero.
+int32_t SaturateF32ToS32(float value) {
+	if (std::isnan(value)) return 0;
+	if (value >= 2147483648.0f) return INT32_MAX;
+	if (value <= -2147483648.0f) return INT32_MIN;
+	return static_cast<int32_t>(value);
+}
+
 bool IsRuntimeUniformOp(ValueOpcode op) {
 	switch (op) {
 		case ValueOpcode::ConditionRef:
@@ -93,13 +123,13 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::BitFieldSExtract:
 		case ValueOpcode::IAdd32:
 		case ValueOpcode::IAdd64:
+		case ValueOpcode::IAddCarry32:
 		case ValueOpcode::ISub32:
 		case ValueOpcode::ISub64:
 		case ValueOpcode::IMul32:
+		case ValueOpcode::IMul64:
 		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
-		case ValueOpcode::UMax32:
-		case ValueOpcode::SMax32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
 		case ValueOpcode::ShiftRightLogical32:
@@ -117,11 +147,9 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::ULessThan32:
 		case ValueOpcode::ULessThanEqual32:
 		case ValueOpcode::IEqual32:
-		case ValueOpcode::IEqual64:
 		case ValueOpcode::UGreaterThan32:
 		case ValueOpcode::SGreaterThanEqual32:
 		case ValueOpcode::INotEqual32:
-		case ValueOpcode::INotEqual64:
 		case ValueOpcode::LogicalOr:
 		case ValueOpcode::LogicalAnd:
 		case ValueOpcode::LogicalXor:
@@ -136,49 +164,13 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 	}
 }
 
-bool ImmediateBits(Value value, uint64_t& bits) {
-	switch (value.GetType()) {
-		case Type::U1: bits = value.U1(); return true;
-		case Type::U8: bits = value.U8(); return true;
-		case Type::U16: bits = value.U16(); return true;
-		case Type::U32: bits = value.U32(); return true;
-		case Type::U64: bits = value.U64(); return true;
-		case Type::F32: bits = std::bit_cast<uint32_t>(value.F32Value()); return true;
-		default: return false;
-	}
-}
-
-// Scratch layout in bytes: per descriptor source its eight DWORDs and a known DWORD, one
-// activity byte per source, then per image, then one qword per walked value (all ones when
-// unknown). The walker's value slots, captured addresses, reachability and states follow.
-constexpr uint32_t DescriptorStride = 9u * sizeof(uint32_t);
-
-uint32_t ActiveOffset(const ResourcePlan& plan) {
-	return static_cast<uint32_t>(plan.descriptor_sources.size()) * DescriptorStride;
-}
-
-uint32_t OutputOffset(const ResourcePlan& plan) {
-	const auto active = plan.descriptor_sources.size() + plan.info.images.size();
-	return (ActiveOffset(plan) + static_cast<uint32_t>(active) + 7u) & ~7u;
-}
-
-const uint8_t* Scratch(const ResourcePlan& plan) {
-	return reinterpret_cast<const uint8_t*>(plan.srt_scratch.data());
-}
-
-thread_local const Xbyak::CodeGenerator* t_running_walker = nullptr;
-
-// Every guest load is mov eax, [r10] (41 8b 02), so a fault completes it as a zero read.
-void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address) {
-	code.lea(code.r10, code.ptr[address]);
-	code.mov(code.eax, code.dword[code.r10]);
-}
+// ValidateRuntimeValueTraced: print each rejected value, innermost first (diagnostics).
+thread_local bool t_validator_trace = false;
 
 class RuntimeValidator {
 public:
-	explicit RuntimeValidator(const ResourcePlan& program, RuntimeValueType type,
-	                          bool wave_uniform = false)
-	    : m_program(program), m_type(type), m_wave_uniform(wave_uniform) {}
+	explicit RuntimeValidator(const ResourcePlan& program, RuntimeValueType type)
+	    : m_program(program), m_type(type) {}
 
 	bool Run(Value value) { return Validate(value); }
 
@@ -193,7 +185,7 @@ private:
 	bool Validate(Value value, bool require_uniform = true) {
 		value = value.Resolve();
 		// Host floating-point evaluation does not model shader rounding/denormal modes.
-		if (m_type != RuntimeValueType::Any &&
+		if (m_type == RuntimeValueType::Integer &&
 		    TypesOverlap(value.GetType(), Type::F16 | Type::F32 | Type::F32x2)) {
 			return false;
 		}
@@ -217,18 +209,73 @@ private:
 			return !require_uniform;
 		}
 		const auto finish = [&](bool valid) {
+			if (!valid && t_validator_trace) [[unlikely]] {
+				const auto name = ValueOpcodeName(inst->GetOpcode());
+				std::printf("  runtime-value rejected: op=%.*s args=%zu uniform=%d\n",
+				            static_cast<int>(name.size()), name.data(), inst->NumArgs(),
+				            require_uniform ? 1 : 0);
+				if (inst->GetOpcode() == ValueOpcode::Phi) {
+					// The phi's leaves (what ResolveInvariantPhi compares), with the guest pc of
+					// memory reads.
+					std::vector<const Inst*>        pending {inst};
+					std::unordered_set<const Inst*> seen;
+					while (!pending.empty()) {
+						const auto* current = pending.back();
+						pending.pop_back();
+						if (!seen.insert(current).second) continue;
+						for (size_t arg = 0; arg < current->NumArgs(); arg++) {
+							const auto  incoming = current->Arg(arg).Resolve();
+							const auto* leaf     = incoming.TryInstruction();
+							if (leaf != nullptr && leaf->GetOpcode() == ValueOpcode::Phi) {
+								pending.push_back(leaf);
+								continue;
+							}
+							const auto leaf_name = leaf != nullptr ? ValueOpcodeName(leaf->GetOpcode())
+							                                       : std::string_view("immediate");
+							std::string detail;
+							if (leaf == nullptr && incoming.GetType() == Type::U32) {
+								detail = fmt::format(" 0x{:x}", incoming.U32());
+							} else if (leaf != nullptr && leaf->GetOpcode() == ValueOpcode::GetUserData &&
+							           leaf->Arg(0).GetType() == Type::ScalarReg) {
+								detail = fmt::format(" s{}", RegIndex(leaf->Arg(0).ScalarRegister()));
+							} else if (leaf != nullptr && (leaf->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+							                               leaf->GetOpcode() == ValueOpcode::ReadConstBuffer)) {
+								detail = fmt::format(" pc=0x{:x}", leaf->Flags<MemoryFlags>().pc);
+							}
+							std::printf("    leaf: %.*s%s\n", static_cast<int>(leaf_name.size()),
+							            leaf_name.data(), detail.c_str());
+						}
+					}
+				}
+				for (size_t arg = 0; inst->GetOpcode() == ValueOpcode::Phi && arg < inst->NumArgs(); arg++) {
+					const auto  incoming = inst->Arg(arg).Resolve();
+					const auto* source   = incoming.TryInstruction();
+					const auto  op_name  = source != nullptr ? ValueOpcodeName(source->GetOpcode())
+					                                         : std::string_view("immediate");
+					std::printf("    phi arg %zu: %.*s%s\n", arg, static_cast<int>(op_name.size()),
+					            op_name.data(),
+					            source != nullptr && source->GetOpcode() == ValueOpcode::GetUserData &&
+					                    source->Arg(0).GetType() == Type::ScalarReg
+					                ? fmt::format(" s{}", RegIndex(source->Arg(0).ScalarRegister())).c_str()
+					                : "");
+					if (source != nullptr && source->GetOpcode() != ValueOpcode::GetUserData) {
+						for (size_t inner = 0; inner < source->NumArgs(); inner++) {
+							const auto* deeper = source->Arg(inner).Resolve().TryInstruction();
+							const auto  deeper_name = deeper != nullptr
+							                              ? ValueOpcodeName(deeper->GetOpcode())
+							                              : std::string_view("immediate");
+							std::printf("      arg %zu: %.*s\n", inner, static_cast<int>(deeper_name.size()),
+							            deeper_name.data());
+						}
+					}
+				}
+				std::fflush(stdout);
+			}
 			m_visiting.erase(inst);
 			if (valid && !require_uniform) m_validated_dependencies.insert(inst);
 			return valid;
 		};
 		const auto op = inst->GetOpcode();
-		if (m_type == RuntimeValueType::ImmutableInteger &&
-		    (op == ValueOpcode::ReadConst || BufferAccessOf(op) != BufferAccess::None ||
-		     AddressOpcodeInfoOf(op).access != AddressAccess::None ||
-		     ImageOpcodeInfoOf(op).access != ImageAccess::None ||
-		     SharedAccessOf(op) != SharedAccess::None)) {
-			return finish(false);
-		}
 		if (op == ValueOpcode::ReadConst) {
 			const auto slot = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (inst->NumArgs() != 2 || inst->Arg(0).Resolve().TryInstruction() == nullptr ||
@@ -238,7 +285,7 @@ private:
 			    slot.U32() >= m_program.srt_reads.size()) {
 				return finish(false);
 			}
-			if (m_type != RuntimeValueType::Any) {
+			if (m_type == RuntimeValueType::Integer) {
 				const auto active_mask = m_active_mask;
 				m_active_mask          = {};
 				const bool valid       = Validate(m_program.srt_reads[slot.U32()].value);
@@ -250,12 +297,14 @@ private:
 		if (!m_active_mask.IsEmpty() && IsRuntimeSelect(op) && inst->NumArgs() == 3 &&
 		    inst->Arg(0).Resolve() == m_active_mask) {
 			// Empty EXEC reads lane zero, so ignored operands still require integer types.
-			if (m_type != RuntimeValueType::Any && !Validate(inst->Arg(2), false)) {
+			if (m_type == RuntimeValueType::Integer && !Validate(inst->Arg(2), false)) {
 				return finish(false);
 			}
 			return finish(Validate(inst->Arg(1)));
 		}
-		if (op == ValueOpcode::UndefU1 || op == ValueOpcode::UndefU32 || op == ValueOpcode::Void) {
+		if (op == ValueOpcode::UndefU1 || op == ValueOpcode::UndefU8 ||
+		    op == ValueOpcode::UndefU16 || op == ValueOpcode::UndefU32 ||
+		    op == ValueOpcode::UndefU64 || op == ValueOpcode::Void) {
 			return finish(false);
 		}
 		if (op == ValueOpcode::GetUserData) {
@@ -275,14 +324,8 @@ private:
 			}
 			return finish(true);
 		}
-		if (m_wave_uniform && op == ValueOpcode::GetBuiltin) {
-			const auto axis = inst->NumArgs() == 2u ? inst->Arg(1).Resolve() : Value {};
-			return finish(m_program.stage == ShaderType::Compute && inst->NumArgs() == 2u &&
-			              inst->Arg(0) == Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) &&
-			              axis.IsImmediate() && axis.GetType() == Type::U32 && axis.U32() < 3u);
-		}
 		if (op == ValueOpcode::Phi) {
-			if (m_type != RuntimeValueType::Any && !ValidateArguments(*inst, false)) {
+			if (m_type == RuntimeValueType::Integer && !ValidateArguments(*inst, false)) {
 				return finish(false);
 			}
 			const auto invariant = ResolveInvariantPhi(m_program, value);
@@ -296,7 +339,7 @@ private:
 			    inst->Arg(1).GetType() != Type::U1) {
 				return finish(false);
 			}
-			if (m_type != RuntimeValueType::Any && !Validate(inst->Arg(1), false)) {
+			if (m_type == RuntimeValueType::Integer && !Validate(inst->Arg(1), false)) {
 				return finish(false);
 			}
 			const auto active_mask = m_active_mask;
@@ -335,7 +378,9 @@ private:
 			const auto* source = inst->NumArgs() == 2 ? inst->Arg(0).ResolveInstruction() : nullptr;
 			const auto  index  = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
-			    index.U32() >= 2u || source->GetOpcode() != ValueOpcode::CompositeConstructU32x2) {
+			    index.U32() >= 2u ||
+			    (source->GetOpcode() != ValueOpcode::CompositeConstructU32x2 &&
+			     source->GetOpcode() != ValueOpcode::IAddCarry32)) {
 				return finish(false);
 			}
 		}
@@ -358,1084 +403,2035 @@ private:
 
 	const ResourcePlan&             m_program;
 	RuntimeValueType                m_type;
-	bool                            m_wave_uniform;
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
 	std::unordered_set<const Inst*> m_validated_dependencies;
 };
 
 
-// Emits one x86 function per plan. Each value, per EXEC-mask context, is a memoized thunk with a
-// state byte (0 unevaluated, 1 unknown or in progress, 2 known, 3 a control Phi holding its first
-// value) and a qword slot; a reference is `call thunk; cmp state, 2`. Operands that are unknown,
-// constant or plain user data are folded at emission. Registers: rdi user data, rsi flat buffer,
-// rdx scratch, r8 capture cursor.
-class WalkerCompiler {
-public:
-	WalkerCompiler(ResourcePlan& plan, Xbyak::CodeGenerator& code): m_plan(plan), m_code(code) {}
+} // namespace
 
-	void Compile(std::span<const Value> values);
+SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
+                     std::span<const uint8_t> clean_flat_slots, SrtWalker* clean_evaluator,
+                     Value active_mask)
+    : m_program(program), m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
+      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
+      m_context(AcquireContext(program)) {}
 
-private:
-	enum class Kind : uint8_t { Unknown, Constant, UserData, ShaderBase, Node };
-	struct Operand {
-		Kind     kind  = Kind::Unknown;
-		uint64_t value = 0;
+SrtWalker::~SrtWalker() { --m_program.ThreadScratch().evaluation_depth; }
 
-		bool operator==(const Operand& other) const = default;
-	};
-	// masked: the operand depends on its context's EXEC mask, so it is not the root context's.
-	struct Ref {
-		Operand operand;
-		bool    masked = false;
-	};
-	struct Node {
-		const Inst*          inst    = nullptr;
-		uint32_t             context = 0;
-		Operand              result;
-		std::vector<Operand> args;
-		uint32_t             slot = 0, state = 0;
-		Xbyak::Label         label;
-		bool                 pending = true, referenced = false, masked = false;
-	};
-
-	static constexpr auto Near = Xbyak::CodeGenerator::T_NEAR;
-
-	bool Thunk(uint32_t index) const {
-		const auto& node = m_nodes[index];
-		return node.referenced || node.result == Operand {Kind::Node, index};
+bool SrtWalker::Evaluate(Value value, uint32_t& result) {
+	uint64_t wide = 0;
+	if (!EvaluateWide(value, wide)) {
+		return false;
 	}
-	static bool MayBeUnknown(const Operand& operand) {
-		return operand.kind == Kind::Unknown || operand.kind == Kind::Node;
-	}
-
-	uint32_t Context(Value mask) {
-		mask = mask.Resolve();
-		const auto found = std::ranges::find(m_masks, mask);
-		if (found != m_masks.end()) return static_cast<uint32_t>(found - m_masks.begin());
-		m_masks.push_back(mask);
-		return static_cast<uint32_t>(m_masks.size() - 1u);
-	}
-
-	void AddOutput(Value value, uint32_t gate);
-	void Consume(std::vector<std::vector<uint32_t>>& gates);
-	Ref Evaluate(Value value, uint32_t context);
-	Operand Analyze(uint32_t index);
-	Operand AnalyzeRead(Node& node, const auto& arg, Operand self);
-	void Layout();
-	void Gate(std::vector<uint32_t>& gates, const Xbyak::Label& skip);
-	void Zero(uint32_t offset, uint32_t size);
-	void Branch(const Operand& operand, const Xbyak::Label& unknown);
-	void Load(const Xbyak::Reg64& reg, const Operand& operand);
-	void Fetch(const Operand& operand, const Xbyak::Label& unknown);
-	void Set(void (Xbyak::CodeGenerator::*condition)(const Xbyak::Operand&));
-	void Store(const Node& node);
-	void EmitNode(uint32_t index);
-	void EmitRead(const Node& node);
-	void EmitStrict(const Node& node);
-
-	ResourcePlan&                                     m_plan;
-	Xbyak::CodeGenerator&                             m_code;
-	std::vector<Value>                                m_masks {Value {}};
-	std::deque<Node>                                  m_nodes;
-	std::map<std::pair<const Inst*, uint32_t>, uint32_t> m_memo;
-	std::vector<Value>                                m_outputs;
-	std::vector<std::vector<uint32_t>>                m_output_gates;
-	Xbyak::Label                                      m_ret;
-	uint32_t m_shader_base = 0, m_reach = 0, m_states = 0, m_states_end = 0;
-	uint32_t m_user_data = 0, m_captures = 0;
-};
-
-void WalkerCompiler::AddOutput(Value value, uint32_t gate) {
-	const auto* inst = value.Resolve().TryInstruction();
-	if (inst == nullptr) return;
-	auto index = inst->WalkOutput();
-	if (index >= m_outputs.size() || m_outputs[index].TryInstruction() != inst) {
-		index = static_cast<uint32_t>(m_outputs.size());
-		inst->SetWalkOutput(index);
-		m_outputs.push_back(value.Resolve());
-		m_output_gates.emplace_back();
-	}
-	m_output_gates[index].push_back(gate);
+	result = static_cast<uint32_t>(wide);
+	return true;
 }
 
-// Mirrors MaterializeResources: each descriptor it reads back is gated by the activity of the
-// resource root that needs it, and so are an indirect root's selector values.
-void WalkerCompiler::Consume(std::vector<std::vector<uint32_t>>& gates) {
-	const auto& sources = m_plan.descriptor_sources;
-	const auto  consume = [&](uint32_t root) {
-		if (root >= sources.size()) return;
-		const auto& indirect = sources[root].indirect_descriptor;
-		if (!indirect) {
-			gates[root].push_back(root);
-			return;
-		}
-		const auto add = [&](uint32_t source) {
-			if (source < sources.size()) gates[source].push_back(root);
-		};
-		if (indirect->sources.empty()) {
-			add(indirect->table_source);
-			if (indirect->selector) {
-				add(indirect->selector->source);
-				if (indirect->selector->rows) add(indirect->selector->rows->source);
-			}
-		}
-		for (const auto source: indirect->sources) add(source);
-		AddOutput(indirect->key_count, root);
-		AddOutput(indirect->selector_first, root);
-		AddOutput(indirect->selector_mask, root);
-	};
-	for (const auto& buffer: m_plan.info.buffers) consume(buffer.source);
-	for (const auto& image: m_plan.info.images) consume(image.source);
-	for (const auto& sampler: m_plan.info.samplers) {
-		const auto* indirect = sampler.source < sources.size() && sources[sampler.source].indirect_descriptor
-		    ? &*sources[sampler.source].indirect_descriptor : nullptr;
-		if (indirect == nullptr || indirect->sources.empty()) {
-			consume(sampler.source);
-		} else if (indirect->sources[0] < sources.size()) {
-			gates[indirect->sources[0]].push_back(indirect->sources[0]);
-		}
+ResourcePlan::EvaluationContext& SrtWalker::AcquireContext(const ResourcePlan& program) {
+	auto& scratch = program.ThreadScratch();
+	if (scratch.evaluation_depth == scratch.evaluation_contexts.size()) {
+		scratch.evaluation_contexts.emplace_back();
 	}
-	const auto& fill = m_plan.uniform_fill;
-	if (fill.fill.words != 0) {
-		AddOutput(fill.pattern_size, UINT32_MAX);
-		AddOutput(fill.element_count, UINT32_MAX);
-		for (const auto value: fill.values) AddOutput(value, UINT32_MAX);
-	}
+	auto& context = scratch.evaluation_contexts[scratch.evaluation_depth++];
+	context.generation += 2;
+	return context;
 }
 
-WalkerCompiler::Ref WalkerCompiler::Evaluate(Value value, uint32_t context) {
+float SrtWalker::Float32(uint64_t bits) {
+	return std::bit_cast<float>(static_cast<uint32_t>(bits));
+}
+
+bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	value = value.Resolve();
-	if (value.IsEmpty()) return {};
 	if (value.IsImmediate()) {
-		uint64_t bits = 0;
-		return ImmediateBits(value, bits) ? Ref {{Kind::Constant, bits}} : Ref {};
-	}
-	const auto mask = m_masks[context];
-	if (context != 0 && value == mask) return {{Kind::Constant, 1u}, true};
-	const auto* inst = value.TryInstruction();
-	if (inst == nullptr) return {};
-	const auto op = inst->GetOpcode();
-	if (context != 0 && IsRuntimeSelect(op) && inst->NumArgs() == 3 && inst->Arg(0).Resolve() == mask) {
-		return {Evaluate(inst->Arg(1), context).operand, true};
-	}
-	switch (op) {
-		case ValueOpcode::BitCastU32F32:
-		case ValueOpcode::BitCastF32U32:
-		case ValueOpcode::ConditionRef: return Evaluate(inst->Arg(0), context);
-		case ValueOpcode::CompositeExtractU32x2: {
-			const auto* source = inst->Arg(0).ResolveInstruction();
-			const auto  index  = inst->Arg(1).Resolve();
-			if (source == nullptr || source->GetOpcode() != ValueOpcode::CompositeConstructU32x2 ||
-			    !index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) return {};
-			return Evaluate(source->Arg(index.U32()), context);
+		switch (value.GetType()) {
+			case Type::U1: result = value.U1(); return true;
+			case Type::U8: result = value.U8(); return true;
+			case Type::U16: result = value.U16(); return true;
+			case Type::U32: result = value.U32(); return true;
+			case Type::U64: result = value.U64(); return true;
+			case Type::F32: result = std::bit_cast<uint32_t>(value.F32Value()); return true;
+			default: return false;
 		}
-		case ValueOpcode::ReadFirstLane:
-			// The lane read does not depend on the EXEC mask it is read under.
-			return {Evaluate(inst->Arg(0), Context(inst->Arg(1))).operand};
-		case ValueOpcode::GetUserData: {
-			const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
-			if (reg < m_plan.user_data_base || reg - m_plan.user_data_base >= m_plan.user_data_count) return {};
-			return {{Kind::UserData, reg - m_plan.user_data_base}};
-		}
-		case ValueOpcode::GetShaderBase: return {{Kind::ShaderBase}};
-		case ValueOpcode::Phi:
-			if (!m_plan.control_phi_predecessors.contains(inst)) {
-				const auto invariant = ResolveInvariantPhi(m_plan, value);
-				return invariant.IsEmpty() ? Ref {} : Evaluate(invariant, context);
-			}
-			break;
-		default: break;
 	}
-	const auto [found, inserted] = m_memo.try_emplace({inst, context}, static_cast<uint32_t>(m_nodes.size()));
-	const auto index = found->second;
-	if (!inserted) {
-		auto& node = m_nodes[index];
-		if (!node.pending) return {node.result, node.masked};
-		// A cycle: the thunk reads as unknown while it runs.
-		node.referenced = true;
-		return {{Kind::Node, index}, context != 0};
+	if (!m_active_mask.IsEmpty() && value == m_active_mask) {
+		result = 1u;
+		return true;
 	}
-	auto& node   = m_nodes.emplace_back();
-	node.inst    = inst;
-	node.context = context;
-	node.result  = Analyze(index);
-	node.pending = false;
-	if (context != 0 && !node.masked && !node.referenced) {
-		node.result = Evaluate(value, 0).operand;
-		return {node.result};
+	auto* inst = value.TryInstruction();
+	if (inst == nullptr) {
+		return false;
 	}
-	return {node.result, node.masked};
+	if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
+	    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
+		return EvaluateWide(inst->Arg(1), result);
+	}
+	const auto index = inst->EvaluationIndex(m_program.evaluation_value_count);
+	if (index >= m_context.values.size()) {
+		m_context.values.resize(m_program.evaluation_value_count);
+	}
+	if (m_context.values[index].generation == m_context.generation) {
+		result = m_context.values[index].value;
+		return true;
+	}
+	// The low generation bit marks an instruction that is still being evaluated.
+	if (m_context.values[index].generation == (m_context.generation | 1u)) {
+		return false;
+	}
+	m_context.values[index].generation = m_context.generation | 1u;
+	uint64_t out = 0;
+	const bool evaluated = EvaluateInst(*inst, out);
+	// Recursive evaluation may grow the dense memo vector.
+	auto& memo = m_context.values[index];
+	if (!evaluated) {
+		memo.generation = 0;
+		return false;
+	}
+	memo.value      = out;
+	memo.generation = m_context.generation;
+	result = out;
+	return true;
 }
 
-WalkerCompiler::Operand WalkerCompiler::Analyze(uint32_t index) {
-	auto&       node = m_nodes[index];
-	const auto& inst = *node.inst;
-	const auto  self = Operand {Kind::Node, index};
-	const auto  arg  = [&](Value value) {
-		const auto ref = Evaluate(value, node.context);
-		node.masked |= ref.masked;
-		return ref.operand;
-	};
-	const auto constant = [](uint64_t value) { return Operand {Kind::Constant, value}; };
-	switch (inst.GetOpcode()) {
-		case ValueOpcode::Phi: {
-			bool known = false;
-			for (size_t i = 0; i < inst.NumArgs(); ++i) {
-				node.args.push_back(arg(inst.Arg(i)));
-				known |= node.args.back().kind != Kind::Unknown;
-			}
-			return known ? self : Operand {};
-		}
-		case ValueOpcode::LoadAddressU32:
-		case ValueOpcode::ReadConstBuffer:
-		case ValueOpcode::LoadBufferU32: return AnalyzeRead(node, arg, self);
-		case ValueOpcode::SelectU1:
-		case ValueOpcode::SelectU32:
-		case ValueOpcode::SelectF32: {
-			const auto predicate = arg(inst.Arg(0));
-			if (predicate.kind == Kind::Unknown) return {};
-			if (predicate.kind == Kind::Constant) return arg(inst.Arg(predicate.value != 0u ? 1 : 2));
-			node.args = {predicate, arg(inst.Arg(1)), arg(inst.Arg(2))};
-			return node.args[1].kind == Kind::Unknown && node.args[2].kind == Kind::Unknown ? Operand {} : self;
-		}
-		case ValueOpcode::ULessThan32:
-		case ValueOpcode::ULessThanEqual32: {
-			// No U32 is below zero and every U32 is at least zero, including an unknown loop-carried
-			// or varying lane value. args[0] is that zero-tested bound.
-			const bool less  = inst.GetOpcode() == ValueOpcode::ULessThan32;
-			const auto bound = arg(inst.Arg(less ? 1 : 0));
-			if (bound.kind == Kind::Unknown) return {};
-			if (bound.kind == Kind::Constant && static_cast<uint32_t>(bound.value) == 0u) return constant(!less);
-			node.args = {bound, arg(inst.Arg(less ? 0 : 1))};
-			return node.args[1].kind == Kind::Unknown && bound.kind == Kind::Constant ? Operand {} : self;
-		}
-		case ValueOpcode::LogicalOr:
-		case ValueOpcode::LogicalAnd: {
-			// A deciding operand, nonzero for Or and zero for And, fixes the result.
-			const bool conjunction = inst.GetOpcode() == ValueOpcode::LogicalAnd;
-			const auto decides     = [&](const Operand& x) {
-				return x.kind == Kind::Constant && (x.value == 0u) == conjunction;
-			};
-			const auto a = arg(inst.Arg(0));
-			if (decides(a)) return constant(!conjunction);
-			const auto b = arg(inst.Arg(1));
-			if (decides(b)) return constant(!conjunction);
-			if (a.kind == Kind::Constant && b.kind == Kind::Constant) return constant(conjunction);
-			if (a.kind == Kind::Constant && b.kind == Kind::Unknown) return {};
-			// Only lanes satisfying the left EXEC factor can make a conjunction true, so an
-			// unknown left side retries the right one under that factor as its mask.
-			Operand refined;
-			if (conjunction && MayBeUnknown(a)) {
-				refined = Evaluate(inst.Arg(1), Context(inst.Arg(0))).operand;
-				if (refined == b || (refined.kind == Kind::Constant && refined.value != 0u)) refined = {};
-				if (a.kind == Kind::Unknown && refined.kind == Kind::Constant) return constant(0u);
-			}
-			if (a.kind == Kind::Unknown && refined.kind == Kind::Unknown &&
-			    (b.kind == Kind::Unknown || b.kind == Kind::Constant)) return {};
-			node.args = {a, b, refined};
-			return self;
-		}
-		case ValueOpcode::CompositeExtractU64: {
-			const auto component = inst.Arg(1).Resolve();
-			if (!component.IsImmediate() || component.GetType() != Type::U32 || component.U32() >= 2u) return {};
-			[[fallthrough]];
-		}
-		default:
-			// The other runtime-uniform ops are strict; a U32x2 pair is only read through its extracts.
-			if (!IsRuntimeUniformOp(inst.GetOpcode()) || inst.GetOpcode() == ValueOpcode::CompositeConstructU32x2)
-				return {};
-			for (size_t i = 0; i < inst.NumArgs(); ++i) {
-				node.args.push_back(arg(inst.Arg(i)));
-				if (node.args.back().kind == Kind::Unknown) return {};
-			}
-			return self;
-	}
+bool SrtWalker::Arg(const Inst& inst, size_t index, uint64_t& result) {
+	return EvaluateWide(inst.Arg(index), result);
 }
 
-WalkerCompiler::Operand WalkerCompiler::AnalyzeRead(Node& node, const auto& arg, Operand self) {
-	const auto& inst = *node.inst;
-	const auto* handle = inst.Arg(0).ResolveInstruction();
-	if (!IsRawRead(m_plan, inst) || handle == nullptr) return {};
+bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
+	auto [cached, inserted] = m_program.ThreadScratch().invariant_phis.try_emplace(&inst);
+	if (inserted) {
+		cached->second = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
+	}
+	const auto value = cached->second;
+	return !value.IsEmpty() && EvaluateWide(value, result);
+}
+
+bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
+	const auto index = inst.Arg(1).Resolve();
+	if (!index.IsImmediate() || index.GetType() != Type::U32) {
+		return false;
+	}
+	const auto component = index.U32();
+	if (component >= 2u) {
+		return false;
+	}
+	if (inst.GetOpcode() == ValueOpcode::CompositeExtractU64) {
+		uint64_t packed = 0;
+		if (!Arg(inst, 0, packed)) {
+			return false;
+		}
+		result = static_cast<uint32_t>(packed >> (component * 32u));
+		return true;
+	}
+	const auto* source = inst.Arg(0).ResolveInstruction();
+	if (source == nullptr) {
+		return false;
+	}
+	if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
+		return EvaluateWide(source->Arg(component), result);
+	}
+	if (source->GetOpcode() == ValueOpcode::IAddCarry32) {
+		uint64_t lhs = 0;
+		uint64_t rhs = 0;
+		if (!Arg(*source, 0, lhs) || !Arg(*source, 1, rhs)) {
+			return false;
+		}
+		const auto sum =
+		    static_cast<uint64_t>(static_cast<uint32_t>(lhs)) + static_cast<uint32_t>(rhs);
+		result =
+		    component == 0u ? static_cast<uint32_t>(sum) : static_cast<uint32_t>(sum >> 32u);
+		return true;
+	}
+	return false;
+}
+
+bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
+	const auto flags = inst.Flags<MemoryFlags>();
+	if (flags.index >= m_program.memory_info.size()) {
+		return false;
+	}
+	const auto& mem    = m_program.memory_info[flags.index];
 	const bool vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32;
-	if (vector) {
-		const auto guard = arg(inst.Arg(4));
-		if (guard.kind == Kind::Unknown) return {};
-		if (guard.kind == Kind::Constant && guard.value == 0u) return {Kind::Constant, 0u};
-		node.args.push_back(guard);
-	}
-	const bool buffer = inst.GetOpcode() != ValueOpcode::LoadAddressU32;
-	const auto offset = static_cast<int32_t>(m_plan.memory_info[inst.Flags<MemoryFlags>().index].offset);
-	bool failed = buffer && (handle->NumArgs() != 4u || offset < 0);
-	for (const auto& word: {handle->Arg(0), handle->Arg(1), inst.Arg(1)}) {
-		node.args.push_back(arg(word));
-		failed |= node.args.back().kind == Kind::Unknown;
-	}
-	for (uint32_t word = 2; buffer && !failed && word < 4u; ++word) {
-		node.args.push_back(arg(handle->Arg(word)));
-		failed |= node.args.back().kind == Kind::Unknown;
-	}
-	if (!failed) return self;
-	// A disabled vector lane still reads zero.
-	if (!vector || node.args[0].kind == Kind::Constant) return {};
-	node.args.resize(1);
-	return self;
-}
-
-void WalkerCompiler::Layout() {
-	uint32_t offset = OutputOffset(m_plan) + static_cast<uint32_t>(m_outputs.size()) * 8u;
-	m_shader_base = offset;
-	offset += 8u;
-	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
-		if (!Thunk(index)) continue;
-		m_nodes[index].slot = offset;
-		offset += 8u;
-	}
-	m_reach = offset;
-	offset += static_cast<uint32_t>(m_plan.control_flow.size());
-	m_states = offset;
-	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
-		if (Thunk(index)) m_nodes[index].state = offset++;
-	}
-	m_states_end = offset;
-	// Captured addresses come last; EmitRead counts them.
-	m_plan.srt_captures = (offset + 7u) & ~7u;
-}
-
-// Falls through when any gating source is active. The list is not empty.
-void WalkerCompiler::Gate(std::vector<uint32_t>& gates, const Xbyak::Label& skip) {
-	auto& c = m_code;
-	std::ranges::sort(gates);
-	if (gates.back() == UINT32_MAX) return;
-	gates.erase(std::unique(gates.begin(), gates.end()), gates.end());
-	Xbyak::Label active;
-	for (size_t i = 0; i < gates.size(); ++i) {
-		c.cmp(c.byte[c.rdx + ActiveOffset(m_plan) + gates[i]], 0);
-		if (i + 1u < gates.size()) {
-			c.jne(active, Near);
-		} else {
-			c.je(skip, Near);
+	const auto guard = vector ? inst.Arg(4).Resolve() : Value {};
+	if (vector && (guard.IsImmediate() || guard != m_active_mask)) {
+		uint64_t enabled = 0;
+		if (!Arg(inst, 4, enabled)) return false;
+		if (enabled == 0u) {
+			result = 0u;
+			return true;
 		}
 	}
-	c.L(active);
-}
-
-void WalkerCompiler::Zero(uint32_t offset, uint32_t size) {
-	auto& c = m_code;
-	if (size == 0) return;
-	c.mov(c.r11, c.rdi);
-	c.lea(c.rdi, c.ptr[c.rdx + offset]);
-	c.mov(c.ecx, size);
-	c.xor_(c.eax, c.eax);
-	c.rep();
-	c.stosb();
-	c.mov(c.rdi, c.r11);
-}
-
-// Jumps to unknown unless the operand has a value at run time.
-void WalkerCompiler::Branch(const Operand& operand, const Xbyak::Label& unknown) {
-	auto& c = m_code;
-	if (operand.kind == Kind::Unknown) {
-		c.jmp(unknown, Near);
-	} else if (operand.kind == Kind::Node) {
-		auto& node = m_nodes[operand.value];
-		c.call(node.label);
-		c.cmp(c.byte[c.rdx + node.state], 2);
-		c.jne(unknown, Near);
+	const auto* handle = inst.Arg(0).ResolveInstruction();
+	if (handle == nullptr) {
+		return false;
 	}
-}
-
-void WalkerCompiler::Load(const Xbyak::Reg64& reg, const Operand& operand) {
-	auto& c = m_code;
-	switch (operand.kind) {
-		case Kind::Constant: c.mov(reg, operand.value); break;
-		case Kind::UserData:
-			m_user_data = std::max(m_user_data, static_cast<uint32_t>(operand.value) + 1u);
-			c.mov(reg.cvt32(), c.dword[c.rdi + operand.value * sizeof(uint32_t)]);
-			break;
-		case Kind::ShaderBase: c.mov(reg, c.qword[c.rdx + m_shader_base]); break;
-		case Kind::Node: c.mov(reg, c.qword[c.rdx + m_nodes[operand.value].slot]); break;
-		case Kind::Unknown: break;
+	uint64_t low    = 0;
+	uint64_t high   = 0;
+	uint64_t offset = 0;
+	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) || !Arg(inst, 1, offset)) {
+		return false;
 	}
-}
-
-// Loads the operand into rax, or jumps to unknown when it has no value at run time.
-void WalkerCompiler::Fetch(const Operand& operand, const Xbyak::Label& unknown) {
-	Branch(operand, unknown);
-	Load(m_code.rax, operand);
-}
-
-// Sets eax to 1 when the condition holds, else 0.
-void WalkerCompiler::Set(void (Xbyak::CodeGenerator::*condition)(const Xbyak::Operand&)) {
-	(m_code.*condition)(m_code.al);
-	m_code.movzx(m_code.eax, m_code.al);
-}
-
-void WalkerCompiler::Store(const Node& node) {
-	auto& c = m_code;
-	c.mov(c.qword[c.rdx + node.slot], c.rax);
-	c.mov(c.byte[c.rdx + node.state], 2);
-	c.ret();
-}
-
-void WalkerCompiler::EmitNode(uint32_t index) {
-	auto&       c    = m_code;
-	auto&       node = m_nodes[index];
-	const auto& args = node.args;
-	c.L(node.label);
-	c.cmp(c.byte[c.rdx + node.state], 0);
-	c.jne(m_ret, Near);
-	c.mov(c.byte[c.rdx + node.state], 1);
-	if (node.result != Operand {Kind::Node, index}) {
-		// A cycle referenced this value before it folded to another operand.
-		Fetch(node.result, m_ret);
-		Store(node);
-		return;
-	}
-	switch (node.inst->GetOpcode()) {
-		case ValueOpcode::Phi: {
-			// Only predecessors reached by this walk contribute, and they must agree. The state is 3
-			// once one of them has stored the value; callers read it like 1, as unknown.
-			const auto& blocks = m_plan.control_phi_predecessors.at(node.inst);
-			const auto  state  = c.byte[c.rdx + node.state];
-			for (size_t i = 0; i < args.size(); ++i) {
-				Xbyak::Label next, first;
-				c.cmp(c.byte[c.rdx + m_reach + blocks[i]], 0);
-				c.je(next, Near);
-				Fetch(args[i], m_ret);
-				c.cmp(state, 1);
-				c.je(first, Near);
-				c.cmp(c.rax, c.qword[c.rdx + node.slot]);
-				c.jne(m_ret, Near);
-				c.jmp(next, Near);
-				c.L(first);
-				c.mov(c.qword[c.rdx + node.slot], c.rax);
-				c.mov(state, 3);
-				c.L(next);
+	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
+	uint64_t   address   = 0;
+	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer || vector) {
+		uint64_t records = 0;
+		uint64_t word3   = 0;
+		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
+			return false;
+		}
+		if (immediate < 0) {
+			return false;
+		}
+		const auto byte_offset =
+		    (static_cast<uint64_t>(immediate) & ~uint64_t {3}) + (static_cast<uint32_t>(offset) & ~3u);
+		const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+		if (vector) {
+			// Only the uniform, unswizzled structured DWORD address is evaluated on the host.
+			if ((high & (1u << 31u)) != 0u || (word3 & ((1u << 23u) | 0xf0000000u)) != 0u)
+				return false;
+			if (stride == 0u || records == 0u || ((word3 >> 12u) & 0x7fu) == 0u) {
+				result = 0u;
+				return true;
 			}
-			c.cmp(state, 3);
-			c.jne(m_ret, Near);
-			c.mov(state, 2);
-			c.ret();
-			return;
+		}
+		const auto size = stride == 0u
+		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
+		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+			// A scalar buffer read past num_records returns zero on the hardware ("reads return
+			// zero, writes ignored"), as the shader's own load does on the GPU.
+			result = 0;
+			return true;
+		}
+		address = (base & ~uint64_t {3}) + byte_offset;
+	} else {
+		const auto relative = (immediate & ~int64_t {3}) +
+		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
+			return false;
+		}
+	}
+	uint32_t word = 0;
+	// Vector loads read like scalar ones (upstream sends them to the specialization reader, which
+	// reads GPU-written bytes back; ours fails on them instead).
+	const auto  reader          = m_runtime.read_memory;
+	void* const reader_userdata = m_runtime.userdata;
+	if (reader != nullptr) {
+		if (!reader(reader_userdata, address, {&word, 1})) {
+			// A load through a null base sits on a path the shader guards with a null-pointer
+			// test and never executes; its value cannot matter.
+			if (base == 0) {
+				result = 0;
+				return true;
+			}
+			static std::atomic<uint32_t> reported {0};
+			if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+				std::fprintf(stderr,
+				             "SRT raw read failed: shader=0x%016llx guest memory unreadable at 0x%llx (base 0x%llx)\n",
+				             static_cast<unsigned long long>(m_program.shader_hash),
+				             static_cast<unsigned long long>(address),
+				             static_cast<unsigned long long>(base));
+			}
+			return false;
+		}
+	} else {
+		if (vector) return false;
+		// Without a reader the address is dereferenced directly. A null or near-null SRT pointer
+		// (e.g. user data the title has not populated yet) can never be mapped, so read it as
+		// zero instead of faulting on the host. A zero descriptor resolves to the null resource,
+		// matching how empty vector buffers are evaluated above.
+		if (address < NullPageLimit) {
+			result = 0u;
+			return true;
+		}
+		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+	}
+	result = word;
+	return true;
+}
+
+bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
+	uint64_t   a       = 0;
+	uint64_t   b       = 0;
+	uint64_t   c       = 0;
+	const auto binary  = [&]() { return Arg(inst, 0, a) && Arg(inst, 1, b); };
+	const auto ternary = [&]() {
+		return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c);
+	};
+	switch (inst.GetOpcode()) {
+		case ValueOpcode::GetUserData: {
+			const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
+			if (reg < m_program.user_data_base ||
+			    reg - m_program.user_data_base >= m_runtime.user_data.size()) {
+				return false;
+			}
+			result = m_runtime.user_data[reg - m_program.user_data_base];
+			return true;
+		}
+		case ValueOpcode::GetShaderBase: result = m_runtime.shader_base; return true;
+		case ValueOpcode::Phi: return EvaluatePhi(inst, result);
+		case ValueOpcode::ReadFirstLane: {
+			if (!m_active_mask.IsEmpty() && inst.Arg(1).Resolve() == m_active_mask) {
+				return EvaluateWide(inst.Arg(0), result);
+			}
+			const auto clean_runtime = CleanRuntime(m_runtime);
+			SrtWalker  clean_active(m_program, clean_runtime, {}, nullptr, inst.Arg(1));
+			SrtWalker  active(m_program, m_runtime, m_clean_flat_slots, &clean_active,
+			                  inst.Arg(1));
+			return active.EvaluateWide(inst.Arg(0), result);
+		}
+		case ValueOpcode::BitCastU32F32:
+		case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
+		case ValueOpcode::CompositeExtractU64:
+		case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result);
+		case ValueOpcode::CompositeConstructU64:
+			if (!binary()) {
+				return false;
+			}
+			result = static_cast<uint32_t>(a) |
+			         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
+			return true;
+		case ValueOpcode::ReadConst: {
+			const auto slot = inst.Arg(1).Resolve();
+			if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+			    slot.U32() >= m_program.srt_reads.size()) {
+				return false;
+			}
+			if (slot.U32() < m_clean_flat_slots.size() &&
+			    m_clean_flat_slots[slot.U32()] != 0u && m_clean_evaluator != nullptr) {
+				return m_clean_evaluator->EvaluateWide(m_program.srt_reads[slot.U32()].value,
+				                                       result);
+			}
+			return EvaluateWide(m_program.srt_reads[slot.U32()].value, result);
 		}
 		case ValueOpcode::LoadAddressU32:
 		case ValueOpcode::ReadConstBuffer:
-		case ValueOpcode::LoadBufferU32: EmitRead(node); return;
-		case ValueOpcode::SelectU1:
-		case ValueOpcode::SelectU32:
-		case ValueOpcode::SelectF32: {
-			Xbyak::Label other;
-			Fetch(args[0], m_ret);
-			c.test(c.rax, c.rax);
-			c.jz(other, Near);
-			Fetch(args[1], m_ret);
-			Store(node);
-			c.L(other);
-			Fetch(args[2], m_ret);
-			Store(node);
-			return;
-		}
-		case ValueOpcode::ULessThan32:
-		case ValueOpcode::ULessThanEqual32: {
-			const bool less = node.inst->GetOpcode() == ValueOpcode::ULessThan32;
-			Xbyak::Label bound_zero;
-			Fetch(args[0], m_ret);
-			c.test(c.eax, c.eax);
-			c.jz(bound_zero, Near);
-			Branch(args[1], m_ret);
-			Load(c.rax, args[0]);
-			Load(c.rcx, args[1]);
-			// ULT tests other < bound, ULE bound <= other.
-			c.cmp(c.ecx, c.eax);
-			Set(less ? &Xbyak::CodeGenerator::setb : &Xbyak::CodeGenerator::setae);
-			Store(node);
-			c.L(bound_zero);
-			c.mov(c.eax, uint32_t {!less});
-			Store(node);
-			return;
-		}
-		case ValueOpcode::LogicalOr:
-		case ValueOpcode::LogicalAnd: {
-			const bool conjunction = node.inst->GetOpcode() == ValueOpcode::LogicalAnd;
-			Xbyak::Label unknown_left, refine, decided;
-			const auto decide = [&] {
-				if (conjunction) {
-					c.jz(decided, Near);
-				} else {
-					c.jnz(decided, Near);
+		case ValueOpcode::LoadBufferU32:
+			if (IsRawRead(m_program, inst)) {
+				if (inst.GetOpcode() == ValueOpcode::LoadBufferU32 && m_clean_evaluator != nullptr &&
+				    m_clean_evaluator->m_active_mask == m_active_mask) {
+					return m_clean_evaluator->EvaluateWide(Value(const_cast<Inst*>(&inst)), result);
 				}
-			};
-			Branch(args[0], unknown_left);
-			if (args[0].kind != Kind::Unknown) {
-				Load(c.rax, args[0]);
-				c.test(c.rax, c.rax);
-				decide();
-				Fetch(args[1], m_ret);
-				c.test(c.rax, c.rax);
-				Set(&Xbyak::CodeGenerator::setne);
-				Store(node);
+				return EvaluateRawRead(inst, result);
 			}
-			c.L(unknown_left);
-			if (MayBeUnknown(args[0])) {
-				// Without the left side only a deciding right side, or a conjunction's zero
-				// refined right side, is known.
-				if (args[1].kind != Kind::Unknown) {
-					Fetch(args[1], refine);
-					c.test(c.rax, c.rax);
-					decide();
-				}
-				c.L(refine);
-				Fetch(args[2], m_ret);
-				c.test(c.rax, c.rax);
-				c.jnz(m_ret, Near);
-			}
-			c.L(decided);
-			c.mov(c.eax, uint32_t {!conjunction});
-			Store(node);
-			return;
-		}
-		default: EmitStrict(node); return;
-	}
-}
-
-// Raw scalar and uniform DWORD buffer loads; out-of-bounds reads are zero.
-void WalkerCompiler::EmitRead(const Node& node) {
-	auto&      c    = m_code;
-	const auto& inst = *node.inst;
-	const auto op = inst.GetOpcode();
-	const bool vector = op == ValueOpcode::LoadBufferU32;
-	auto args = std::span(node.args);
-	Xbyak::Label zero;
-	if (vector) {
-		Fetch(args[0], m_ret);
-		c.test(c.rax, c.rax);
-		c.jz(zero, Near);
-		args = args.subspan(1);
-		if (args.empty()) c.jmp(m_ret, Near);
-	}
-	if (!args.empty()) {
-		for (const auto& arg: args) Branch(arg, m_ret);
-		const auto immediate =
-		    static_cast<int64_t>(static_cast<int32_t>(m_plan.memory_info[inst.Flags<MemoryFlags>().index].offset)) &
-		    ~int64_t {3};
-		// rax = the 48-bit base (high << 32 | low) with its low two bits clear.
-		Load(c.rax, args[1]);
-		c.shl(c.rax, 48);
-		c.shr(c.rax, 16);
-		Load(c.rcx, args[0]);
-		c.and_(c.ecx, ~3u);
-		c.or_(c.rax, c.rcx);
-		Load(c.r9, args[2]);
-		c.and_(c.r9d, ~3u);
-		if (op == ValueOpcode::LoadAddressU32) {
-			c.lea(c.rax, c.ptr[c.rax + c.r9 + static_cast<size_t>(immediate)]);
-			c.mov(c.rcx, c.rax);
-			c.shr(c.rcx, 48);
-			c.jnz(m_ret, Near);
-			LoadGuest(c, c.rax);
-		} else {
-			Load(c.r11, args[1]);
-			c.shr(c.r11d, 16);
-			if (vector) {
-				// Only the uniform, unswizzled structured DWORD address is evaluated on the host.
-				c.test(c.r11d, 1u << 15u);
-				c.jnz(m_ret, Near);
-				Load(c.rcx, args[4]);
-				c.test(c.ecx, (1u << 23u) | 0xf0000000u);
-				c.jnz(m_ret, Near);
-				c.test(c.r11d, 0x3fffu);
-				c.jz(zero, Near);
-				c.test(c.ecx, 0x7fu << 12u);
-				c.jz(zero, Near);
-			}
-			c.and_(c.r11d, 0x3fffu);
-			Load(c.rcx, args[3]);
-			if (vector) {
-				c.test(c.ecx, c.ecx);
-				c.jz(zero, Near);
-			}
-			Xbyak::Label sized;
-			c.test(c.r11d, c.r11d);
-			c.jz(sized, Near);
-			c.imul(c.rcx, c.r11);
-			c.L(sized);
-			c.lea(c.r11, c.ptr[c.r9 + static_cast<size_t>(immediate) + 4u]);
-			c.cmp(c.r11, c.rcx);
-			c.ja(zero, Near);
-			LoadGuest(c, c.rax + c.r9 + static_cast<size_t>(immediate));
-		}
-		++m_captures;
-		c.mov(c.qword[c.r8], c.r10);
-		c.add(c.r8, 8);
-		Store(node);
-	}
-	c.L(zero);
-	c.xor_(c.eax, c.eax);
-	Store(node);
-}
-
-void WalkerCompiler::EmitStrict(const Node& node) {
-	auto&       c    = m_code;
-	const auto& inst = *node.inst;
-	for (const auto& arg: node.args) Branch(arg, m_ret);
-	const std::array regs {c.rax, c.rcx, c.r9, c.r11};
-	for (size_t i = 0; i < node.args.size() && i < regs.size(); ++i) Load(regs[i], node.args[i]);
-	// Field ops require offset + width <= 32. Leaves (1 << width) - 1 in r11, the offset in
-	// cl and the former rcx (the offset or the inserted value) in r10.
-	const auto field = [&](const Xbyak::Reg32& offset, const Xbyak::Reg32& width) {
-		c.lea(c.r10, c.ptr[offset.cvt64() + width.cvt64()]);
-		c.cmp(c.r10, 32);
-		c.ja(m_ret, Near);
-		c.mov(c.r10, c.rcx);
-		c.mov(c.ecx, width);
-		c.mov(c.r11d, 1);
-		c.shl(c.r11, c.cl);
-		c.dec(c.r11);
-		c.mov(c.ecx, offset.getIdx() == Xbyak::Operand::RCX ? c.r10d : offset);
-	};
-	switch (inst.GetOpcode()) {
-		case ValueOpcode::CompositeConstructU64:
-			c.shl(c.rcx, 32);
-			c.or_(c.rax, c.rcx);
 			break;
-		case ValueOpcode::CompositeExtractU64:
-			if (inst.Arg(1).Resolve().U32() != 0u) c.shr(c.rax, 32);
-			c.mov(c.eax, c.eax);
-			break;
-		case ValueOpcode::IAdd32: c.add(c.eax, c.ecx); break;
-		case ValueOpcode::IAdd64: c.add(c.rax, c.rcx); break;
-		case ValueOpcode::ISub32: c.sub(c.eax, c.ecx); break;
-		case ValueOpcode::ISub64: c.sub(c.rax, c.rcx); break;
-		case ValueOpcode::IMul32: c.imul(c.eax, c.ecx); break;
+		case ValueOpcode::IAdd32:
+			if (binary()) {
+				result = static_cast<uint32_t>(a + b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::IAdd64:
+			if (binary()) {
+				result = a + b;
+				return true;
+			}
+			return false;
+		case ValueOpcode::ISub32:
+			if (binary()) {
+				result = static_cast<uint32_t>(a - b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::ISub64:
+			if (binary()) {
+				result = a - b;
+				return true;
+			}
+			return false;
+		case ValueOpcode::IMul32:
+			if (binary()) {
+				result = static_cast<uint32_t>(a * b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::IMul64:
+			if (binary()) {
+				result = a * b;
+				return true;
+			}
+			return false;
 		case ValueOpcode::UMulHi:
-			c.imul(c.rax, c.rcx);
-			c.shr(c.rax, 32);
-			break;
+			if (binary()) {
+				result = (static_cast<uint64_t>(static_cast<uint32_t>(a)) * static_cast<uint32_t>(b)) >> 32u;
+				return true;
+			}
+			return false;
 		case ValueOpcode::UMin32:
-			c.cmp(c.eax, c.ecx);
-			c.cmova(c.eax, c.ecx);
-			break;
-		case ValueOpcode::UMax32:
-			c.cmp(c.eax, c.ecx);
-			c.cmovb(c.eax, c.ecx);
-			break;
-		case ValueOpcode::SMax32:
-			c.cmp(c.eax, c.ecx);
-			c.cmovl(c.eax, c.ecx);
-			break;
+			if (binary()) {
+				result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+				return true;
+			}
+			return false;
 		case ValueOpcode::ConvertF32U32:
-			c.cvtsi2ss(c.xmm0, c.rax);
-			c.movd(c.eax, c.xmm0);
-			break;
-		case ValueOpcode::ConvertU32F32: {
-			// The conversion saturates and maps NaN to zero.
-			Xbyak::Label done;
-			c.movd(c.xmm0, c.eax);
-			c.xorps(c.xmm1, c.xmm1);
-			c.xor_(c.eax, c.eax);
-			c.ucomiss(c.xmm0, c.xmm1);
-			c.jbe(done, Near);
-			c.mov(c.ecx, 0x4f800000u);
-			c.movd(c.xmm1, c.ecx);
-			c.mov(c.eax, UINT32_MAX);
-			c.ucomiss(c.xmm0, c.xmm1);
-			c.jae(done, Near);
-			c.cvttss2si(c.rax, c.xmm0);
-			c.L(done);
-			break;
-		}
-		case ValueOpcode::ConvertS32F32: {
-			// The conversion saturates and maps NaN to zero. cvttss2si's out-of-range result,
-			// INT32_MIN, is already right for negative overflow.
-			Xbyak::Label done;
-			c.movd(c.xmm0, c.eax);
-			c.xor_(c.eax, c.eax);
-			c.ucomiss(c.xmm0, c.xmm0);
-			c.jp(done, Near);
-			c.mov(c.ecx, 0x4f000000u);
-			c.movd(c.xmm1, c.ecx);
-			c.mov(c.eax, INT32_MAX);
-			c.ucomiss(c.xmm0, c.xmm1);
-			c.jae(done, Near);
-			c.cvttss2si(c.eax, c.xmm0);
-			c.L(done);
-			break;
-		}
+			if (Arg(inst, 0, a)) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(static_cast<uint32_t>(a)));
+				return true;
+			}
+			return false;
+		case ValueOpcode::ConvertU32F32:
+			if (Arg(inst, 0, a)) {
+				const auto value = Float32(a);
+				if (!std::isfinite(value) || value < 0.0f ||
+				    static_cast<double>(value) > UINT32_MAX) {
+					return false;
+				}
+				result = static_cast<uint32_t>(value);
+				return true;
+			}
+			return false;
+		case ValueOpcode::ConvertS32F32:
+			if (Arg(inst, 0, a)) {
+				result = static_cast<uint32_t>(SaturateF32ToS32(Float32(a)));
+				return true;
+			}
+			return false;
 		case ValueOpcode::FPMul32:
-			c.movd(c.xmm0, c.eax);
-			c.movd(c.xmm1, c.ecx);
-			c.mulss(c.xmm0, c.xmm1);
-			c.movd(c.eax, c.xmm0);
-			break;
+			if (binary()) {
+				result = std::bit_cast<uint32_t>(Float32(a) * Float32(b));
+				return true;
+			}
+			return false;
 		case ValueOpcode::FPTrunc32:
-			c.movd(c.xmm0, c.eax);
-			c.roundss(c.xmm0, c.xmm0, 3);
-			c.movd(c.eax, c.xmm0);
-			break;
+			if (Arg(inst, 0, a)) {
+				result = std::bit_cast<uint32_t>(std::trunc(Float32(a)));
+				return true;
+			}
+			return false;
 		case ValueOpcode::FPRecipIFlag32:
-			// Normal positive powers of two have exact normal reciprocals in every FP mode.
-			c.test(c.eax, 0x807fffffu);
-			c.jnz(m_ret, Near);
-			c.shr(c.eax, 23);
-			c.jz(m_ret, Near);
-			c.cmp(c.eax, 254);
-			c.jae(m_ret, Near);
-			c.neg(c.eax);
-			c.add(c.eax, 254);
-			c.shl(c.eax, 23);
-			break;
+			if (Arg(inst, 0, a)) {
+				const auto exponent = (a >> 23u) & 0xffu;
+				// Normal positive powers of two have exact normal reciprocals in every FP mode.
+				if ((a & 0x807fffffu) != 0u || exponent == 0u || exponent >= 254u) return false;
+				result = (254u - exponent) << 23u;
+				return true;
+			}
+			return false;
 		case ValueOpcode::FPIsNan32:
-			c.and_(c.eax, 0x7fffffffu);
-			c.cmp(c.eax, 0x7f800000u);
-			Set(&Xbyak::CodeGenerator::seta);
-			break;
+			if (Arg(inst, 0, a)) {
+				result = std::isnan(Float32(a));
+				return true;
+			}
+			return false;
 		case ValueOpcode::FPOrdLessThanEqual32:
 		case ValueOpcode::FPOrdGreaterThanEqual32:
-			if (inst.Flags<FPCompareFlags>().flush_input_denorms) {
-				for (const auto& reg: {c.eax, c.ecx}) {
-					Xbyak::Label normal;
-					c.mov(c.r11d, reg);
-					c.and_(c.r11d, 0x7fffffffu);
-					c.cmp(c.r11d, 0x00800000u);
-					c.jae(normal, Near);
-					c.and_(reg, 0x80000000u);
-					c.L(normal);
-				}
+			if (binary()) {
+				const auto operand = [&](uint64_t bits) {
+					if (inst.Flags<FPCompareFlags>().flush_input_denorms &&
+					    (bits & 0x7fffffffu) < 0x00800000u) {
+						bits &= 0x80000000u;
+					}
+					return Float32(bits);
+				};
+				result = inst.GetOpcode() == ValueOpcode::FPOrdLessThanEqual32
+				             ? operand(a) <= operand(b)
+				             : operand(a) >= operand(b);
+				return true;
 			}
-			c.movd(c.xmm0, c.eax);
-			c.movd(c.xmm1, c.ecx);
-			// Unordered operands set CF, so AE is false for NaN.
-			if (inst.GetOpcode() == ValueOpcode::FPOrdLessThanEqual32) {
-				c.ucomiss(c.xmm1, c.xmm0);
-			} else {
-				c.ucomiss(c.xmm0, c.xmm1);
+			return false;
+		case ValueOpcode::BitwiseAnd32:
+			if (binary()) {
+				result = static_cast<uint32_t>(a & b);
+				return true;
 			}
-			Set(&Xbyak::CodeGenerator::setae);
-			break;
-		case ValueOpcode::BitwiseAnd32: c.and_(c.eax, c.ecx); break;
-		case ValueOpcode::BitwiseAnd64: c.and_(c.rax, c.rcx); break;
-		case ValueOpcode::BitwiseOr32: c.or_(c.eax, c.ecx); break;
-		case ValueOpcode::BitwiseXor32: c.xor_(c.eax, c.ecx); break;
-		case ValueOpcode::BitwiseNot32: c.not_(c.eax); break;
-		case ValueOpcode::ShiftLeftLogical32: c.shl(c.eax, c.cl); break;
-		case ValueOpcode::ShiftLeftLogical64: c.shl(c.rax, c.cl); break;
-		case ValueOpcode::ShiftRightLogical32: c.shr(c.eax, c.cl); break;
-		case ValueOpcode::ShiftRightLogical64: c.shr(c.rax, c.cl); break;
-		case ValueOpcode::ShiftRightArithmetic32: c.sar(c.eax, c.cl); break;
-		case ValueOpcode::ShiftRightArithmetic64: c.sar(c.rax, c.cl); break;
+			return false;
+		case ValueOpcode::BitwiseAnd64:
+			if (binary()) {
+				result = a & b;
+				return true;
+			}
+			return false;
+		case ValueOpcode::BitwiseOr32:
+			if (binary()) {
+				result = static_cast<uint32_t>(a | b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::BitwiseXor32:
+			if (binary()) {
+				result = static_cast<uint32_t>(a ^ b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::BitwiseNot32:
+			if (Arg(inst, 0, a)) {
+				result = ~static_cast<uint32_t>(a);
+				return true;
+			}
+			return false;
+		case ValueOpcode::ShiftLeftLogical32:
+			if (binary()) {
+				result = static_cast<uint32_t>(a) << (b & 31u);
+				return true;
+			}
+			return false;
+		case ValueOpcode::ShiftLeftLogical64:
+			if (binary()) {
+				result = a << (b & 63u);
+				return true;
+			}
+			return false;
+		case ValueOpcode::ShiftRightLogical32:
+			if (binary()) {
+				result = static_cast<uint32_t>(a) >> (b & 31u);
+				return true;
+			}
+			return false;
+		case ValueOpcode::ShiftRightLogical64:
+			if (binary()) {
+				result = a >> (b & 63u);
+				return true;
+			}
+			return false;
+		case ValueOpcode::ShiftRightArithmetic32:
+			if (binary()) {
+				result = static_cast<uint32_t>(
+				    std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >> (b & 31u));
+				return true;
+			}
+			return false;
+		case ValueOpcode::ShiftRightArithmetic64:
+			if (binary()) {
+				result = static_cast<uint64_t>(std::bit_cast<int64_t>(a) >> (b & 63u));
+				return true;
+			}
+			return false;
 		case ValueOpcode::BitFieldUExtract:
-			field(c.ecx, c.r9d);
-			c.shr(c.rax, c.cl);
-			c.and_(c.rax, c.r11);
-			break;
-		case ValueOpcode::BitFieldSExtract: {
-			Xbyak::Label done;
-			field(c.ecx, c.r9d);
-			c.shr(c.rax, c.cl);
-			c.and_(c.rax, c.r11);
-			// Width zero tests bit 63, which is clear.
-			c.lea(c.ecx, c.ptr[c.r9 - 1]);
-			c.bt(c.rax, c.rcx);
-			c.jnc(done, Near);
-			c.not_(c.r11);
-			c.or_(c.rax, c.r11);
-			c.mov(c.eax, c.eax);
-			c.L(done);
-			break;
+			if (ternary()) {
+				const auto offset = static_cast<uint32_t>(b);
+				const auto width  = static_cast<uint32_t>(c);
+				if (offset > 32u || width > 32u - offset) {
+					return false;
+				}
+				const auto mask = width == 32u  ? UINT32_MAX
+				                  : width == 0u ? 0u
+				                                : (uint32_t {1} << width) - 1u;
+				result = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
+				return true;
+			}
+			return false;
+		case ValueOpcode::BitFieldSExtract:
+			if (ternary()) {
+				const auto offset = static_cast<uint32_t>(b);
+				const auto width  = static_cast<uint32_t>(c);
+				if (offset > 32u || width > 32u - offset) {
+					return false;
+				}
+				if (width == 0u) {
+					result = 0;
+					return true;
+				}
+				const auto mask = width == 32u ? UINT32_MAX : (uint32_t {1} << width) - 1u;
+				auto       bits = (static_cast<uint32_t>(a) >> offset) & mask;
+				if (width < 32u && (bits & (uint32_t {1} << (width - 1u))) != 0u) {
+					bits |= ~mask;
+				}
+				result = bits;
+				return true;
+			}
+			return false;
+		case ValueOpcode::BitFieldInsert: {
+			uint64_t d = 0;
+			if (!ternary() || !Arg(inst, 3, d)) {
+				return false;
+			}
+			const auto offset = static_cast<uint32_t>(c);
+			const auto width  = static_cast<uint32_t>(d);
+			if (offset > 32u || width > 32u - offset) {
+				return false;
+			}
+			if (width == 0u) {
+				result = static_cast<uint32_t>(a);
+				return true;
+			}
+			const auto mask =
+			    width == 32u ? UINT32_MAX : ((uint32_t {1} << width) - 1u) << offset;
+			result = (static_cast<uint32_t>(a) & ~mask) |
+			         ((static_cast<uint32_t>(b) << offset) & mask);
+			return true;
 		}
-		case ValueOpcode::BitFieldInsert:
-			field(c.r9d, c.r11d);
-			c.shl(c.r11, c.cl);
-			c.shl(c.r10, c.cl);
-			c.and_(c.r10, c.r11);
-			c.not_(c.r11);
-			c.and_(c.rax, c.r11);
-			c.or_(c.rax, c.r10);
-			c.mov(c.eax, c.eax);
-			break;
+		case ValueOpcode::SelectU32:
+		case ValueOpcode::SelectU1:
+		case ValueOpcode::SelectF32: {
+			auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+			if (predicate.EvaluateWide(inst.Arg(0), a)) {
+				return Arg(inst, a != 0u ? 1u : 2u, result);
+			}
+			return false;
+		}
 		case ValueOpcode::IEqual32:
-			c.cmp(c.eax, c.ecx);
-			Set(&Xbyak::CodeGenerator::sete);
-			break;
+			if (binary()) {
+				result = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);
+				return true;
+			}
+			return false;
 		case ValueOpcode::INotEqual32:
-			c.cmp(c.eax, c.ecx);
-			Set(&Xbyak::CodeGenerator::setne);
-			break;
-		case ValueOpcode::IEqual64:
-			c.cmp(c.rax, c.rcx);
-			Set(&Xbyak::CodeGenerator::sete);
-			break;
-		case ValueOpcode::INotEqual64:
-			c.cmp(c.rax, c.rcx);
-			Set(&Xbyak::CodeGenerator::setne);
-			break;
+			if (binary()) {
+				result = static_cast<uint32_t>(a) != static_cast<uint32_t>(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::ULessThan32:
+			if (binary()) {
+				result = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::ULessThanEqual32:
+			if (binary()) {
+				result = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);
+				return true;
+			}
+			return false;
 		case ValueOpcode::UGreaterThan32:
-			c.cmp(c.eax, c.ecx);
-			Set(&Xbyak::CodeGenerator::seta);
-			break;
+			if (binary()) {
+				result = static_cast<uint32_t>(a) > static_cast<uint32_t>(b);
+				return true;
+			}
+			return false;
 		case ValueOpcode::SGreaterThanEqual32:
-			c.cmp(c.eax, c.ecx);
-			Set(&Xbyak::CodeGenerator::setge);
-			break;
+			if (binary()) {
+				result = std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >=
+				         std::bit_cast<int32_t>(static_cast<uint32_t>(b));
+				return true;
+			}
+			return false;
+		case ValueOpcode::LogicalAnd:
+			if (binary()) {
+				result = (a != 0u) && (b != 0u);
+				return true;
+			}
+			return false;
+		case ValueOpcode::LogicalOr:
+			if (binary()) {
+				result = (a != 0u) || (b != 0u);
+				return true;
+			}
+			return false;
 		case ValueOpcode::LogicalXor:
-			c.test(c.rax, c.rax);
-			c.setne(c.al);
-			c.test(c.rcx, c.rcx);
-			c.setne(c.cl);
-			c.xor_(c.al, c.cl);
-			c.movzx(c.eax, c.al);
-			break;
+			if (binary()) {
+				result = (a != 0u) != (b != 0u);
+				return true;
+			}
+			return false;
+		// The branch the wave takes: the emitted condition (argument 1), not the analysis one.
+		case ValueOpcode::ConditionRef: return Arg(inst, 1, result);
 		case ValueOpcode::LogicalNot:
-			c.test(c.rax, c.rax);
-			Set(&Xbyak::CodeGenerator::sete);
-			break;
-		default: EXIT("unexpected SRT walker opcode\n");
+			if (Arg(inst, 0, a)) {
+				result = a == 0u;
+				return true;
+			}
+			return false;
+		case ValueOpcode::UndefU1:
+		case ValueOpcode::UndefU8:
+		case ValueOpcode::UndefU16:
+		case ValueOpcode::UndefU32:
+		case ValueOpcode::UndefU64: return false;
+		default: break;
 	}
-	Store(node);
+	return false;
+}
+bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
+	if (source >= m_program.descriptor_sources.size()) {
+		return false;
+	}
+	const auto& descriptor = m_program.descriptor_sources[source];
+	result = {};
+	result.dword_count = descriptor.dword_count;
+	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
+		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
+			return false;
+		}
+	}
+	return true;
 }
 
-void WalkerCompiler::Compile(std::span<const Value> values) {
-	auto&       c         = m_code;
-	const auto& sources   = m_plan.descriptor_sources;
-	const auto& blocks    = m_plan.control_flow;
-	const bool  resources = values.empty();
-	std::vector<std::vector<uint32_t>> gates(sources.size());
-	if (resources) Consume(gates);
-	for (const auto value: values) AddOutput(value, UINT32_MAX);
-	// Analyze every root first, so thunk bodies only reuse finished operands.
-	std::vector<Operand>              conditions, reads, outputs;
-	std::vector<std::vector<Operand>> descriptors(sources.size());
-	if (resources) {
-		for (const auto& block: blocks) conditions.push_back(Evaluate(block.condition, 0).operand);
-		for (const auto& read: m_plan.srt_reads) reads.push_back(Evaluate(read.value, 0).operand);
-		for (uint32_t source = 0; source < sources.size(); ++source) {
-			if (gates[source].empty()) continue;
-			for (uint32_t word = 0; word < sources[source].dword_count; ++word)
-				descriptors[source].push_back(Evaluate(sources[source].dwords[word], 0).operand);
+std::span<const uint8_t> SrtWalker::FindActiveSources() {
+	if (m_program.control_flow.empty()) {
+		return {};
+	}
+	// Conditions over flat SRT slots use this walker; see CompiledResourcePlan.
+	const auto& direct = CompileResourcePlan(m_program).direct_conditions;
+	auto&       strict = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+	auto&       active = m_program.ThreadScratch().active_sources;
+	active.assign(m_program.descriptor_sources.size(), 1u);
+	for (const auto& block: m_program.control_flow) {
+		for (const auto source: block.sources) {
+			active.at(source) = 0u;
 		}
 	}
-	for (const auto value: m_outputs) outputs.push_back(Evaluate(value, 0).operand);
-	Layout();
+	auto& visited = m_program.ThreadScratch().visited_blocks;
+	auto& pending = m_program.ThreadScratch().pending_blocks;
+	visited.assign(m_program.control_flow.size(), 0u);
+	pending.clear();
+	pending.push_back(0u);
+	while (!pending.empty()) {
+		const auto index = pending.back();
+		pending.pop_back();
+		if (visited.at(index)) {
+			continue;
+		}
+		visited[index] = 1u;
+		const auto& block = m_program.control_flow[index];
+		for (const auto source: block.sources) {
+			active[source] = 1u;
+		}
+		uint32_t condition = 0;
+		auto&    evaluator = index < direct.size() && direct[index] != 0u ? *this : strict;
+		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
+		    evaluator.Evaluate(block.condition, condition)) {
+			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
+		} else {
+			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+		}
+	}
+	return active;
+}
 
-	Xbyak::Label pass, fail, reset;
-	c.mov(c.qword[c.rdx + m_shader_base], c.rcx);
-	Zero(m_reach, m_states_end - m_reach);
-	c.lea(c.r8, c.ptr[c.rdx + m_plan.srt_captures]);
-	if (!resources) {
-		for (uint32_t block = 0; block < blocks.size(); ++block) c.mov(c.byte[c.rdx + m_reach + block], 1);
-	} else if (!blocks.empty()) {
-		// Reachability grows monotonically. A newly reached predecessor of an evaluated
-		// control Phi restarts the walk with fresh values; a retreating edge resumes at its target.
-		std::vector<std::vector<uint32_t>> rechecks(blocks.size());
-		for (uint32_t index = 0; index < m_nodes.size(); ++index) {
-			const auto& node = m_nodes[index];
-			if (node.inst->GetOpcode() != ValueOpcode::Phi || node.result != Operand {Kind::Node, index}) continue;
-			for (const auto block: m_plan.control_phi_predecessors.at(node.inst)) rechecks[block].push_back(node.state);
+bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+	if (!m_program.srt_plan_complete) {
+		return false;
+	}
+	flat.resize(m_program.srt_reads.size());
+	for (const auto& read: m_program.srt_reads) {
+		const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
+		                   m_clean_flat_slots[read.flat_offset] != 0u;
+		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
+			return false;
 		}
-		std::vector<Xbyak::Label> starts(blocks.size());
-		c.mov(c.byte[c.rdx + m_reach], 1);
-		c.L(pass);
-		for (uint32_t block = 0; block < blocks.size(); ++block) {
-			Xbyak::Label next;
-			const auto mark = [&](uint32_t target) {
-				Xbyak::Label reached;
-				c.cmp(c.byte[c.rdx + m_reach + target], 0);
-				c.jne(reached, Near);
-				c.mov(c.byte[c.rdx + m_reach + target], 1);
-				for (const auto state: rechecks[target]) {
-					c.cmp(c.byte[c.rdx + state], 0);
-					c.jne(reset, Near);
-				}
-				if (target <= block) c.jmp(starts[target], Near);
-				c.L(reached);
-			};
-			const auto& successors = blocks[block].successors;
-			const auto  condition  = conditions[block];
-			c.L(starts[block]);
-			c.cmp(c.byte[c.rdx + m_reach + block], 0);
-			c.je(next, Near);
-			if (condition.kind == Kind::Constant) {
-				mark(successors[condition.value != 0u ? 0 : 1]);
-			} else {
-				if (condition.kind != Kind::Unknown) {
-					Xbyak::Label both, other;
-					Fetch(condition, both);
-					c.test(c.rax, c.rax);
-					c.jz(other, Near);
-					mark(successors[0]);
-					c.jmp(next, Near);
-					c.L(other);
-					mark(successors[1]);
-					c.jmp(next, Near);
-					c.L(both);
-				}
-				for (const auto successor: successors) mark(successor);
-			}
-			c.L(next);
+		auto& evaluator = clean ? *m_clean_evaluator : *this;
+		if (read.flat_offset >= flat.size() || !evaluator.Evaluate(read.value, flat[read.flat_offset])) {
+			return false;
 		}
 	}
-	if (resources) {
-		const auto flat = [&](uint32_t slot) {
-			const auto offset = slot < reads.size() ? m_plan.srt_reads[slot].flat_offset : UINT32_MAX;
-			if (offset >= reads.size()) {
-				c.jmp(fail, Near);
+	return true;
+}
+
+namespace {
+
+using NodeOp = ResourceNode::Op;
+
+bool ImmediateBits(Value value, uint64_t& bits) {
+	switch (value.GetType()) {
+		case Type::U1: bits = value.U1(); return true;
+		case Type::U8: bits = value.U8(); return true;
+		case Type::U16: bits = value.U16(); return true;
+		case Type::U32: bits = value.U32(); return true;
+		case Type::U64: bits = value.U64(); return true;
+		case Type::F32: bits = std::bit_cast<uint32_t>(value.F32Value()); return true;
+		case Type::F16: bits = value.F16Bits(); return false;
+		case Type::ScalarReg: bits = RegIndex(value.ScalarRegister()); return false;
+		case Type::VectorReg: bits = RegIndex(value.VectorRegister()); return false;
+		default: bits = 0; return false;
+	}
+}
+
+NodeOp ArithmeticOp(ValueOpcode op, size_t& args) {
+	args = 2;
+	switch (op) {
+		case ValueOpcode::CompositeConstructU64: return NodeOp::ConstructU64;
+		case ValueOpcode::IAdd32: return NodeOp::IAdd32;
+		case ValueOpcode::IAdd64: return NodeOp::IAdd64;
+		case ValueOpcode::ISub32: return NodeOp::ISub32;
+		case ValueOpcode::ISub64: return NodeOp::ISub64;
+		case ValueOpcode::IMul32: return NodeOp::IMul32;
+		case ValueOpcode::IMul64: return NodeOp::IMul64;
+		case ValueOpcode::UMin32: return NodeOp::UMin32;
+		case ValueOpcode::FPMul32: return NodeOp::FPMul32;
+		case ValueOpcode::FPOrdLessThanEqual32: return NodeOp::FPOrdLessThanEqual32;
+		case ValueOpcode::FPOrdGreaterThanEqual32: return NodeOp::FPOrdGreaterThanEqual32;
+		case ValueOpcode::BitwiseAnd32: return NodeOp::BitwiseAnd32;
+		case ValueOpcode::BitwiseAnd64: return NodeOp::BitwiseAnd64;
+		case ValueOpcode::BitwiseOr32: return NodeOp::BitwiseOr32;
+		case ValueOpcode::BitwiseXor32: return NodeOp::BitwiseXor32;
+		case ValueOpcode::ShiftLeftLogical32: return NodeOp::ShiftLeftLogical32;
+		case ValueOpcode::ShiftLeftLogical64: return NodeOp::ShiftLeftLogical64;
+		case ValueOpcode::ShiftRightLogical32: return NodeOp::ShiftRightLogical32;
+		case ValueOpcode::ShiftRightLogical64: return NodeOp::ShiftRightLogical64;
+		case ValueOpcode::ShiftRightArithmetic32: return NodeOp::ShiftRightArithmetic32;
+		case ValueOpcode::ShiftRightArithmetic64: return NodeOp::ShiftRightArithmetic64;
+		case ValueOpcode::IEqual32: return NodeOp::IEqual32;
+		case ValueOpcode::INotEqual32: return NodeOp::INotEqual32;
+		case ValueOpcode::ULessThan32: return NodeOp::ULessThan32;
+		case ValueOpcode::ULessThanEqual32: return NodeOp::ULessThanEqual32;
+		case ValueOpcode::UGreaterThan32: return NodeOp::UGreaterThan32;
+		case ValueOpcode::SGreaterThanEqual32: return NodeOp::SGreaterThanEqual32;
+		case ValueOpcode::LogicalAnd: return NodeOp::LogicalAnd;
+		case ValueOpcode::LogicalOr: return NodeOp::LogicalOr;
+		case ValueOpcode::LogicalXor: return NodeOp::LogicalXor;
+		default: break;
+	}
+	args = 1;
+	switch (op) {
+		case ValueOpcode::ConvertF32U32: return NodeOp::ConvertF32U32;
+		case ValueOpcode::ConvertU32F32: return NodeOp::ConvertU32F32;
+		case ValueOpcode::ConvertS32F32: return NodeOp::ConvertS32F32;
+		case ValueOpcode::FPTrunc32: return NodeOp::FPTrunc32;
+		case ValueOpcode::FPIsNan32: return NodeOp::FPIsNan32;
+		case ValueOpcode::BitwiseNot32: return NodeOp::BitwiseNot32;
+		case ValueOpcode::LogicalNot: return NodeOp::LogicalNot;
+		default: break;
+	}
+	args = 3;
+	switch (op) {
+		case ValueOpcode::BitFieldUExtract: return NodeOp::BitFieldUExtract;
+		case ValueOpcode::BitFieldSExtract: return NodeOp::BitFieldSExtract;
+		case ValueOpcode::SelectU1:
+		case ValueOpcode::SelectU32:
+		case ValueOpcode::SelectF32: return NodeOp::Select;
+		default: break;
+	}
+	args = 4;
+	return op == ValueOpcode::BitFieldInsert ? NodeOp::BitFieldInsert : NodeOp::Fail;
+}
+
+class PlanCompiler {
+public:
+	PlanCompiler(const ResourcePlan& program, CompiledResourcePlan& compiled)
+	    : m_program(program), m_compiled(compiled) {}
+
+	uint32_t Node(Value value) {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			uint64_t   bits  = 0;
+			const bool valid = ImmediateBits(value, bits);
+			const auto key   = std::pair {static_cast<uint32_t>(value.GetType()), bits};
+			if (const auto found = m_constants.find(key); found != m_constants.end()) {
+				return found->second;
+			}
+			const auto index = Push({.op = valid ? NodeOp::Const : NodeOp::Fail, .imm = bits});
+			m_constants.emplace(key, index);
+			return index;
+		}
+		const auto* inst = value.TryInstruction();
+		// A branch condition's reference evaluates as its emitted condition, as in the walker.
+		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::ConditionRef) {
+			return Node(inst->Arg(1));
+		}
+		if (const auto found = m_instructions.find(inst); found != m_instructions.end()) {
+			return found->second;
+		}
+		// Register before the operands so that cycles resolve to this node, like the walker's
+		// in-progress marker.
+		const auto index = Push({});
+		m_instructions.emplace(inst, index);
+		const auto node        = Build(*inst);
+		m_compiled.nodes[index] = node;
+		return index;
+	}
+
+private:
+	uint32_t Push(const ResourceNode& node) {
+		m_compiled.nodes.push_back(node);
+		return static_cast<uint32_t>(m_compiled.nodes.size() - 1u);
+	}
+
+	ResourceNode Build(const Inst& inst) {
+		ResourceNode node;
+		const auto   op = inst.GetOpcode();
+		switch (op) {
+			case ValueOpcode::GetUserData: {
+				if (inst.NumArgs() < 1 || inst.Arg(0).GetType() != Type::ScalarReg) {
+					return node;
+				}
+				const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
+				if (reg < m_program.user_data_base) {
+					return node;
+				}
+				node.op  = NodeOp::UserData;
+				node.aux = reg - m_program.user_data_base;
+				return node;
+			}
+			case ValueOpcode::GetShaderBase: node.op = NodeOp::ShaderBase; return node;
+			case ValueOpcode::Phi: {
+				const auto invariant =
+				    ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
+				if (invariant.IsEmpty()) {
+					return node;
+				}
+				node.args[0] = Node(invariant);
+				node.op      = NodeOp::Forward;
+				return node;
+			}
+			case ValueOpcode::ReadFirstLane: {
+				if (inst.NumArgs() < 2) {
+					return node;
+				}
+				node.args[0]    = Node(inst.Arg(0));
+				const auto mask = inst.Arg(1).Resolve();
+				node.args[1]    = mask.IsEmpty() ? ResourceNode::NoNode : Node(mask);
+				node.op         = NodeOp::ReadFirstLane;
+				return node;
+			}
+			case ValueOpcode::BitCastU32F32:
+			case ValueOpcode::BitCastF32U32:
+				if (inst.NumArgs() < 1) {
+					return node;
+				}
+				node.args[0] = Node(inst.Arg(0));
+				node.op      = NodeOp::Forward;
+				return node;
+			case ValueOpcode::CompositeExtractU64:
+			case ValueOpcode::CompositeExtractU32x2: return BuildExtract(inst);
+			case ValueOpcode::ReadConst: {
+				if (inst.NumArgs() < 2) {
+					return node;
+				}
+				const auto slot = inst.Arg(1).Resolve();
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32 ||
+				    slot.U32() >= m_program.srt_reads.size()) {
+					return node;
+				}
+				node.aux     = slot.U32();
+				node.args[0] = Node(m_program.srt_reads[slot.U32()].value);
+				node.flags   = node.aux < m_program.clean_flat_slots.size() &&
+				                     m_program.clean_flat_slots[node.aux] != 0u
+				                   ? ResourceNode::CleanSlot
+				                   : 0u;
+				node.op      = NodeOp::ReadConst;
+				return node;
+			}
+			case ValueOpcode::LoadAddressU32:
+			case ValueOpcode::ReadConstBuffer: return BuildRawRead(inst);
+			case ValueOpcode::Void:
+			case ValueOpcode::UndefU32: {
+				// Diagnostic (the title missing shorts, cs/ps 47e9336d / a8faef16): KYTY_SRT_VOID_AS_ZERO=1
+				// evaluates a removed (Void) or undefined value as 0 instead of failing the plan.
+				static const bool as_zero = KYTY_GETENV("KYTY_SRT_VOID_AS_ZERO") != nullptr;
+				if (as_zero && inst.NumArgs() == 0) {
+					node.op  = NodeOp::Const;
+					node.imm = 0;
+					return node;
+				}
+				break;
+			}
+			default: break;
+		}
+		size_t     count      = 0;
+		const auto arithmetic = ArithmeticOp(op, count);
+		if (arithmetic == NodeOp::Fail || inst.NumArgs() < count) {
+			// KYTY_DEBUG_SRT_FAIL=1: name the IR opcodes the compiled evaluator cannot evaluate.
+			static const bool report = KYTY_GETENV("KYTY_DEBUG_SRT_FAIL") != nullptr;
+			static std::atomic<uint32_t> reported {0};
+			if (report && reported.fetch_add(1, std::memory_order_relaxed) < 64u) {
+				const auto name = ValueOpcodeName(op);
+				std::printf("srt-node-fail: shader=0x%016llx opcode=%.*s args=%zu\n",
+				            static_cast<unsigned long long>(m_program.shader_hash),
+				            static_cast<int>(name.size()), name.data(), inst.NumArgs());
+				std::fflush(stdout);
+			}
+			return node;
+		}
+		for (size_t index = 0; index < count; index++) {
+			node.args[index] = Node(inst.Arg(index));
+		}
+		node.op = arithmetic;
+		return node;
+	}
+
+	ResourceNode BuildExtract(const Inst& inst) {
+		ResourceNode node;
+		if (inst.NumArgs() < 2) {
+			return node;
+		}
+		const auto index = inst.Arg(1).Resolve();
+		if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) {
+			return node;
+		}
+		node.aux = index.U32();
+		if (inst.GetOpcode() == ValueOpcode::CompositeExtractU64) {
+			node.args[0] = Node(inst.Arg(0));
+			node.op      = NodeOp::ExtractU64;
+			return node;
+		}
+		const auto* source = inst.Arg(0).Resolve().TryInstruction();
+		if (source == nullptr) {
+			return node;
+		}
+		if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2 &&
+		    source->NumArgs() > node.aux) {
+			node.args[0] = Node(source->Arg(node.aux));
+			node.op      = NodeOp::Forward;
+		} else if (source->GetOpcode() == ValueOpcode::IAddCarry32 && source->NumArgs() >= 2) {
+			node.args[0] = Node(source->Arg(0));
+			node.args[1] = Node(source->Arg(1));
+			node.op      = NodeOp::AddCarry;
+		}
+		return node;
+	}
+
+	ResourceNode BuildRawRead(const Inst& inst) {
+		ResourceNode node;
+		if (!IsRawRead(m_program, inst) || inst.NumArgs() < 2) {
+			return node;
+		}
+		const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+		if (handle == nullptr || handle->NumArgs() < 2) {
+			return node;
+		}
+		const auto& memory = m_program.memory_info[inst.Flags<MemoryFlags>().index];
+		node.imm = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(memory.offset)));
+		node.args[0] = Node(handle->Arg(0));
+		node.args[1] = Node(handle->Arg(1));
+		node.args[2] = Node(inst.Arg(1));
+		if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer) {
+			if (handle->NumArgs() == 4u) {
+				node.args[3] = Node(handle->Arg(2));
+				node.args[4] = Node(handle->Arg(3));
+			}
+			node.op = NodeOp::RawBuffer;
+		} else {
+			node.op = NodeOp::RawAddress;
+		}
+		return node;
+	}
+
+	const ResourcePlan&                          m_program;
+	CompiledResourcePlan&                        m_compiled;
+	std::unordered_map<const Inst*, uint32_t>    m_instructions;
+	std::map<std::pair<uint32_t, uint64_t>, uint32_t> m_constants;
+};
+
+// Finds the inputs of the buffer, image and sampler descriptor values. ReadConst is an input
+// (its value is the flat SRT slot); memory reads other than a slot's own raw read, clean-only
+// dependencies and nested EXEC evaluations make a plan non-memoizable.
+class MemoAnalysis {
+public:
+	explicit MemoAnalysis(CompiledResourcePlan& compiled): m_compiled(compiled) {}
+
+	bool Visit(uint32_t index, bool clean) {
+		if (index == ResourceNode::NoNode) {
+			return true;
+		}
+		auto& visited = clean ? m_clean_visited : m_visited;
+		if (visited.size() < m_compiled.nodes.size()) {
+			visited.resize(m_compiled.nodes.size(), 0u);
+		}
+		if (visited[index] != 0u) {
+			return true;
+		}
+		visited[index] = 1u;
+		const auto& node = m_compiled.nodes[index];
+		switch (node.op) {
+			case NodeOp::Fail:
+			case NodeOp::Const: return true;
+			case NodeOp::UserData: m_compiled.memo_user_data.push_back(node.aux); return true;
+			case NodeOp::ShaderBase: m_compiled.memo_shader_base = true; return true;
+			case NodeOp::ReadConst: {
+				// A clean walker rereads the slot through the strict reader.
+				const auto target = m_compiled.nodes[node.args[0]].op;
+				if (clean || (node.flags & ResourceNode::CleanSlot) != 0u ||
+				    (target != NodeOp::RawAddress && target != NodeOp::RawBuffer)) {
+					return false;
+				}
+				m_compiled.memo_slots.push_back(node.aux);
+				return true;
+			}
+			case NodeOp::ReadFirstLane:
+			case NodeOp::RawAddress:
+			case NodeOp::RawBuffer: return false;
+			case NodeOp::Select:
+				// Predicates are evaluated by the clean walker.
+				return Visit(node.args[0], true) && Visit(node.args[1], clean) &&
+				       Visit(node.args[2], clean);
+			default:
+				for (const auto arg: node.args) {
+					if (!Visit(arg, clean)) {
+						return false;
+					}
+				}
+				return true;
+		}
+	}
+
+private:
+	CompiledResourcePlan& m_compiled;
+	std::vector<uint8_t>  m_visited;
+	std::vector<uint8_t>  m_clean_visited;
+};
+
+// A condition may use the ordinary walker when everything it reads directly is a flat SRT slot,
+// which RefreshFlatBuffer reads (and memoizes) on every refresh anyway. Select predicates still go
+// to the strict walker, as for any ordinary value.
+class DirectConditionAnalysis {
+public:
+	explicit DirectConditionAnalysis(const CompiledResourcePlan& compiled)
+	    : m_compiled(compiled), m_visited(compiled.nodes.size(), 0u) {}
+
+	bool Visit(uint32_t index) {
+		if (index == ResourceNode::NoNode || m_visited[index] != 0u) {
+			return true;
+		}
+		m_visited[index] = 1u;
+		const auto& node = m_compiled.nodes[index];
+		switch (node.op) {
+			case NodeOp::ReadConst: {
+				const auto target = m_compiled.nodes[node.args[0]].op;
+				return (node.flags & ResourceNode::CleanSlot) == 0u &&
+				       (target == NodeOp::RawAddress || target == NodeOp::RawBuffer);
+			}
+			case NodeOp::ReadFirstLane:
+			case NodeOp::RawAddress:
+			case NodeOp::RawBuffer: return false;
+			case NodeOp::Select: return Visit(node.args[1]) && Visit(node.args[2]);
+			default:
+				for (const auto arg: node.args) {
+					if (!Visit(arg)) {
+						return false;
+					}
+				}
+				return true;
+		}
+	}
+
+private:
+	const CompiledResourcePlan& m_compiled;
+	std::vector<uint8_t>        m_visited;
+};
+
+void AnalyzeControlFlow(const ResourcePlan& program, CompiledResourcePlan& compiled) {
+	compiled.direct_conditions.assign(program.control_flow.size(), 0u);
+	const bool clean_slots =
+	    std::ranges::any_of(program.clean_flat_slots, [](uint8_t slot) { return slot != 0u; });
+	for (uint32_t block = 0; block < program.control_flow.size(); block++) {
+		const auto condition = compiled.conditions[block];
+		compiled.direct_conditions[block] =
+		    !clean_slots && condition != ResourceNode::NoNode &&
+		    DirectConditionAnalysis(compiled).Visit(condition);
+	}
+	compiled.initial_active.assign(program.descriptor_sources.size(), 1u);
+	for (const auto& block: program.control_flow) {
+		for (const auto source: block.sources) {
+			if (source >= compiled.initial_active.size()) {
+				compiled.initial_active.clear();
 				return;
 			}
-			Fetch(reads[slot], fail);
-			c.mov(c.dword[c.rsi + offset * sizeof(uint32_t)], c.eax);
-		};
-		if (blocks.empty()) {
-			for (uint32_t slot = 0; slot < reads.size(); ++slot) flat(slot);
+			compiled.initial_active[source] = 0u;
 		}
-		for (uint32_t block = 0; block < blocks.size(); ++block) {
-			if (blocks[block].srt_reads.empty()) continue;
-			Xbyak::Label skip;
-			c.cmp(c.byte[c.rdx + m_reach + block], 0);
-			c.je(skip, Near);
-			for (const auto slot: blocks[block].srt_reads) flat(slot);
-			c.L(skip);
+	}
+	// A block's successors are inert when no block reachable from them (along any path) has
+	// sources: whatever the condition, the walk adds nothing.
+	const auto count = program.control_flow.size();
+	compiled.inert_successors.assign(count, 0u);
+	std::vector<uint8_t>  reached;
+	std::vector<uint32_t> stack;
+	for (uint32_t block = 0; block < count; block++) {
+		reached.assign(count, 0u);
+		stack.assign(program.control_flow[block].successors.begin(),
+		             program.control_flow[block].successors.end());
+		bool inert = true;
+		while (!stack.empty() && inert) {
+			const auto index = stack.back();
+			stack.pop_back();
+			if (index >= count) {
+				inert = false;
+				break;
+			}
+			if (reached[index] != 0u) {
+				continue;
+			}
+			reached[index] = 1u;
+			inert          = program.control_flow[index].sources.empty();
+			stack.insert(stack.end(), program.control_flow[index].successors.begin(),
+			             program.control_flow[index].successors.end());
 		}
-		// A source or image no block lists is always active.
-		for (uint32_t index = 0; index < sources.size() + m_plan.info.images.size(); ++index) {
-			const bool     image = index >= sources.size();
-			const uint32_t id    = image ? index - static_cast<uint32_t>(sources.size()) : index;
-			bool listed = false;
-			for (uint32_t block = 0; block < blocks.size(); ++block) {
-				const auto& list = image ? blocks[block].images : blocks[block].sources;
-				if (std::ranges::find(list, id) == list.end()) continue;
-				if (listed) {
-					c.or_(c.al, c.byte[c.rdx + m_reach + block]);
-				} else {
-					c.mov(c.al, c.byte[c.rdx + m_reach + block]);
+		compiled.inert_successors[block] = inert ? 1u : 0u;
+	}
+}
+
+void AnalyzeMemo(const ResourcePlan& program, CompiledResourcePlan& compiled) {
+	if (program.requires_specialization_memory ||
+	    std::ranges::any_of(program.clean_flat_slots, [](uint8_t slot) { return slot != 0u; })) {
+		return;
+	}
+	MemoAnalysis analysis(compiled);
+	const auto   visit_source = [&](uint32_t source) {
+        if (source >= compiled.descriptors.size()) {
+            return true;
+        }
+        const auto count = program.descriptor_sources[source].dword_count;
+        for (uint32_t dword = 0; dword < count && dword < 8u; dword++) {
+            if (!analysis.Visit(compiled.descriptors[source][dword], false)) {
+                return false;
+            }
+        }
+        return true;
+	};
+	for (const auto& buffer: program.info.buffers) {
+		if (!visit_source(buffer.source)) return;
+	}
+	for (const auto& image: program.info.images) {
+		if (!visit_source(image.source)) return;
+		// A finite GPU-selected image depends on each listed candidate as well.
+		if (image.source < program.descriptor_sources.size()) {
+			if (const auto& indirect = program.descriptor_sources[image.source].indirect_descriptor) {
+				for (const auto listed: indirect->sources) {
+					if (!visit_source(listed)) return;
 				}
-				listed = true;
-			}
-			const auto active = c.byte[c.rdx + ActiveOffset(m_plan) + index];
-			if (listed) {
-				c.mov(active, c.al);
-			} else {
-				c.mov(active, 1);
 			}
 		}
-		for (uint32_t source = 0; source < sources.size(); ++source) {
-			if (gates[source].empty()) continue;
-			Xbyak::Label skip;
-			const auto known = c.dword[c.rdx + source * DescriptorStride + 8u * sizeof(uint32_t)];
-			c.mov(known, 0);
-			Gate(gates[source], skip);
-			for (uint32_t word = 0; word < descriptors[source].size(); ++word) {
-				Fetch(descriptors[source][word], skip);
-				c.mov(c.dword[c.rdx + source * DescriptorStride + word * sizeof(uint32_t)], c.eax);
-			}
-			c.mov(known, 1);
-			c.L(skip);
+	}
+	for (const auto& sampler: program.info.samplers) {
+		if (!visit_source(sampler.source)) return;
+	}
+	for (auto& slot: compiled.memo_slots) {
+		slot = program.srt_reads[slot].flat_offset;
+		if (slot >= program.srt_reads.size()) return;
+	}
+	for (auto* list: {&compiled.memo_user_data, &compiled.memo_slots}) {
+		std::ranges::sort(*list);
+		list->erase(std::unique(list->begin(), list->end()), list->end());
+	}
+	compiled.memoizable = true;
+}
+
+bool g_flat_run_reads = true; // See SetFlatRunReads.
+
+// Groups the ordinary slots that read consecutive dwords through one handle and offset (a
+// scalar load of several dwords becomes one LoadAddressU32 per dword) into runs.
+void BuildFlatRuns(const ResourcePlan& program, CompiledResourcePlan& compiled) {
+	if (!g_flat_run_reads) {
+		return;
+	}
+	struct Candidate {
+		uint32_t low    = 0;
+		uint32_t high   = 0;
+		uint32_t offset = 0;
+		int64_t  imm    = 0;
+		uint32_t slot   = 0;
+
+		[[nodiscard]] bool SameBase(const Candidate& other) const {
+			return low == other.low && high == other.high && offset == other.offset;
+		}
+	};
+	std::vector<Candidate> candidates;
+	for (uint32_t slot = 0; slot < compiled.slots.size(); slot++) {
+		const auto flat_offset = program.srt_reads[slot].flat_offset;
+		if (flat_offset >= program.srt_reads.size() ||
+		    (flat_offset < compiled.clean_slots.size() && compiled.clean_slots[flat_offset] != 0u)) {
+			continue;
+		}
+		const auto& node = compiled.nodes[compiled.slots[slot]];
+		const auto  imm  = static_cast<int64_t>(node.imm);
+		if (node.op != NodeOp::RawAddress || (imm & 3) != 0) {
+			continue;
+		}
+		candidates.push_back({node.args[0], node.args[1], node.args[2], imm, slot});
+	}
+	std::ranges::sort(candidates, [](const Candidate& a, const Candidate& b) {
+		return std::tie(a.low, a.high, a.offset, a.imm, a.slot) <
+		       std::tie(b.low, b.high, b.offset, b.imm, b.slot);
+	});
+	std::vector<CompiledResourcePlan::FlatRunEntry> entries;
+	const auto flush = [&](int64_t first_imm, int64_t last_imm) {
+		// A single dword gains nothing from a run.
+		if (entries.size() >= 2u && last_imm > first_imm) {
+			compiled.flat_runs.push_back({
+			    .first  = static_cast<uint32_t>(compiled.run_entries.size()),
+			    .count  = static_cast<uint32_t>(entries.size()),
+			    .dwords = static_cast<uint32_t>((last_imm - first_imm) / 4 + 1),
+			});
+			compiled.run_entries.insert(compiled.run_entries.end(), entries.begin(), entries.end());
+		}
+		entries.clear();
+	};
+	int64_t first_imm = 0;
+	int64_t last_imm  = 0;
+	for (size_t index = 0; index < candidates.size(); index++) {
+		const auto& candidate = candidates[index];
+		const bool  extends   = index != 0 && candidate.SameBase(candidates[index - 1]) &&
+		                     candidate.imm - last_imm <= 4 &&
+		                     (candidate.imm - first_imm) / 4 < CompiledResourcePlan::MaxRunDwords;
+		if (!extends) {
+			flush(first_imm, last_imm);
+			first_imm = candidate.imm;
+		}
+		last_imm = candidate.imm;
+		entries.push_back({candidate.slot, static_cast<uint32_t>((candidate.imm - first_imm) / 4),
+		                   program.srt_reads[candidate.slot].flat_offset});
+	}
+	flush(first_imm, last_imm);
+	if (!compiled.flat_runs.empty()) {
+		compiled.in_run.assign(compiled.slots.size(), 0u);
+		for (const auto& entry: compiled.run_entries) {
+			compiled.in_run[entry.slot] = 1u;
+		}
+		// The first entry of a run reads dword 0, and its node gives the run's base.
+		for (const auto& run: compiled.flat_runs) {
+			EXIT_IF(compiled.run_entries[run.first].dword != 0u);
 		}
 	}
-	for (uint32_t index = 0; index < outputs.size(); ++index) {
-		Xbyak::Label skip;
-		const auto output = c.qword[c.rdx + OutputOffset(m_plan) + index * 8u];
-		c.mov(output, -1);
-		Gate(m_output_gates[index], skip);
-		Fetch(outputs[index], skip);
-		c.mov(c.eax, c.eax);
-		c.mov(output, c.rax);
-		c.L(skip);
-	}
-	c.mov(c.rax, c.r8);
-	c.L(m_ret);
-	c.ret();
-	c.L(fail);
-	c.xor_(c.eax, c.eax);
-	c.ret();
-	if (resources && !blocks.empty()) {
-		c.L(reset);
-		Zero(m_states, m_states_end - m_states);
-		c.lea(c.r8, c.ptr[c.rdx + m_plan.srt_captures]);
-		c.jmp(pass, Near);
-	}
-	for (uint32_t index = 0; index < m_nodes.size(); ++index) {
-		if (Thunk(index)) EmitNode(index);
-	}
-	m_plan.srt_scratch.assign(m_plan.srt_captures / 8u + m_captures, 0u);
-	m_plan.srt_user_data = m_user_data;
-	c.readyRE();
-	EXIT_IF(Xbyak::GetError() != 0);
 }
 
 } // namespace
 
-void CompileSrtWalker(ResourcePlan& plan, std::span<const Value> values) {
-	plan.srt_code = std::make_unique<Xbyak::CodeGenerator>(4096, Xbyak::AutoGrow);
-	WalkerCompiler(plan, *plan.srt_code).Compile(values);
+void SetFlatRunReads(bool enabled) {
+	g_flat_run_reads = enabled;
 }
 
-bool WalkSrt(const ResourcePlan& plan, const SrtRuntime& runtime, std::vector<uint32_t>& flat,
-             std::vector<std::pair<uint64_t, uint64_t>>* reads) {
-	if (plan.srt_code == nullptr || runtime.user_data.size() < plan.srt_user_data) return false;
-	flat.assign(plan.srt_reads.size(), 0u);
-	using Walker = const uint64_t* KYTY_SYSV_ABI (*)(const uint32_t*, uint32_t*, uint64_t*, uint64_t);
-	t_running_walker = plan.srt_code.get();
-	const auto* end = plan.srt_code->getCode<Walker>()(runtime.user_data.data(), flat.data(),
-	                                                     plan.srt_scratch.data(), runtime.shader_base);
-	t_running_walker = nullptr;
-	if (end == nullptr) return false;
-	if (reads != nullptr) {
-		for (auto* read = plan.srt_scratch.data() + plan.srt_captures / 8u; read != end; ++read)
-			reads->emplace_back(*read, sizeof(uint32_t));
+const CompiledResourcePlan& CompileResourcePlan(const ResourcePlan& program) {
+	if (program.compiled != nullptr) {
+		return *program.compiled;
 	}
+	auto         compiled = std::make_unique<CompiledResourcePlan>();
+	PlanCompiler compiler(program, *compiled);
+	compiled->slots.reserve(program.srt_reads.size());
+	for (const auto& read: program.srt_reads) {
+		compiled->slots.push_back(compiler.Node(read.value));
+	}
+	compiled->clean_slots = program.clean_flat_slots;
+	compiled->descriptors.resize(program.descriptor_sources.size());
+	compiled->key_counts.resize(program.descriptor_sources.size(), ResourceNode::NoNode);
+	compiled->selector_masks.resize(program.descriptor_sources.size(), ResourceNode::NoNode);
+	compiled->selector_firsts.resize(program.descriptor_sources.size(), ResourceNode::NoNode);
+	for (uint32_t source = 0; source < program.descriptor_sources.size(); source++) {
+		const auto& descriptor = program.descriptor_sources[source];
+		auto&       dwords     = compiled->descriptors[source];
+		dwords.fill(ResourceNode::NoNode);
+		for (uint32_t dword = 0; dword < descriptor.dword_count && dword < dwords.size(); dword++) {
+			dwords[dword] = compiler.Node(descriptor.dwords[dword]);
+		}
+		if (descriptor.indirect_descriptor.has_value()) {
+			const auto& indirect             = *descriptor.indirect_descriptor;
+			compiled->key_counts[source]     = compiler.Node(indirect.key_count);
+			compiled->selector_masks[source] = compiler.Node(indirect.selector_mask);
+			compiled->selector_firsts[source] = compiler.Node(indirect.selector_first);
+		}
+	}
+	compiled->conditions.reserve(program.control_flow.size());
+	for (const auto& block: program.control_flow) {
+		compiled->conditions.push_back(block.condition.IsEmpty() ? ResourceNode::NoNode
+		                                                         : compiler.Node(block.condition));
+	}
+	for (uint32_t i = 0; i < program.uniform_fill.fill.words && i < compiled->fill.size(); i++) {
+		compiled->fill[i] = compiler.Node(program.uniform_fill.values[i]);
+	}
+	compiled->descriptor_slots.resize(compiled->descriptors.size());
+	for (uint32_t source = 0; source < compiled->descriptors.size(); source++) {
+		for (uint32_t dword = 0; dword < 8u; dword++) {
+			auto&      slot  = compiled->descriptor_slots[source][dword];
+			const auto index = compiled->descriptors[source][dword];
+			slot             = ResourceNode::NoNode;
+			if (index == ResourceNode::NoNode) {
+				continue;
+			}
+			const auto& node = compiled->nodes[index];
+			if (node.op != NodeOp::ReadConst || (node.flags & ResourceNode::CleanSlot) != 0u) {
+				continue;
+			}
+			const auto target = compiled->nodes[node.args[0]].op;
+			if (target == NodeOp::RawAddress || target == NodeOp::RawBuffer) {
+				slot = program.srt_reads[node.aux].flat_offset;
+			}
+		}
+	}
+	AnalyzeControlFlow(program, *compiled);
+	AnalyzeMemo(program, *compiled);
+	BuildFlatRuns(program, *compiled);
+	program.compiled = std::move(compiled);
+	return *program.compiled;
+}
+
+SrtEvaluator::SrtEvaluator(const ResourcePlan& program, const CompiledResourcePlan& compiled,
+                           const SrtRuntime& runtime, bool clean_flat_slots,
+                           SrtEvaluator* clean_evaluator, uint32_t active_mask)
+    : m_program(program), m_compiled(compiled), m_nodes(compiled.nodes.data()),
+      m_runtime(runtime), m_clean_flat_slots(clean_flat_slots),
+      m_clean_evaluator(clean_evaluator), m_active_mask(active_mask),
+      m_context(SrtWalker::AcquireContext(program)) {
+	if (m_context.values.size() < compiled.nodes.size()) {
+		m_context.values.resize(compiled.nodes.size());
+	}
+	m_memo       = m_context.values.data();
+	m_generation = m_context.generation;
+}
+
+SrtEvaluator::~SrtEvaluator() { --m_program.ThreadScratch().evaluation_depth; }
+
+bool SrtEvaluator::Evaluate(uint32_t node, uint32_t& result) {
+	uint64_t wide = 0;
+	if (!EvaluateWide(node, wide)) {
+		return false;
+	}
+	result = static_cast<uint32_t>(wide);
 	return true;
 }
 
-bool WalkedValue(const ResourcePlan& plan, Value value, uint32_t& result) {
-	value = value.Resolve();
-	uint64_t bits = 0;
-	if (value.IsImmediate()) {
-		if (!ImmediateBits(value, bits)) return false;
-		result = static_cast<uint32_t>(bits);
+bool SrtEvaluator::EvaluateWide(uint32_t index, uint64_t& result) {
+	const auto& node = m_nodes[index];
+	if (node.op == NodeOp::Const) {
+		result = node.imm;
 		return true;
 	}
-	const auto* inst = value.TryInstruction();
-	if (inst == nullptr) return false;
-	EXIT_IF(inst->WalkOutput() == UINT32_MAX);
-	std::memcpy(&bits, Scratch(plan) + OutputOffset(plan) + inst->WalkOutput() * 8u, sizeof(bits));
-	result = static_cast<uint32_t>(bits);
-	return bits <= UINT32_MAX;
-}
-
-bool WalkedDescriptor(const ResourcePlan& plan, uint32_t source, DescriptorValue& result) {
-	if (source >= plan.descriptor_sources.size()) return false;
-	std::array<uint32_t, 9> words {};
-	std::memcpy(words.data(), Scratch(plan) + source * DescriptorStride, DescriptorStride);
-	if (words[8] == 0u) return false;
-	result = {};
-	result.dword_count = plan.descriptor_sources[source].dword_count;
-	std::copy_n(words.begin(), result.dword_count, result.dwords.begin());
+	if (node.op == NodeOp::Fail) {
+		return false;
+	}
+	if (m_active_mask != ResourceNode::NoNode && node.op == NodeOp::Select &&
+	    node.args[0] == m_active_mask) {
+		return EvaluateWide(node.args[1], result);
+	}
+	auto& memo = m_memo[index];
+	if (memo.generation == m_generation) {
+		result = memo.value;
+		return true;
+	}
+	// The low generation bit marks an instruction that is still being evaluated.
+	if (memo.generation == (m_generation | 1u)) {
+		return false;
+	}
+	memo.generation = m_generation | 1u;
+	uint64_t out    = 0;
+	if (!EvaluateInst(node, out)) {
+		memo.generation = 0;
+		return false;
+	}
+	memo.value      = out;
+	memo.generation = m_generation;
+	result          = out;
 	return true;
 }
 
-bool WalkedActive(const ResourcePlan& plan, uint32_t source) {
-	return Scratch(plan)[ActiveOffset(plan) + source] != 0u;
+bool SrtEvaluator::EvaluateRawRead(const ResourceNode& node, uint64_t& result) {
+	uint64_t low    = 0;
+	uint64_t high   = 0;
+	uint64_t offset = 0;
+	if (!EvaluateWide(node.args[0], low) || !EvaluateWide(node.args[1], high) ||
+	    !EvaluateWide(node.args[2], offset)) {
+		return false;
+	}
+	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+	const auto immediate = static_cast<int64_t>(node.imm);
+	uint64_t   address   = 0;
+	if (node.op == NodeOp::RawBuffer) {
+		uint64_t records = 0;
+		uint64_t word3   = 0;
+		if (node.args[3] == ResourceNode::NoNode || !EvaluateWide(node.args[3], records) ||
+		    !EvaluateWide(node.args[4], word3)) {
+			return false;
+		}
+		if (immediate < 0) {
+			return false;
+		}
+		const auto byte_offset =
+		    static_cast<uint64_t>(immediate) + static_cast<uint32_t>(offset);
+		const auto aligned = byte_offset & ~uint64_t {3};
+		const auto stride  = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
+		const auto size = stride == 0u
+		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
+		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+		if (aligned > size || size - aligned < sizeof(uint32_t)) {
+			return false;
+		}
+		address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
+	} else {
+		const auto relative = (immediate & ~int64_t {3}) +
+		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
+			return false;
+		}
+	}
+	uint32_t word = 0;
+	if (m_runtime.read_memory != nullptr) {
+		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
+			return false;
+		}
+	} else {
+		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+	}
+	result = word;
+	return true;
 }
 
-bool WalkedImageActive(const ResourcePlan& plan, uint32_t image) {
-	return Scratch(plan)[ActiveOffset(plan) + plan.descriptor_sources.size() + image] != 0u;
+bool SrtEvaluator::EvaluateInst(const ResourceNode& node, uint64_t& result) {
+	uint64_t   a       = 0;
+	uint64_t   b       = 0;
+	uint64_t   c       = 0;
+	const auto unary   = [&]() { return EvaluateWide(node.args[0], a); };
+	const auto binary  = [&]() {
+        return EvaluateWide(node.args[0], a) && EvaluateWide(node.args[1], b);
+	};
+	const auto ternary = [&]() { return binary() && EvaluateWide(node.args[2], c); };
+	const auto f32     = [](uint64_t bits) {
+        return std::bit_cast<float>(static_cast<uint32_t>(bits));
+	};
+	switch (node.op) {
+		case NodeOp::UserData:
+			if (node.aux >= m_runtime.user_data.size()) {
+				return false;
+			}
+			result = m_runtime.user_data[node.aux];
+			return true;
+		case NodeOp::ShaderBase: result = m_runtime.shader_base; return true;
+		case NodeOp::Forward: return EvaluateWide(node.args[0], result);
+		case NodeOp::ReadConst:
+			// After RefreshFlatBuffer the slot's value is in the flat buffer, read as this read
+			// would evaluate it (clean slots by the clean walker).
+			if (m_flat != nullptr && node.aux < m_program.srt_reads.size()) {
+				result = (*m_flat)[m_program.srt_reads[node.aux].flat_offset];
+				return true;
+			}
+			if ((node.flags & ResourceNode::CleanSlot) != 0u && m_clean_flat_slots &&
+			    m_clean_evaluator != nullptr) {
+				return m_clean_evaluator->EvaluateWide(node.args[0], result);
+			}
+			return EvaluateWide(node.args[0], result);
+		case NodeOp::ReadFirstLane: {
+			const auto   clean_runtime = CleanRuntime(m_runtime);
+			SrtEvaluator clean_active(m_program, m_compiled, clean_runtime, false, nullptr,
+			                          node.args[1]);
+			SrtEvaluator active(m_program, m_compiled, m_runtime, m_clean_flat_slots,
+			                    &clean_active, node.args[1]);
+			return active.EvaluateWide(node.args[0], result);
+		}
+		case NodeOp::RawAddress:
+		case NodeOp::RawBuffer: return EvaluateRawRead(node, result);
+		case NodeOp::ExtractU64:
+			if (!unary()) {
+				return false;
+			}
+			result = static_cast<uint32_t>(a >> (node.aux * 32u));
+			return true;
+		case NodeOp::AddCarry: {
+			if (!binary()) {
+				return false;
+			}
+			const auto sum =
+			    static_cast<uint64_t>(static_cast<uint32_t>(a)) + static_cast<uint32_t>(b);
+			result = node.aux == 0u ? static_cast<uint32_t>(sum)
+			                        : static_cast<uint32_t>(sum >> 32u);
+			return true;
+		}
+		case NodeOp::ConstructU64:
+			if (!binary()) {
+				return false;
+			}
+			result = static_cast<uint32_t>(a) |
+			         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
+			return true;
+		case NodeOp::IAdd32:
+			if (!binary()) return false;
+			result = static_cast<uint32_t>(a + b);
+			return true;
+		case NodeOp::IAdd64:
+			if (!binary()) return false;
+			result = a + b;
+			return true;
+		case NodeOp::ISub32:
+			if (!binary()) return false;
+			result = static_cast<uint32_t>(a - b);
+			return true;
+		case NodeOp::ISub64:
+			if (!binary()) return false;
+			result = a - b;
+			return true;
+		case NodeOp::IMul32:
+			if (!binary()) return false;
+			result = static_cast<uint32_t>(a * b);
+			return true;
+		case NodeOp::IMul64:
+			if (!binary()) return false;
+			result = a * b;
+			return true;
+		case NodeOp::UMin32:
+			if (!binary()) return false;
+			result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+			return true;
+		case NodeOp::ConvertF32U32:
+			if (!unary()) return false;
+			result = std::bit_cast<uint32_t>(static_cast<float>(static_cast<uint32_t>(a)));
+			return true;
+		case NodeOp::ConvertU32F32: {
+			if (!unary()) return false;
+			const auto value = f32(a);
+			if (!std::isfinite(value) || value < 0.0f || static_cast<double>(value) > UINT32_MAX) {
+				return false;
+			}
+			result = static_cast<uint32_t>(value);
+			return true;
+		}
+		case NodeOp::ConvertS32F32:
+			if (!unary()) return false;
+			result = static_cast<uint32_t>(SaturateF32ToS32(f32(a)));
+			return true;
+		case NodeOp::FPMul32:
+			if (!binary()) return false;
+			result = std::bit_cast<uint32_t>(f32(a) * f32(b));
+			return true;
+		case NodeOp::FPTrunc32:
+			if (!unary()) return false;
+			result = std::bit_cast<uint32_t>(std::trunc(f32(a)));
+			return true;
+		case NodeOp::FPIsNan32:
+			if (!unary()) return false;
+			result = std::isnan(f32(a));
+			return true;
+		case NodeOp::FPOrdLessThanEqual32:
+			if (!binary()) return false;
+			result = f32(a) <= f32(b);
+			return true;
+		case NodeOp::FPOrdGreaterThanEqual32:
+			if (!binary()) return false;
+			result = f32(a) >= f32(b);
+			return true;
+		case NodeOp::BitwiseAnd32:
+			if (!binary()) return false;
+			result = static_cast<uint32_t>(a & b);
+			return true;
+		case NodeOp::BitwiseAnd64:
+			if (!binary()) return false;
+			result = a & b;
+			return true;
+		case NodeOp::BitwiseOr32:
+			if (!binary()) return false;
+			result = static_cast<uint32_t>(a | b);
+			return true;
+		case NodeOp::BitwiseXor32:
+			if (!binary()) return false;
+			result = static_cast<uint32_t>(a ^ b);
+			return true;
+		case NodeOp::BitwiseNot32:
+			if (!unary()) return false;
+			result = ~static_cast<uint32_t>(a);
+			return true;
+		case NodeOp::ShiftLeftLogical32:
+			if (!binary()) return false;
+			result = static_cast<uint32_t>(a) << (b & 31u);
+			return true;
+		case NodeOp::ShiftLeftLogical64:
+			if (!binary()) return false;
+			result = a << (b & 63u);
+			return true;
+		case NodeOp::ShiftRightLogical32:
+			if (!binary()) return false;
+			result = static_cast<uint32_t>(a) >> (b & 31u);
+			return true;
+		case NodeOp::ShiftRightLogical64:
+			if (!binary()) return false;
+			result = a >> (b & 63u);
+			return true;
+		case NodeOp::ShiftRightArithmetic32:
+			if (!binary()) return false;
+			result = static_cast<uint32_t>(std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >>
+			                               (b & 31u));
+			return true;
+		case NodeOp::ShiftRightArithmetic64:
+			if (!binary()) return false;
+			result = static_cast<uint64_t>(std::bit_cast<int64_t>(a) >> (b & 63u));
+			return true;
+		case NodeOp::BitFieldUExtract: {
+			if (!ternary()) return false;
+			const auto offset = static_cast<uint32_t>(b);
+			const auto width  = static_cast<uint32_t>(c);
+			if (offset > 32u || width > 32u - offset) {
+				return false;
+			}
+			const auto mask = width == 32u  ? UINT32_MAX
+			                  : width == 0u ? 0u
+			                                : (uint32_t {1} << width) - 1u;
+			result = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
+			return true;
+		}
+		case NodeOp::BitFieldSExtract: {
+			if (!ternary()) return false;
+			const auto offset = static_cast<uint32_t>(b);
+			const auto width  = static_cast<uint32_t>(c);
+			if (offset > 32u || width > 32u - offset) {
+				return false;
+			}
+			if (width == 0u) {
+				result = 0;
+				return true;
+			}
+			const auto mask = width == 32u ? UINT32_MAX : (uint32_t {1} << width) - 1u;
+			auto       bits = (static_cast<uint32_t>(a) >> offset) & mask;
+			if (width < 32u && (bits & (uint32_t {1} << (width - 1u))) != 0u) {
+				bits |= ~mask;
+			}
+			result = bits;
+			return true;
+		}
+		case NodeOp::BitFieldInsert: {
+			uint64_t d = 0;
+			if (!ternary() || !EvaluateWide(node.args[3], d)) {
+				return false;
+			}
+			const auto offset = static_cast<uint32_t>(c);
+			const auto width  = static_cast<uint32_t>(d);
+			if (offset > 32u || width > 32u - offset) {
+				return false;
+			}
+			if (width == 0u) {
+				result = static_cast<uint32_t>(a);
+				return true;
+			}
+			const auto mask =
+			    width == 32u ? UINT32_MAX : ((uint32_t {1} << width) - 1u) << offset;
+			result = (static_cast<uint32_t>(a) & ~mask) |
+			         ((static_cast<uint32_t>(b) << offset) & mask);
+			return true;
+		}
+		case NodeOp::Select: {
+			auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+			if (!predicate.EvaluateWide(node.args[0], a)) {
+				return false;
+			}
+			return EvaluateWide(node.args[a != 0u ? 1u : 2u], result);
+		}
+		case NodeOp::IEqual32:
+			if (!binary()) return false;
+			result = static_cast<uint32_t>(a) == static_cast<uint32_t>(b);
+			return true;
+		case NodeOp::INotEqual32:
+			if (!binary()) return false;
+			result = static_cast<uint32_t>(a) != static_cast<uint32_t>(b);
+			return true;
+		case NodeOp::ULessThan32:
+			if (!binary()) return false;
+			result = static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
+			return true;
+		case NodeOp::ULessThanEqual32:
+			if (!binary()) return false;
+			result = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);
+			return true;
+		case NodeOp::UGreaterThan32:
+			if (!binary()) return false;
+			result = static_cast<uint32_t>(a) > static_cast<uint32_t>(b);
+			return true;
+		case NodeOp::SGreaterThanEqual32:
+			if (!binary()) return false;
+			result = std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >=
+			         std::bit_cast<int32_t>(static_cast<uint32_t>(b));
+			return true;
+		case NodeOp::LogicalAnd:
+			if (!binary()) return false;
+			result = (a != 0u) && (b != 0u);
+			return true;
+		case NodeOp::LogicalOr:
+			if (!binary()) return false;
+			result = (a != 0u) || (b != 0u);
+			return true;
+		case NodeOp::LogicalXor:
+			if (!binary()) return false;
+			result = (a != 0u) != (b != 0u);
+			return true;
+		case NodeOp::LogicalNot:
+			if (!unary()) return false;
+			result = a == 0u;
+			return true;
+		case NodeOp::Fail:
+		case NodeOp::Const: break;
+	}
+	return false;
+}
+
+bool SrtEvaluator::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
+	if (source >= m_program.descriptor_sources.size()) {
+		return false;
+	}
+	const auto& dwords = m_compiled.descriptors[source];
+	const auto& slots  = m_compiled.descriptor_slots[source];
+	result             = {};
+	result.dword_count = m_program.descriptor_sources[source].dword_count;
+	for (uint32_t index = 0; index < result.dword_count; ++index) {
+		// A dword that is exactly a slot this walker refreshed evaluates to its flat value.
+		if (m_flat != nullptr && slots[index] != ResourceNode::NoNode) {
+			result.dwords[index] = (*m_flat)[slots[index]];
+		} else if (!Evaluate(dwords[index], result.dwords[index])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+std::span<const uint8_t> SrtEvaluator::FindActiveSources() {
+	if (m_program.control_flow.empty()) {
+		return {};
+	}
+	auto&      active    = m_program.ThreadScratch().active_sources;
+	auto&      strict    = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+	const bool evaluates = m_runtime.read_specialization_memory != nullptr;
+	const auto outcome   = [&](uint32_t index) -> uint8_t {
+		uint32_t condition = 0;
+		auto&    evaluator = m_compiled.direct_conditions[index] != 0u ? *this : strict;
+		if (!evaluator.Evaluate(m_compiled.conditions[index], condition)) {
+			return 2u;
+		}
+		return condition != 0u ? 1u : 0u;
+	};
+	// The walk below depends on the plan only through the outcomes of the conditions it
+	// evaluates, in an order those outcomes fix. Follow the tree of earlier walks (see
+	// ResourcePlan::ActiveTreeNode) with this refresh's outcomes; reaching a leaf means the walk
+	// would visit the same blocks and find the same sources.
+	using TreeNode = ResourcePlan::ActiveTreeNode;
+	auto& tree     = m_program.ThreadScratch().active_tree;
+	auto& trace    = m_program.ThreadScratch().active_trace;
+	if (evaluates && !tree.empty()) {
+		uint32_t node = 0;
+		while (node != TreeNode::None && tree[node].block != TreeNode::None) {
+			node = tree[node].next[outcome(tree[node].block)];
+		}
+		if (node != TreeNode::None && tree[node].sources != TreeNode::None) {
+			const auto first = m_program.ThreadScratch().active_tree_sources.begin() + tree[node].sources;
+			const auto count = static_cast<ptrdiff_t>(m_program.descriptor_sources.size());
+			active.assign(first, first + count);
+			return active;
+		}
+	}
+	trace.clear();
+	if (!m_compiled.initial_active.empty()) {
+		active.assign(m_compiled.initial_active.begin(), m_compiled.initial_active.end());
+	} else {
+		active.assign(m_program.descriptor_sources.size(), 1u);
+		for (const auto& block: m_program.control_flow) {
+			for (const auto source: block.sources) {
+				active.at(source) = 0u;
+			}
+		}
+	}
+	auto&      visited     = m_program.ThreadScratch().visited_blocks;
+	auto&      pending     = m_program.ThreadScratch().pending_blocks;
+	const auto block_count = m_program.control_flow.size();
+	// Most plans have at most 64 blocks; track those in a mask instead of clearing a vector.
+	const bool small       = block_count <= 64u;
+	uint64_t   visited_mask = 0;
+	if (!small) {
+		visited.assign(block_count, 0u);
+	}
+	pending.clear();
+	pending.push_back(0u);
+	while (!pending.empty()) {
+		const auto index = pending.back();
+		pending.pop_back();
+		EXIT_IF(index >= block_count);
+		if (small) {
+			const auto bit = uint64_t {1} << index;
+			if ((visited_mask & bit) != 0u) {
+				continue;
+			}
+			visited_mask |= bit;
+		} else {
+			if (visited[index]) {
+				continue;
+			}
+			visited[index] = 1u;
+		}
+		const auto& block = m_program.control_flow[index];
+		for (const auto source: block.sources) {
+			active[source] = 1u;
+		}
+		// Nothing reachable from here adds a source: skip the condition and its strict reads.
+		if (!m_compiled.inert_successors.empty() && m_compiled.inert_successors[index] != 0u) {
+			continue;
+		}
+		const auto condition_node = m_compiled.conditions[index];
+		const auto result =
+		    condition_node != ResourceNode::NoNode && evaluates ? outcome(index) : uint8_t {2};
+		if (condition_node != ResourceNode::NoNode && evaluates) {
+			trace.push_back({index, result});
+		}
+		if (result != 2u) {
+			pending.push_back(block.successors[result != 0u ? 0u : 1u]);
+		} else {
+			pending.insert(pending.end(), block.successors.begin(), block.successors.end());
+		}
+	}
+	// Add this walk to the tree, up to a bound on its size.
+	constexpr size_t MaxTreeNodes = 4096;
+	auto&            sources      = m_program.ThreadScratch().active_tree_sources;
+	if (evaluates && active.size() == m_program.descriptor_sources.size() &&
+	    tree.size() + trace.size() + 1u <= MaxTreeNodes) {
+		if (tree.empty()) {
+			tree.emplace_back();
+		}
+		uint32_t node = 0;
+		bool     fits = true;
+		for (const auto& step: trace) {
+			// Earlier walks with the same outcomes so far evaluated the same condition here.
+			if (tree[node].block == TreeNode::None && tree[node].sources == TreeNode::None) {
+				tree[node].block = step.block;
+			} else if (tree[node].block != step.block) {
+				fits = false;
+				break;
+			}
+			auto next = tree[node].next[step.outcome];
+			if (next == TreeNode::None) {
+				next                          = static_cast<uint32_t>(tree.size());
+				tree[node].next[step.outcome] = next;
+				tree.emplace_back();
+			}
+			node = next;
+		}
+		fits = fits && tree[node].block == TreeNode::None;
+		if (fits && tree[node].sources == TreeNode::None) {
+			tree[node].sources = static_cast<uint32_t>(sources.size());
+			sources.insert(sources.end(), active.begin(), active.end());
+		} else if (!fits) {
+			// Not expected: the walk order is a function of the outcomes. Start over.
+			tree.clear();
+			sources.clear();
+		}
+	}
+	return active;
+}
+
+// A failed refresh falls back to the reference walker (KYTY_DEBUG_SRT_FAIL=1 reports the first 32, or
+// KYTY_DEBUG_SRT_FAIL_MAX of them: the SRT read slot and the IR opcode its value comes from).
+static bool ReportSrtRefreshFailure(const ResourcePlan& program, const char* reason, uint32_t slot) {
+	static const bool     enabled = KYTY_GETENV("KYTY_DEBUG_SRT_FAIL") != nullptr;
+	static const uint32_t limit   = [] {
+		const char* text = KYTY_GETENV("KYTY_DEBUG_SRT_FAIL_MAX");
+		return text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 32u;
+	}();
+	static std::atomic<uint32_t> reported {0};
+	if (enabled && reported.fetch_add(1, std::memory_order_relaxed) < limit) {
+		// The IR behind srt_reads is discarded after compilation: report the read's flat offset
+		// and guest pc only.
+		const auto offset = slot < program.srt_reads.size() ? program.srt_reads[slot].flat_offset : 0u;
+		std::printf("srt-refresh-failed: shader=0x%016llx %s slot=%u/%zu flat_offset=%u\n",
+		            static_cast<unsigned long long>(program.shader_hash), reason, slot,
+		            program.srt_reads.size(), offset);
+		std::fflush(stdout);
+	}
+	return false;
+}
+
+void SrtEvaluator::DescribeFailure(uint32_t index, uint32_t depth) {
+	if (index == ResourceNode::NoNode || depth > 48u) {
+		std::printf("srt-fail-node: depth=%u no node\n", depth);
+		return;
+	}
+	const auto& node = m_nodes[index];
+	std::array<uint64_t, 5> values {};
+	for (size_t arg = 0; arg < node.args.size(); arg++) {
+		if (node.args[arg] == ResourceNode::NoNode) {
+			continue;
+		}
+		if (!EvaluateWide(node.args[arg], values[arg])) {
+			DescribeFailure(node.args[arg], depth + 1u);
+			return;
+		}
+	}
+	std::printf("srt-fail-node: depth=%u op=%u aux=%u imm=0x%llx args=0x%llx,0x%llx,0x%llx,0x%llx,0x%llx\n",
+	            depth, static_cast<uint32_t>(node.op), node.aux,
+	            static_cast<unsigned long long>(node.imm),
+	            static_cast<unsigned long long>(values[0]), static_cast<unsigned long long>(values[1]),
+	            static_cast<unsigned long long>(values[2]), static_cast<unsigned long long>(values[3]),
+	            static_cast<unsigned long long>(values[4]));
+	std::fflush(stdout);
+}
+
+bool SrtEvaluator::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
+	if (!m_program.srt_plan_complete) {
+		return ReportSrtRefreshFailure(m_program, "plan incomplete", 0);
+	}
+	flat.resize(m_program.srt_reads.size());
+	// Run slots are ordinary: this walker evaluates them. A run that cannot be read whole
+	// evaluates its slots one by one, and fails exactly as that would.
+	const bool runs = !m_compiled.flat_runs.empty() && m_active_mask == ResourceNode::NoNode;
+	for (uint32_t run = 0; runs && run < m_compiled.flat_runs.size(); run++) {
+		const auto& info = m_compiled.flat_runs[run];
+		if (ReadFlatRun(info, flat)) {
+			continue;
+		}
+		for (uint32_t index = 0; index < info.count; index++) {
+			const auto slot = m_compiled.run_entries[info.first + index].slot;
+			if (!Evaluate(m_compiled.slots[slot], flat[m_program.srt_reads[slot].flat_offset])) {
+				static std::atomic<uint32_t> described {0};
+				if (KYTY_GETENV("KYTY_DEBUG_SRT_FAIL") != nullptr &&
+				    described.fetch_add(1, std::memory_order_relaxed) < 4u) {
+					DescribeFailure(m_compiled.slots[slot], 0);
+				}
+				return ReportSrtRefreshFailure(m_program, "run slot unreadable", slot);
+			}
+		}
+	}
+	for (uint32_t slot = 0; slot < m_program.srt_reads.size(); slot++) {
+		if (runs && m_compiled.in_run[slot] != 0u) {
+			continue;
+		}
+		const auto offset = m_program.srt_reads[slot].flat_offset;
+		const bool clean  = m_clean_flat_slots && offset < m_compiled.clean_slots.size() &&
+		                   m_compiled.clean_slots[offset] != 0u;
+		if (clean &&
+		    (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
+			return ReportSrtRefreshFailure(m_program, "no clean reader", slot);
+		}
+		auto& evaluator = clean ? *m_clean_evaluator : *this;
+		if (offset >= flat.size() || !evaluator.Evaluate(m_compiled.slots[slot], flat[offset])) {
+			static std::atomic<uint32_t> described {0};
+			if (KYTY_GETENV("KYTY_DEBUG_SRT_FAIL") != nullptr &&
+			    described.fetch_add(1, std::memory_order_relaxed) < 6u) {
+				evaluator.DescribeFailure(m_compiled.slots[slot], 0);
+			}
+			return ReportSrtRefreshFailure(m_program, clean ? "clean slot unreadable" : "slot unreadable",
+			                               slot);
+		}
+	}
+	// Only this walker's own contexts use the shortcut; nested EXEC walkers evaluate normally.
+	if (m_active_mask == ResourceNode::NoNode) {
+		m_flat = &flat;
+	}
+	return true;
+}
+
+bool SrtEvaluator::ReadFlatRun(const CompiledResourcePlan::FlatRun& run,
+                               std::vector<uint32_t>& flat) {
+	const auto* entries = m_compiled.run_entries.data() + run.first;
+	const auto& node    = m_nodes[m_compiled.slots[entries[0].slot]];
+	uint64_t    low     = 0;
+	uint64_t    high    = 0;
+	uint64_t    offset  = 0;
+	if (!EvaluateWide(node.args[0], low) || !EvaluateWide(node.args[1], high) ||
+	    !EvaluateWide(node.args[2], offset)) {
+		return false;
+	}
+	// As EvaluateRawRead computes each dword's address; the immediates are dword multiples.
+	const auto base     = (((high << 32u) | static_cast<uint32_t>(low)) & AddressMask) & ~uint64_t {3};
+	const auto relative = static_cast<int64_t>(node.imm) +
+	                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+	const auto span     = static_cast<int64_t>(run.dwords - 1u) * 4;
+	uint64_t   first    = 0;
+	uint64_t   last     = 0;
+	if (!AddSignedAddress(base, relative, first) || !AddSignedAddress(base, relative + span, last) ||
+	    last - first != static_cast<uint64_t>(span)) {
+		return false;
+	}
+	// One read per 64-byte block, as dword reads through a block cache would see memory.
+	std::array<uint32_t, CompiledResourcePlan::MaxRunDwords> words;
+	for (uint32_t done = 0; done < run.dwords;) {
+		const auto address = first + uint64_t {done} * 4u;
+		const auto count   = std::min<uint64_t>(run.dwords - done, (64u - (address & 63u)) / 4u);
+		const auto values  = std::span(words.data() + done, count);
+		if (m_runtime.read_memory != nullptr) {
+			if (!m_runtime.read_memory(m_runtime.userdata, address, values)) {
+				return false;
+			}
+		} else {
+			std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+		}
+		done += static_cast<uint32_t>(count);
+	}
+	// Later ReadConsts of these slots read the flat buffer (see EvaluateInst), so the slot nodes'
+	// memos are left alone.
+	for (uint32_t index = 0; index < run.count; index++) {
+		flat[entries[index].flat_offset] = words[entries[index].dword];
+	}
+	return true;
 }
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
 	return RuntimeValidator(program, type).Run(value);
 }
 
-bool ValidateWaveUniformValue(const ResourcePlan& program, Value value) {
-	return RuntimeValidator(program, RuntimeValueType::Any, true).Run(value);
+bool ValidateRuntimeValueTraced(const ResourcePlan& program, Value value, RuntimeValueType type) {
+	t_validator_trace = true;
+	const bool valid  = RuntimeValidator(program, type).Run(value);
+	t_validator_trace = false;
+	return valid;
 }
 
-uint32_t SrtWalkerLoadLength(uint64_t rip) {
-	if (t_running_walker == nullptr ||
-	    rip - reinterpret_cast<uint64_t>(t_running_walker->getCode()) >= t_running_walker->getSize())
-		return 0;
-	const auto* code = reinterpret_cast<const uint8_t*>(rip);
-	return code[0] == 0x41u && code[1] == 0x8bu && code[2] == 0x02u ? 3 : 0;
-}
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

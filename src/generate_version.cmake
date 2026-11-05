@@ -38,4 +38,36 @@ if(GIT_EXECUTABLE)
 		endif()
 	endif()
 endif()
+
+# Recorded shaders and driver pipelines depend only on the recompiler and pipeline code. Hashing
+# those sources (including uncommitted edits) keeps a title's caches valid across unrelated
+# commits, and invalidates them for any change that can alter compilation or journal records.
+set(KYTY_SHADER_CACHE_KEY "unknown")
+if(SOURCE_DIRECTORY)
+	set(shader_cache_files)
+	foreach(directory graphics/shader graphics/host_gpu/renderer/pipeline)
+		file(GLOB_RECURSE directory_files LIST_DIRECTORIES false
+			"${SOURCE_DIRECTORY}/${directory}/*")
+		list(APPEND shader_cache_files ${directory_files})
+	endforeach()
+	list(SORT shader_cache_files)
+	set(shader_cache_digest "")
+	foreach(source_file ${shader_cache_files})
+		file(SHA256 "${source_file}" source_hash)
+		file(RELATIVE_PATH source_name "${SOURCE_DIRECTORY}" "${source_file}")
+		string(APPEND shader_cache_digest "${source_name}:${source_hash}\n")
+	endforeach()
+	if(shader_cache_files)
+		string(SHA256 KYTY_SHADER_CACHE_KEY "${shader_cache_digest}")
+	endif()
+endif()
+# The configure option KYTY_SHADER_CACHE_KEY (passed here as KYTY_SHADER_CACHE_KEY_PINNED) replaces
+# the computed key, so a build whose hashed sources changed only outside code generation (pipeline
+# management, threading) keeps another build's driver cache and shader journal. Only valid when no
+# change can alter the generated SPIR-V or journal records.
+if(KYTY_SHADER_CACHE_KEY_PINNED)
+	message(STATUS "Shader cache key: ${KYTY_SHADER_CACHE_KEY_PINNED} (pinned; computed ${KYTY_SHADER_CACHE_KEY})")
+	set(KYTY_SHADER_CACHE_KEY "${KYTY_SHADER_CACHE_KEY_PINNED}")
+endif()
+
 configure_file("${INPUT_FILE}" "${OUTPUT_FILE}")

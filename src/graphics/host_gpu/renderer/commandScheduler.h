@@ -3,13 +3,19 @@
 
 #include "common/common.h"
 #include "common/uniqueFunction.h"
-#include "graphics/host_gpu/renderer/dynamicState.h"
+#include "graphics/host_gpu/renderer/commandHooks.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 #include "graphics/host_gpu/renderer/render.h"
 
+#include <array>
+#include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
+
 #include <queue>
+
 #include <thread>
 #include <vector>
 
@@ -22,9 +28,11 @@ public:
 	KYTY_CLASS_NO_COPY(CommandScheduler);
 
 	void           Begin(HW::Context& registers, HW::UserConfig& user_config, HW::Shader& shaders);
-	void           EndRendering() { m_command.EndRendering(); }
+	void           BeginRendering(const RenderState& state);
+	void           EndRendering();
 	void           Flush();
 	void           Flush(SubmitInfo& submit);
+	void           FlushAndWait();
 	void           Finish();
 	CommandBuffer& BeginCommand();
 	uint64_t       Submit(SubmitInfo submit = {});
@@ -32,22 +40,39 @@ public:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
-	void                      PopPendingOperations();
+	// Runs the deferred operations of completed ticks. `wait_for_priority` = false (draw and
+	// dispatch entry) leaves an operation queued until the priority thread has run the priority
+	// operations of its tick, instead of waiting for it.
+	void                      PopPendingOperations(bool wait_for_priority = true);
 	void                      DrainPriorityOperations();
 	void                      WaitPriorityOperations(uint64_t tick);
+	// Whether `tick` completed and every priority operation deferred up to it has run.
+	[[nodiscard]] bool        IsPublished(uint64_t tick);
 	// Guest-memory completions use the priority queue; normal callbacks maintain GPU resources.
 	void                      DeferOperation(Common::UniqueFunction<void>&& operation);
 	void                      DeferPriorityOperation(Common::UniqueFunction<void>&& operation);
 	[[nodiscard]] bool        HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
+	// Hands later submissions to a dedicated queue thread, which submits them in tick order.
+	// Submit() then returns once the tick is allocated. Host waits on the timeline stay valid
+	// before the submission happens. Enable before the first Submit().
+	void EnableAsyncSubmit();
+	// Runs at the start of every Submit, while the buffer is still open: the buffer cache records
+	// the uploads it batched there (see BufferCache::FlushUploadBatch). One slot: the render
+	// context's buffer cache.
+	void SetPreSubmitHook(void (*hook)(void*), void* context) noexcept {
+		m_pre_submit         = hook;
+		m_pre_submit_context = context;
+	}
 
 	[[nodiscard]] bool Active() const noexcept { return m_command.m_registers != nullptr; }
 	void                           CheckActive() const;
 	CommandBuffer&                 Current();
 	[[nodiscard]] uint64_t         CurrentTick() const noexcept { return m_master.CurrentTick(); }
 	[[nodiscard]] bool             IsFree(uint64_t tick);
+	// Microseconds since this scheduler last submitted (recording thread only).
+	[[nodiscard]] uint64_t         MicrosSinceSubmit() const noexcept;
 	[[nodiscard]] MasterSemaphore& GetMasterSemaphore() noexcept { return m_master; }
-	[[nodiscard]] DynamicState&    GetDynamicState() noexcept { return m_dynamic_state; }
 	[[nodiscard]] RenderContext&   Context() const noexcept { return m_context; }
 	[[nodiscard]] GraphicContext&  Graphics() const noexcept { return m_graphics; }
 
@@ -80,24 +105,105 @@ private:
 		uint64_t                     tick = 0;
 	};
 
+	// A finished command buffer and everything its vkQueueSubmit needs, including the debug
+	// state for fatal reports and the drain-stats attribution of the submitting thread.
+	struct SubmitJob {
+		vk::CommandBuffer buffer = nullptr;
+		SubmitInfo        submit;
+		uint64_t          tick         = 0;
+		uint32_t          debug_op     = 0;
+		uint64_t          debug_submit = 0;
+		uint32_t          debug_arg0   = 0;
+		uint32_t          debug_arg1   = 0;
+		uint32_t          debug_arg2   = 0;
+		uint32_t          debug_arg3   = 0;
+		uint64_t          debug_arg4   = 0;
+		uint8_t           reason       = 0;
+		uint32_t          pm4_op       = 0;
+	};
+
 	void BeginNext();
 	void PriorityOperationsThread(std::stop_token stop);
+	void SubmitThread(std::stop_token stop);
+	void QueueSubmit(SubmitJob& job);
+	void StopSubmitThread();
 	void QueueOperation(Common::UniqueFunction<void>&& operation, bool priority);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
 	GraphicContext&              m_graphics;
+	void (*m_pre_submit)(void*)  = nullptr;
+	void*                        m_pre_submit_context = nullptr;
 	CommandPool                  m_command_pool;
 	CommandBuffer                m_command;
-	DynamicState                 m_dynamic_state;
 	std::queue<PendingOperation> m_pending_operations;
 	std::queue<PendingOperation> m_priority_operations;
 	std::mutex                   m_operation_mutex;
 	std::condition_variable      m_operation_available;
 	std::jthread                 m_priority_thread;
-	uint64_t                     m_priority_active_tick = 0; // 0 while none runs
+	bool                         m_priority_active      = false;
+	uint64_t                     m_priority_active_tick = 0;
 	OperationState               m_operation_state      = OperationState::Open;
+	// Asynchronous submission; jobs are queued in tick order by the recording thread.
+	std::mutex                   m_submit_mutex;
+	std::condition_variable_any  m_submit_available;
+	std::deque<SubmitJob>        m_submit_jobs;
+	std::jthread                 m_submit_thread;
+	// Deferred recording: the GPU thread's commands and submits, recorded and submitted in
+	// order by the submit thread (see CommandStream).
+	std::unique_ptr<CommandStream> m_stream;
+	bool                         m_async_submit = false;
+	// --drain-stats on the render scheduler: GPU execution time from timestamps written at the
+	// start and end of each command buffer, read back once its tick completes.
+	static constexpr uint32_t TimestampSlots = 4096;
+	void                      WriteStartTimestamp();
+	void                      WriteEndTimestamp();
+	void                      ReadTimestamps(uint32_t slot);
+	vk::QueryPool             m_timestamp_pool = nullptr;
+	uint32_t                  m_timestamp_next = 0;
+	uint32_t                  m_timestamp_slot = UINT32_MAX; // Slot of the recording buffer.
+	uint64_t                  m_gpu_last_end   = 0;          // Latest end seen, in ticks.
+	// KYTY_DEBUG_GPU_TIMELINE: when the GPU thread handed each slot's buffer over (0: outside the
+	// window), printed with the buffer's GPU interval (see DrainStats::TimelineActive).
+	std::vector<uint64_t>     m_timeline_handover = std::vector<uint64_t>(TimestampSlots);
+	// The PM4 packet (DrainStats::Pm4Op) and drain reason that closed each slot's buffer.
+	std::vector<uint32_t>     m_timeline_cause    = std::vector<uint32_t>(TimestampSlots);
+	uint64_t                  m_timeline_cb       = 0; // Handover of the buffer read last (zones).
+	// KYTY_GPU_ZONES=1 with --drain-stats: a timestamp at each change of zone (gpuZones.h) in
+	// the recording buffer. Each buffer takes one chunk of the pool, reset when it begins, and
+	// its intervals are read once its tick completes.
+	static constexpr uint32_t ZoneChunkQueries = 4096;
+	static constexpr uint32_t ZoneChunks       = 64;
+	struct ZoneMark {
+		DrainStats::Zone zone;
+		uint64_t         key;
+		uint64_t         pixels; // Render area of the interval's first draw.
+	};
+	static void MarkZoneThunk(void* context, vk::CommandBuffer buffer, DrainStats::Zone zone,
+	                          uint64_t key, uint64_t pixels);
+	// KYTY_DEBUG_GPU_CHECKPOINTS: each mark on the recording buffer sets a checkpoint instead.
+	static void CheckpointThunk(void* context, vk::CommandBuffer buffer, DrainStats::Zone zone,
+	                            uint64_t key, uint64_t pixels);
+	// KYTY_DEBUG_OP_RING: each mark goes into the host-side ring only (see GpuZones).
+	static void OpRingThunk(void* context, vk::CommandBuffer buffer, DrainStats::Zone zone,
+	                        uint64_t key, uint64_t pixels);
+	void        BeginZones();
+	void        MarkZone(DrainStats::Zone zone, uint64_t key, uint64_t pixels = 0);
+	void        EndZones();
+	void        ReadZones(uint32_t chunk, const std::vector<ZoneMark>& marks);
+	bool                  m_zones           = false;
+	vk::QueryPool         m_zone_pool       = nullptr;
+	uint32_t              m_zone_next_chunk = 0;
+	uint32_t              m_zone_chunk      = UINT32_MAX; // Chunk of the recording buffer.
+	// The tick of the submission that last wrote each chunk: a chunk is reset for reuse only once
+	// that submission has completed (resetting queries a running buffer still writes lost the
+	// device in Ghost of Yotei at ~7000 submits per 10 s, which cycles the 64 chunks in ~100 ms).
+	std::array<uint64_t, ZoneChunks> m_zone_chunk_ticks {};
+	std::vector<ZoneMark> m_zone_marks;
+	std::chrono::steady_clock::time_point m_last_submit {};
+	std::chrono::steady_clock::time_point m_last_pending_refresh {}; // See PopPendingOperations.
+	uint32_t                              m_pending_calls = 0;     // See PopPendingOperations.
 };
 
 } // namespace Libs::Graphics

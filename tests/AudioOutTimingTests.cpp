@@ -7,8 +7,6 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <limits>
 #include <memory>
 #include <vector>
 
@@ -24,7 +22,6 @@ struct Stream {
 	SDL_AudioSpec spec;
 	uint64_t      frames = 0; // Millionths of a frame retain exact simulated consumption.
 	uint64_t      updated;
-	std::vector<uint8_t> pcm;
 };
 
 uint64_t                             now       = 1000000;
@@ -34,8 +31,8 @@ std::vector<std::unique_ptr<Stream>> streams;
 bool                                 fail_open = false, fail_put = false, stalled = false;
 bool                                 pad_connected = false, pad_bluetooth = false;
 uint64_t                             pad_queue_us = 0;
-const float*                         queued_pad_gains = nullptr;
 int                                  clears = 0;
+float                                last_put_sample = 0.0f; // First sample of the last queued block.
 
 Stream& GetStream(SDL_AudioStream* stream) {
 	return *reinterpret_cast<Stream*>(stream);
@@ -65,7 +62,7 @@ SDL_AudioStream* OpenAudioDeviceStream(SDL_AudioDeviceID, const SDL_AudioSpec* s
 		return nullptr;
 	}
 
-	streams.push_back(std::make_unique<Stream>(Stream {*spec, 0, now, {}}));
+	streams.push_back(std::make_unique<Stream>(Stream {*spec, 0, now}));
 	return reinterpret_cast<SDL_AudioStream*>(streams.back().get());
 }
 
@@ -89,9 +86,10 @@ bool PutAudioStreamData(SDL_AudioStream* stream, const void* data, int bytes) {
 	if (fail_put) {
 		return false;
 	}
+	if (data != nullptr && bytes >= static_cast<int>(sizeof(float))) {
+		last_put_sample = *static_cast<const float*>(data);
+	}
 	auto& state = GetStream(stream);
-	const auto* pcm = static_cast<const uint8_t*>(data);
-	state.pcm.assign(pcm, pcm + bytes);
 	Drain(state);
 	state.frames += static_cast<uint64_t>(bytes) * 1000000 /
 	                (SDL_AUDIO_BYTESIZE(state.spec.format) * state.spec.channels);
@@ -107,13 +105,15 @@ bool ClearAudioStream(SDL_AudioStream* stream) {
 }
 } // namespace Fake
 
-namespace Common::TimingThread {
-using namespace Thread;
-inline void SleepMicro(uint32_t micros) {
-	sleeps.push_back(micros);
-	now += micros + oversleep;
-}
-} // namespace Common::TimingThread
+namespace Common {
+class TimingThread: public Thread {
+public:
+	static void SleepMicro(uint32_t micros) {
+		sleeps.push_back(micros);
+		now += micros + oversleep;
+	}
+};
+} // namespace Common
 
 #define Thread                      TimingThread
 #define SDL_InitSubSystem           Fake::InitSubSystem
@@ -152,8 +152,7 @@ void     Close(Stream*) {}
 bool UsesBluetooth(const Stream* stream) {
 	return stream != nullptr && pad_bluetooth;
 }
-uint64_t Queue(Stream* stream, int, const void*, uint32_t, uint32_t, bool, const int*, float, const float* gains) {
-	queued_pad_gains = gains;
+uint64_t Queue(Stream* stream, int, const void*, uint32_t, uint32_t, bool, const int*, float) {
 	return stream != nullptr ? pad_queue_us : 0;
 }
 } // namespace DualSenseHaptics
@@ -186,7 +185,6 @@ struct Fixture {
 		fail_open = fail_put = stalled = false;
 		pad_connected = pad_bluetooth = false;
 		pad_queue_us = 0;
-		queued_pad_gains = nullptr;
 		sleeps.clear();
 	}
 
@@ -374,6 +372,46 @@ void TestControllerSpeakerPacing() {
 	      "stalled USB speaker waited longer than one audio block");
 }
 
+void TestMixGains() {
+	namespace Mix = Libs::Audio::Mix;
+	Fixture f;
+	f.pcm.fill(0.5f);
+
+	// Unity settings leave every port's samples alone.
+	const auto main  = f.Open(256, Mix::PORT_TYPE_MAIN);
+	const auto bgm   = f.Open(256, Mix::PORT_TYPE_BGM);
+	const auto pad   = f.Open(256, Mix::PORT_TYPE_PADSPK);
+	const auto voice = f.Open(256, Mix::PORT_TYPE_VOICE);
+	for (const auto port: {main, bgm, pad, voice}) {
+		last_put_sample = 0.0f;
+		f.Output(port, false);
+		Check(last_put_sample == 0.5f, "unity mix changed the samples");
+	}
+
+	Mix::Settings settings;
+	settings.master      = 50;
+	settings.main        = 100;
+	settings.music       = 200;
+	settings.pad_on_main = 25;
+	f.audio.SetMixSettings(settings);
+	const auto played = [&f](Audio::Id port) {
+		last_put_sample = -1.0f;
+		f.Output(port, false);
+		return last_put_sample;
+	};
+	Check(played(main) == 0.25f, "main port did not get master x main gain");
+	Check(played(voice) == 0.25f, "voice port is not in the main category");
+	Check(played(bgm) == 0.5f, "BGM port did not get master x music gain");
+	Check(played(pad) == 0.0625f, "pad speaker on the main output did not get its gain");
+
+	// A DualSense that takes the pad speaker gets the samples instead; the main output gets none.
+	f.audio.AudioOutClose(pad);
+	pad_connected       = true;
+	pad_queue_us        = 1000;
+	const auto pad_ds   = f.Open(256, Mix::PORT_TYPE_PADSPK);
+	Check(played(pad_ds) == -1.0f, "pad speaker played on the main output with a DualSense");
+}
+
 void TestInvalidBatchSize() {
 	Libs::Audio::AudioOut::AudioOutOutputParam param {};
 	for (const auto count: {0u, 33u}) {
@@ -392,68 +430,6 @@ void TestZeroOutputFrequency() {
 	      "internal output open accepted zero frequency");
 	Check(f.Open().ToInt() == 1, "rejected output port occupied a handle");
 }
-
-template <typename T>
-void CheckOutputSamples(std::initializer_list<T> expected, const char* message) {
-	const auto& pcm = streams.back()->pcm;
-	Check(pcm.size() == expected.size() * sizeof(T) &&
-	          std::memcmp(pcm.data(), expected.begin(), pcm.size()) == 0, message);
-}
-
-void TestChannelGains() {
-	Fixture f;
-	const std::array pcm {0.25f, -0.5f, 0.75f, -1.0f};
-	const auto stereo = f.audio.AudioOutOpen(0, 2, 48000, Audio::Format::FloatStereo);
-	std::array gains {2.0f, 0.5f};
-	Audio::OutputParam output {stereo, pcm.data(), gains.data()};
-	for (int push = 0; push < 2; push++) {
-		f.audio.AudioOutOutputs(&output, 1, false);
-		CheckOutputSamples({0.5f, -0.25f, 1.5f, -0.5f}, "float channel gains were not applied independently");
-	}
-	const int volume[] {16384, 32768};
-	f.audio.AudioOutSetVolume(stereo, 3, volume);
-	f.audio.AudioOutOutputs(&output, 1, false);
-	CheckOutputSamples({0.25f, -0.25f, 0.75f, -0.5f}, "channel gain did not combine with port volume");
-	gains = {0.0f, 0.0f};
-	f.audio.AudioOutOutputs(&output, 1, false);
-	CheckOutputSamples({0.0f, -0.0f, 0.0f, -0.0f}, "zero channel gains did not mute");
-	output.gains = nullptr;
-	f.audio.AudioOutOutputs(&output, 1, false);
-	CheckOutputSamples({0.125f, -0.5f, 0.375f, -1.0f}, "channel scaling changed original float PCM");
-
-	const std::array<int16_t, 2> integer_pcm {20000, -20000};
-	const auto integer = f.audio.AudioOutOpen(0, 1, 48000, Audio::Format::Signed16bitStereo);
-	output = {integer, integer_pcm.data(), gains.data()};
-	for (const auto gain: {2.0f, std::numeric_limits<float>::max()}) {
-		gains = {gain, gain};
-		f.audio.AudioOutOutputs(&output, 1, false);
-		CheckOutputSamples<int16_t>({32767, -32768}, "integer gain overflowed instead of saturating");
-	}
-	gains = {0.5f, 0.25f};
-	f.audio.AudioOutOutputs(&output, 1, false);
-	CheckOutputSamples<int16_t>({10000, -5000}, "integer channel gains changed original PCM");
-
-	const std::array surround_pcm {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f};
-	for (const auto format: {Audio::Format::Float8Ch, Audio::Format::Float12Ch}) {
-		const auto surround = f.audio.AudioOutOpen(0, 1, 48000, format);
-		output = {surround, surround_pcm.data(), surround_pcm.data()};
-		f.audio.AudioOutOutputs(&output, 1, false);
-		if (format == Audio::Format::Float8Ch) {
-			CheckOutputSamples({1.0f, 4.0f, 9.0f, 16.0f, 49.0f, 64.0f, 25.0f, 36.0f},
-			                   "channel reordering used destination channel gains");
-		} else {
-			CheckOutputSamples({82.0f, 104.0f, 9.0f, 16.0f, 170.0f, 208.0f, 25.0f, 36.0f},
-			                   "height downmix lost per-channel gains");
-		}
-	}
-	pad_connected = true;
-	const auto speaker = f.Open(2, 4);
-	gains = {0.75f, 0.25f};
-	output = {speaker, pcm.data(), gains.data()};
-	f.audio.AudioOutOutputs(&output, 1, false);
-	Check(queued_pad_gains != nullptr && queued_pad_gains[0] == gains[0] && queued_pad_gains[1] == gains[1],
-	      "connected controller did not receive channel gains");
-}
 } // namespace
 
 int main() {
@@ -465,9 +441,9 @@ int main() {
 	TestFallbackUsesEachPortsPeriod();
 	TestFailedQueueUsesFallbackClock();
 	TestControllerSpeakerPacing();
+	TestMixGains();
 	TestInvalidBatchSize();
 	TestZeroOutputFrequency();
-	TestChannelGains();
 	Check(streams.empty(), "output stream leaked");
 	std::puts("AudioOutTimingTests: all cases passed");
 }

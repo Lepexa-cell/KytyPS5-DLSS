@@ -1,13 +1,60 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include "common/assert.h"
+#include "common/switches.h"
 #include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/host_gpu/aftermath.h"
 
 #include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <system_error>
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
 namespace Libs::Graphics {
+
+bool LaterAccessEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = KYTY_GETENV("KYTY_LATER_ACCESS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+bool LaterAccessOn(LaterSite site) noexcept {
+	if (!LaterAccessEnabled()) {
+		return false;
+	}
+	static const uint32_t sites = [] {
+		const char* value = KYTY_GETENV("KYTY_LATER_ACCESS_SITES");
+		const auto  mask  = value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 16))
+		                                     : UINT32_MAX;
+		std::printf("later-access: sites 0x%x\n", mask);
+		std::fflush(stdout);
+		return mask;
+	}();
+	if (((sites >> static_cast<uint32_t>(site)) & 1u) == 0u) {
+		return false;
+	}
+	static const char* off_file = KYTY_GETENV("KYTY_LATER_ACCESS_OFF_FILE");
+	if (off_file == nullptr) {
+		return true;
+	}
+	static std::atomic<uint32_t> calls {0};
+	static std::atomic<bool>     off {false};
+	if (calls.fetch_add(1, std::memory_order_relaxed) % 1024u == 0u) {
+		std::error_code error;
+		const bool      now = std::filesystem::exists(off_file, error);
+		if (off.exchange(now, std::memory_order_relaxed) != now) {
+			std::printf("later-access: %s\n", now ? "off" : "on");
+			std::fflush(stdout);
+		}
+	}
+	return !off.load(std::memory_order_relaxed);
+}
 namespace {
 
 struct FormatMapping {
@@ -46,6 +93,10 @@ constexpr FormatMapping kFormatMappings[] = {
     {Prospero::BufferFormat::k16_16SInt, vk::Format::eR16G16Sint},
     {Prospero::BufferFormat::k16_16Float, vk::Format::eR16G16Sfloat},
     {Prospero::BufferFormat::k11_11_10Float, vk::Format::eB10G11R11UfloatPack32},
+    // Vulkan has no 11/11/10 unorm format. The float format has the same bit fields, so render
+    // targets, sampling and filtering work; only data the CPU writes in the unorm encoding reads
+    // back as different values (Ghost of Yotei renders and samples these on the GPU).
+    {Prospero::BufferFormat::k11_11_10UNorm, vk::Format::eB10G11R11UfloatPack32},
     {Prospero::BufferFormat::k10_10_10_2UNorm, vk::Format::eA2B10G10R10UnormPack32},
     {Prospero::BufferFormat::k10_10_10_2SNorm, vk::Format::eA2B10G10R10SnormPack32},
     {Prospero::BufferFormat::k10_10_10_2UScaled, vk::Format::eA2B10G10R10UscaledPack32},
@@ -72,7 +123,8 @@ constexpr FormatMapping kFormatMappings[] = {
     {Prospero::BufferFormat::k32_32_32_32UInt, vk::Format::eR32G32B32A32Uint},
     {Prospero::BufferFormat::k32_32_32_32SInt, vk::Format::eR32G32B32A32Sint},
     {Prospero::BufferFormat::k32_32_32_32Float, vk::Format::eR32G32B32A32Sfloat},
-    // 8 and 8_8 sRGB views are optional in Vulkan, so these images store UNorm.
+    // Narrow-channel sRGB formats are optional in Vulkan. Keep a same-width fallback until
+    // sampler-aware sRGB emulation is available.
     {Prospero::BufferFormat::k8Srgb, vk::Format::eR8Unorm},
     {Prospero::BufferFormat::k8_8Srgb, vk::Format::eR8G8Unorm},
     {Prospero::BufferFormat::k8_8_8_8Srgb, vk::Format::eR8G8B8A8Srgb},
@@ -124,6 +176,7 @@ void RequireVulkanSuccess(vk::Result result, const char* operation) {
 }
 
 vk::ShaderModule CompileSPV(std::span<const uint32_t> code, vk::Device device) {
+	Aftermath::NoteShaderModule(code);
 	vk::ShaderModuleCreateInfo create_info {};
 	create_info.codeSize    = code.size_bytes();
 	create_info.pCode       = code.data();

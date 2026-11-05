@@ -1,7 +1,6 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_EMULATOR_H_
 #define EMULATOR_INCLUDE_EMULATOR_EMULATOR_H_
 
-#include "common/additionalContent.h"
 #include "common/emulatorConfig.h"
 #include "common/stringUtils.h"
 
@@ -10,12 +9,10 @@
 namespace Emulator {
 
 struct RunOptions {
-	Config::ConfigOptions                config;
-	std::filesystem::path                app0_dir;
-	std::filesystem::path                elf;
-	std::filesystem::path                game_patch;
-	std::filesystem::path                addcont_dir;
-	std::vector<Common::AddContentEntry> addcont;
+	Config::ConfigOptions config;
+	std::filesystem::path app0_dir;
+	std::filesystem::path elf;
+	std::filesystem::path game_patch;
 };
 
 void Run(const RunOptions& options);

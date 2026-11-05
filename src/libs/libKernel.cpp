@@ -3,7 +3,6 @@
 #include "common/common.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
-#include "common/hostException.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "common/stringUtils.h"
@@ -12,16 +11,15 @@
 #include "kernel/eventQueue.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
-#include "kernel/module.h"
 #include "kernel/pthread.h"
 #include "kernel/semaphore.h"
 #include "kernel/syncOnAddress.h"
+#include "libs/agc.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
 #include "libs/network.h"
 #include "loader/elf.h"
 #include "loader/runtimeLinker.h"
-#include "loader/systemContent.h"
 #include "loader/symbolDatabase.h"
 
 #include <algorithm>
@@ -39,6 +37,9 @@
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #elif defined(__APPLE__)
 #include <csignal>
@@ -65,6 +66,7 @@ LIB_DEFINE(InitLibKernel_1_Apr);
 
 namespace LibKernel {
 
+using KernelModule                   = int32_t;
 using get_thread_atexit_count_func_t = KYTY_SYSV_ABI int (*)(KernelModule);
 using thread_atexit_report_func_t    = KYTY_SYSV_ABI void (*)(KernelModule);
 
@@ -952,6 +954,17 @@ static void ApplySignalUcontextToHost(ucontext_t* dst_ctx, const SignalUcontext&
 #endif
 }
 
+static int SignalDispatchHostSignal() {
+#if defined(__APPLE__)
+	// macOS has no realtime signals; SIGUSR1 is otherwise unused on the host side (the
+	// guest's SIGUSR1 is an emulated signal number, not a host registration).
+	static const int host_signal = SIGUSR1;
+#else
+	static const int host_signal = SIGRTMIN + 3;
+#endif
+	return host_signal;
+}
+
 static void HostSignalDispatchHandler(int /*host_signal*/, siginfo_t* /*info*/,
                                       void* native_context) {
 	Pthread current = PthreadSelfOrNull();
@@ -989,8 +1002,7 @@ static bool EnsureHostSignalDispatchInstalled() {
 		action.sa_sigaction = HostSignalDispatchHandler;
 		sigemptyset(&action.sa_mask);
 		action.sa_flags = SA_SIGINFO | SA_RESTART;
-		const int signal_number = Common::HostException::GuestSignalDispatchSignal();
-		return ::sigaction(signal_number, &action, nullptr) == 0;
+		return ::sigaction(SignalDispatchHostSignal(), &action, nullptr) == 0;
 	}();
 	return installed;
 }
@@ -1172,7 +1184,7 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 		}
 
 		PthreadQueuePendingSignal(thread, signum);
-		if (!PthreadKillHost(thread, Common::HostException::GuestSignalDispatchSignal())) {
+		if (!PthreadKillHost(thread, SignalDispatchHostSignal())) {
 			PthreadTakePendingSignal(thread, signum);
 			LOGF("\t pthread_kill failed for target thread\n");
 			return KERNEL_ERROR_EINVAL;
@@ -1190,9 +1202,9 @@ static int KYTY_SYSV_ABI KernelRaiseException(Pthread thread, int signum) {
 	return OK;
 }
 
-KernelModule KYTY_SYSV_ABI KernelLoadStartModule(const char* module_file_name, size_t args,
-                                                 const void* argp, uint32_t flags,
-                                                 const KernelLoadModuleOpt* opt, int* res) {
+static KYTY_SYSV_ABI KernelModule KernelLoadStartModule(const char* module_file_name, size_t args,
+                                                        const void* argp, uint32_t flags,
+                                                        const KernelLoadModuleOpt* opt, int* res) {
 	PRINT_NAME();
 
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
@@ -1244,9 +1256,9 @@ KernelModule KYTY_SYSV_ABI KernelLoadStartModule(const char* module_file_name, s
 	return static_cast<KernelModule>(handle);
 }
 
-int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args, const void* argp,
-                                        uint32_t flags, const KernelUnloadModuleOpt* opt,
-                                        int* res) {
+static int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args, const void* argp,
+                                                uint32_t flags, const KernelUnloadModuleOpt* opt,
+                                                int* res) {
 	PRINT_NAME();
 
 	// EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
@@ -1310,12 +1322,33 @@ static void* KYTY_SYSV_ABI KernelGetProcParam() {
 }
 
 static int KYTY_SYSV_ABI KernelIsTrinityMode() {
-	return Loader::SystemContentIsTrinityMode() ? 1 : 0;
+	static std::atomic_uint32_t call_count {0};
+
+	auto count = call_count.fetch_add(1, std::memory_order_relaxed);
+	if (count < 8 || (count % 1024) == 0) {
+		PRINT_NAME();
+		LOGF("\tcall = %u, return = %d\n", count + 1,
+		     Libs::Graphics::Gen5::TrinityModeTest() ? 1 : 0);
+	}
+
+	// KYTY_TRINITY_MODE=1: "PS5 Pro" (test only, see agc.cpp TrinityModeTest).
+	return Libs::Graphics::Gen5::TrinityModeTest() ? 1 : 0;
 }
 
 static int KYTY_SYSV_ABI KernelGetOperationMode(int* mode, int* submode) {
-	*mode    = Loader::SystemContentIsTrinityMode() ? 3 : 2;
+	PRINT_NAME();
+
+	*mode    = 2; // PS5 Base
 	*submode = 0; // None
+	LOGF("\t mode = %d, submode = %d\n", *mode, *submode);
+	return OK;
+}
+
+static int KYTY_SYSV_ABI KernelFsync(int fd) {
+	PRINT_NAME();
+
+	LOGF("\t fd = %d\n", fd);
+
 	return OK;
 }
 
@@ -1348,8 +1381,22 @@ static void KYTY_SYSV_ABI KernelRtldSetApplicationHeapAPI(void* api[]) {
 	[[maybe_unused]] auto* heap_posix_memalign = api[6];
 }
 
-static int64_t KYTY_SYSV_ABI write(int d, const void* buf, size_t nbytes) {
-	return POSIX_N_CALL(FileSystem::KernelWrite(d, buf, nbytes));
+static int64_t KYTY_SYSV_ABI write(int d, const char* str, int64_t size) {
+	// PRINT_NAME();
+
+	EXIT_NOT_IMPLEMENTED(d < 0);
+
+	if (Network::Net::IsSocket(d)) {
+		return Network::Net::Send(d, str, static_cast<uint64_t>(size), 0);
+	}
+
+	if (d > 2) {
+		return POSIX_N_CALL(FileSystem::KernelWrite(d, str, size));
+	}
+
+	int size_int = static_cast<int>(size);
+
+	return size_int;
 }
 
 static int KYTY_SYSV_ABI open(const char* path, int flags, int mode) {
@@ -1942,12 +1989,6 @@ int KYTY_SYSV_ABI ftruncate(int d, int64_t length) {
 	return POSIX_CALL(LibKernel::FileSystem::KernelFtruncate(d, length));
 }
 
-int KYTY_SYSV_ABI fsync(int d) {
-	PRINT_NAME();
-
-	return POSIX_CALL(LibKernel::FileSystem::KernelFsync(d));
-}
-
 int KYTY_SYSV_ABI socket(int family, int type, int protocol) {
 	PRINT_NAME();
 	return Network::Net::Socket(family, type, protocol);
@@ -1966,11 +2007,6 @@ int KYTY_SYSV_ABI connect(int s, const void* addr, uint32_t addrlen) {
 int KYTY_SYSV_ABI listen(int s, int backlog) {
 	PRINT_NAME();
 	return Network::Net::Listen(s, backlog);
-}
-
-int KYTY_SYSV_ABI shutdown(int s, int how) {
-	PRINT_NAME();
-	return Network::Net::Shutdown(s, how);
 }
 
 int KYTY_SYSV_ABI accept(int s, void* addr, uint32_t* addrlen) {
@@ -2136,7 +2172,6 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("E6ao34wPw+U", stat);
 	LIB_FUNC("JGMio+21L4c", mkdir);
 	LIB_FUNC("ih4CD9-gghM", Posix::ftruncate);
-	LIB_FUNC("juWbTNM+8hw", Posix::fsync);
 	LIB_FUNC("8nY19bKoiZk", Posix::fcntl);
 	LIB_FUNC("pDuPEf3m4fI", Posix::sem_init);
 	LIB_FUNC("cDW233RAwWo", Posix::sem_destroy);
@@ -2210,7 +2245,6 @@ LIB_DEFINE(InitLibKernel_1_Posix) {
 	LIB_FUNC("KuOmgKoqCdY", Posix::bind);
 	LIB_FUNC("XVL8So3QJUk", Posix::connect);
 	LIB_FUNC("pxnCmagrtao", Posix::listen);
-	LIB_FUNC("TUuiYS2kE8s", Posix::shutdown);
 	LIB_FUNC("3e+4Iv7IJ8U", Posix::accept);
 	LIB_FUNC("RenI1lL1WFk", Posix::getsockname);
 	LIB_FUNC("6O8EwYOgH9Y", Posix::getsockopt);
@@ -3080,7 +3114,6 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("UK2Tl2DWUns", FileSystem::KernelClose);
 	LIB_FUNC("Cg4srZ6TKbU", FileSystem::KernelRead);
 	LIB_FUNC("4wSze92BhLI", FileSystem::KernelWrite);
-	LIB_FUNC("kAt6VDbHmro", FileSystem::KernelWritev);
 	LIB_FUNC("+r3rMFwItV4", FileSystem::KernelPread);
 	LIB_FUNC("yTj62I7kw4s", FileSystem::KernelPreadv);
 	LIB_FUNC("nKWi-N2HBV4", FileSystem::KernelPwrite);
@@ -3088,7 +3121,6 @@ LIB_DEFINE(InitLibKernel_1_FS) {
 	LIB_FUNC("eV9wAD2riIA", FileSystem::KernelStat);
 	LIB_FUNC("kBwCPsYX-m4", FileSystem::KernelFstat);
 	LIB_FUNC("VW3TVZiM4-E", FileSystem::KernelFtruncate);
-	LIB_FUNC("WlyEA-sLDf0", FileSystem::KernelTruncate);
 	LIB_FUNC("AUXVxWeJU-A", FileSystem::KernelUnlink);
 	LIB_FUNC("52NcYU9+lEo", FileSystem::KernelRename);
 	LIB_FUNC("taRWhTJFTgE", FileSystem::KernelGetdirentries);
@@ -3154,7 +3186,6 @@ LIB_DEFINE(InitLibKernel_1_Equeue) {
 	LIB_FUNC("F6e0kwo4cnk", EventQueue::KernelTriggerUserEvent);
 	LIB_FUNC("LJDwdSNTnDg", EventQueue::KernelDeleteUserEvent);
 	LIB_FUNC("57ZK+ODEXWY", EventQueue::KernelAddTimerEvent);
-	LIB_FUNC("YWQFUyXIVdU", EventQueue::KernelDeleteTimerEvent);
 	LIB_FUNC("R74tt43xP6k", EventQueue::KernelAddHRTimerEvent);
 	LIB_FUNC("J+LF6LwObXU", EventQueue::KernelDeleteHRTimerEvent);
 	LIB_FUNC("bBfz7kMF2Ho", EventQueue::KernelAddAmprEvent);
@@ -3231,7 +3262,6 @@ LIB_DEFINE(InitLibKernel_1_Pthread) {
 	LIB_FUNC("8+s5BzZjxSg", LibKernel::PthreadAttrGetaffinity);
 	LIB_FUNC("nsYoNRywwNg", LibKernel::PthreadAttrInit);
 	LIB_FUNC("JaRMy+QcpeU", LibKernel::PthreadAttrGetdetachstate);
-	LIB_FUNC("lpMP8HhkBbg", LibKernel::PthreadAttrGetinheritsched);
 	LIB_FUNC("-quPa4SEJUw", LibKernel::PthreadAttrGetstack);
 	LIB_FUNC("Ru36fiTtJzA", LibKernel::PthreadAttrGetstackaddr);
 	LIB_FUNC("-fA+7ZlGDQs", LibKernel::PthreadAttrGetstacksize);
@@ -3359,7 +3389,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("959qrazPIrg", LibKernel::KernelGetProcParam);
 	LIB_FUNC("tU5e3f9gSiU", LibKernel::KernelIsTrinityMode);
 	LIB_FUNC("NH6xARDOVv8", LibKernel::KernelGetOperationMode);
-	LIB_FUNC("fTx66l5iWIA", FileSystem::KernelFsync);
+	LIB_FUNC("fTx66l5iWIA", LibKernel::KernelFsync);
 	LIB_FUNC("uvT2iYBBnkY", LibKernel::KernelSync);
 	LIB_FUNC("HoLVWNanBBc", LibKernel::getpid);
 	LIB_FUNC("9BcDykPmo1I", LibKernel::get_error_addr);

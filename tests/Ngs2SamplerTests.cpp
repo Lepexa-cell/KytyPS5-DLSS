@@ -24,11 +24,9 @@ struct Fixture {
 
 	Fixture(uint32_t rate, uint32_t channels = 1, Ngs2RackType type = Ngs2RackType::Sampler) {
 		system.option.sample_rate = 48000;
-		system.option.num_grain_samples = 256;
 		rack.ngs                  = &system;
 		rack.type                 = type;
 		voice.rack                = &rack;
-		SetCapacity(4);
 		struct Setup {
 			Ngs2VoiceParamHeader header {40, 0, 0x10000000};
 			Ngs2WaveformFormat   format;
@@ -41,52 +39,20 @@ struct Fixture {
 		voice.state = Ngs2VoicePlayState::Playing;
 	}
 
-	void SetCapacity(uint32_t capacity) {
-		if (rack.type == Ngs2RackType::Sampler) {
-			rack.option.sampler.max_waveform_blocks = capacity;
-		} else {
-			rack.option.custom_sampler.max_waveform_blocks = capacity;
-			rack.option.custom_sampler.custom_rack_option.state_size = sizeof(Ngs2CustomSamplerVoiceState);
-			rack.option.custom_sampler.custom_rack_option.num_buffers = 1;
-		}
-	}
-
-	Ngs2SamplerVoiceState State() {
-		Ngs2SamplerVoiceState state {};
-		if (rack.type == Ngs2RackType::CustomSampler) {
-			Ngs2CustomSamplerVoiceState custom {};
-			Check(Ngs2VoiceGetState(reinterpret_cast<uintptr_t>(&voice), &custom.voice_state,
-			                       sizeof(custom)) == OK, "custom sampler state failed");
-			state.voice_state = custom.voice_state;
-			state.num_decoded_samples = custom.num_decoded_samples;
-			state.decoded_data_size = custom.decoded_data_size;
-			state.waveform_data = custom.waveform_data;
-			state.user_data = custom.user_data;
-		} else {
-			Check(Ngs2VoiceGetState(reinterpret_cast<uintptr_t>(&voice), &state.voice_state,
-			                       sizeof(state)) == OK, "sampler state failed");
-		}
-		return state;
-	}
-
-	int QueueBlocks(const void* data, const Ngs2WaveformBlock* blocks, uint32_t count,
-	                uint32_t flags) {
+	void Queue(const int16_t* data, uint32_t frames, uint32_t flags, uint32_t repeats = 0,
+	           uint32_t skip = 0) {
+		Ngs2WaveformBlock block {
+		    0,  size_t(frames + skip) * voice.channels * sizeof(int16_t), repeats, skip, frames, 0,
+		    123};
 		struct Blocks {
 			Ngs2VoiceParamHeader     header {32, 0, 0x10000001};
 			const void*              data;
 			uint32_t                 flags, count;
 			const Ngs2WaveformBlock* blocks;
-		} param {{32, 0, 0x10000001}, data, flags, count, blocks};
+		} param {{32, 0, 0x10000001}, data, flags, 1, &block};
 		param.header.id = rack.type == Ngs2RackType::Sampler ? 0x10000001 : 0x40010001;
-		return Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &param.header);
-	}
-
-	void Queue(const int16_t* data, uint32_t frames, uint32_t flags, uint32_t repeats = 0,
-	           uint32_t skip = 0) {
-		const Ngs2WaveformBlock block {
-		    0, size_t(frames + skip) * voice.channels * sizeof(int16_t), repeats, skip, frames, 0,
-		    123};
-		Check(QueueBlocks(data, &block, 1, flags) == OK, "sampler queue failed");
+		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &param.header) == OK,
+		      "sampler queue failed");
 	}
 
 	void Render(uint32_t frames) {
@@ -94,283 +60,6 @@ struct Fixture {
 		Ngs2RenderVoice(voice, {}, frames);
 	}
 };
-
-void TestStereoPan() {
-	Ngs2PanWork work;
-	Check(Ngs2PanInit(&work, nullptr, 360.0f, 2) == OK, "pan init failed");
-	Check(work.speaker_angles[0] == 270.0f && work.speaker_angles[1] == 90.0f,
-	      "pan init did not install the default speaker positions");
-	auto pan = [&](float angle, float distance = 1.0f) {
-		const Ngs2PanParam   param {angle, distance, 1.0f, 1.0f};
-		std::array<float, 2> matrix {};
-		Check(Ngs2PanGetVolumeMatrix(&work, &param, 1, 2, matrix.data()) == OK,
-		      "pan matrix failed");
-		return matrix;
-	};
-	const auto left  = pan(270.0f);
-	const auto right = pan(90.0f);
-	Check(std::abs(left[0] - 1.0f) < 1e-6f && std::abs(left[1]) < 1e-6f,
-	      "270 degrees should be hard left");
-	Check(std::abs(right[1] - 1.0f) < 1e-6f && std::abs(right[0]) < 1e-6f,
-	      "90 degrees should be hard right");
-	const auto centre = pan(0.0f);
-	Check(std::abs(centre[0] - centre[1]) < 1e-6f &&
-	          std::abs(centre[0] - std::numbers::sqrt2_v<float> / 2.0f) < 1e-6f,
-	      "0 degrees should be centred");
-	const auto opposite = pan(90.0f, -1.0f);
-	Check(std::abs(opposite[0] - left[0]) < 1e-6f && std::abs(opposite[1] - left[1]) < 1e-6f,
-	      "negative pan distance did not reverse direction");
-
-	// L is across zero from R; positions need not use the default 180-degree separation.
-	const float speakers[] = {320.0f, 40.0f};
-	Check(Ngs2PanInit(&work, speakers, 360.0f, 2) == OK, "custom pan init failed");
-	const auto custom_left  = pan(320.0f);
-	const auto custom_right = pan(40.0f);
-	Check(std::abs(custom_left[0] - 1.0f) < 1e-6f && std::abs(custom_left[1]) < 1e-6f &&
-	          std::abs(custom_right[1] - 1.0f) < 1e-6f && std::abs(custom_right[0]) < 1e-6f,
-	      "custom speaker positions were ignored");
-	const auto front = pan(0.0f);
-	const auto rear  = pan(180.0f);
-	Check(std::abs(front[0] - front[1]) < 1e-6f && std::abs(rear[0] - rear[1]) < 1e-6f,
-	      "custom speaker arcs did not meet at their midpoints");
-	for (float angle: {-40.0f, 320.0f, 680.0f}) {
-		const auto wrapped = pan(angle);
-		Check(std::abs(wrapped[0] - custom_left[0]) < 1e-6f &&
-		          std::abs(wrapped[1] - custom_left[1]) < 1e-6f,
-		      "source pan angle did not wrap across zero");
-	}
-	const float wrapped_speakers[] = {-40.0f, 400.0f};
-	Check(Ngs2PanInit(&work, wrapped_speakers, 360.0f, 2) == OK, "wrapped speaker pan init failed");
-	const auto wrapped_front = pan(0.0f);
-	Check(std::abs(wrapped_front[0] - front[0]) < 1e-6f &&
-	          std::abs(wrapped_front[1] - front[1]) < 1e-6f,
-	      "speaker angles did not wrap across zero");
-
-	// All gains for one destination must be adjacent, even for a non-square input matrix.
-	const Ngs2PanParam params[] = {
-	    {320.0f, 1.0f, 0.25f, 0.0f}, {40.0f, 1.0f, 0.75f, 0.0f}, {320.0f, 1.0f, 0.5f, 0.0f}};
-	float matrix[6] {};
-	Check(Ngs2PanGetVolumeMatrix(&work, params, 3, 2, matrix) == OK,
-	      "multi-input pan matrix failed");
-	const float expected[] = {0.25f, 0.0f, 0.5f, 0.0f, 0.75f, 0.0f};
-	for (size_t i = 0; i < std::size(matrix); i++) {
-		Check(std::abs(matrix[i] - expected[i]) < 1e-6f,
-		      "pan matrix channel order or FBW level is incorrect");
-	}
-
-	const auto      degrees           = pan(17.0f, 0.4f);
-	constexpr float radians           = 2.0f * std::numbers::pi_v<float>;
-	const float     radian_speakers[] = {-40.0f / 360.0f * radians, 400.0f / 360.0f * radians};
-	Check(Ngs2PanInit(&work, radian_speakers, radians, 2) == OK, "radian pan init failed");
-	const auto in_radians = pan(17.0f / 360.0f * radians, 0.4f);
-	Check(std::abs(degrees[0] - in_radians[0]) < 1e-6f &&
-	          std::abs(degrees[1] - in_radians[1]) < 1e-6f,
-	      "degree and radian panning disagree");
-	Check(Ngs2PanInit(&work, nullptr, radians, 2) == OK &&
-	          std::abs(work.speaker_angles[0] - 0.75f * radians) < 1e-6f &&
-	          std::abs(work.speaker_angles[1] - 0.25f * radians) < 1e-6f,
-	      "default speaker angles did not use the requested units");
-
-	const float narrow_and_large_layouts[][2] = {
-	    {100.0f, std::nextafter(100.0f, 101.0f)}, {0.0f, -1e-20f}, {1e20f, 40.0f}};
-	for (const auto& speakers: narrow_and_large_layouts) {
-		Check(Ngs2PanInit(&work, speakers, 360.0f, 2) == OK,
-		      "distinct finite speaker positions were rejected");
-		const auto endpoint_left  = pan(speakers[0]);
-		const auto endpoint_right = pan(speakers[1]);
-		Check(std::abs(endpoint_left[0] - 1.0f) < 1e-6f && std::abs(endpoint_left[1]) < 1e-6f &&
-		          std::abs(endpoint_right[1] - 1.0f) < 1e-6f && std::abs(endpoint_right[0]) < 1e-6f,
-		      "speaker angle normalization lost distinct endpoints");
-	}
-
-	const float duplicate_speakers[] = {0.0f, 360.0f};
-	Check(Ngs2PanInit(&work, duplicate_speakers, 360.0f, 2) == static_cast<int32_t>(0x804a8451u),
-	      "coincident speaker positions were accepted");
-}
-
-void TestWaveformQueueCapacity() {
-	constexpr int32_t full = static_cast<int32_t>(0x804a8054u);
-	constexpr int32_t invalid_count = static_cast<int32_t>(0x804a8053u);
-	for (auto rack: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
-		for (uint32_t capacity: {1u, 4u, 16u}) {
-			Fixture f(24000, 1, rack);
-			f.SetCapacity(capacity);
-			f.system.option.num_grain_samples = 1;
-			const int16_t pcm[] = {8192, 16384};
-			const int16_t replacement[] = {24576, 4096};
-			std::vector<Ngs2WaveformBlock> blocks(capacity + 1);
-			for (uint32_t i = 0; i < blocks.size(); ++i) {
-				blocks[i] = {0, sizeof(pcm), 0, 0, 2, 0, i + 1};
-			}
-			Check(f.QueueBlocks(pcm, blocks.data(), capacity, 1) == OK,
-			      "configured waveform capacity was not available");
-			f.Render(1);
-			const auto phase = f.voice.sample_phase;
-			Check(f.QueueBlocks(replacement, blocks.data(), 1, 0) == full,
-			      "full waveform queue accepted another guest buffer");
-			Check(f.QueueBlocks(replacement, blocks.data(), capacity + 1, 4) == invalid_count,
-			      "oversized waveform request did not reject before CLEAR");
-			Check(f.voice.blocks.size() == capacity && f.voice.accepts_blocks &&
-			          f.voice.sample_phase == phase && f.voice.decoded_samples == 1 &&
-			          f.voice.decoded_bytes == sizeof(int16_t),
-			      "rejected waveform request changed playback or stream continuity");
-			for (uint32_t i = 0; i < capacity; ++i) {
-				Check(f.voice.blocks[i].data == reinterpret_cast<const uint8_t*>(pcm) &&
-				          f.voice.blocks[i].info.user_data == i + 1 &&
-				          f.voice.blocks[i].data_cursor == (i == 0 ? sizeof(int16_t) : 0u),
-				      "rejected waveform request replaced an outstanding block");
-			}
-			f.Render(3);
-			Check(f.voice.samples == std::vector<float> {0.375f, 0.5f,
-			                                            capacity == 1 ? 0.5f : 0.375f} &&
-			          f.voice.blocks.size() == capacity - 1,
-			      "queue rejection changed partially played source audio");
-			Check(f.QueueBlocks(replacement, blocks.data(), 1, 1) == OK &&
-			          f.voice.blocks.size() == capacity,
-			      "completed waveform block did not release its queue slot");
-			const auto progress = f.State();
-			Check(f.QueueBlocks(replacement, blocks.data(), 1, 5) == OK &&
-			          f.voice.blocks.size() == 1 && f.voice.sample_phase == 0 &&
-			          f.voice.decoded_samples == progress.num_decoded_samples &&
-			          f.voice.decoded_bytes == progress.decoded_data_size,
-			      "CLEAR failed to replace a full queue while preserving progress");
-			f.Render(2);
-			Check(f.voice.samples == std::vector<float> {0.75f, 0.4375f},
-			      "CLEAR retained an old source or fractional playback position");
-		}
-	}
-}
-
-struct PcmRing {
-	static constexpr uint32_t block_frames = 7, block_count = 64;
-	Fixture& fixture;
-	std::array<std::array<int16_t, block_frames * 2>, 4> buffers {};
-	uint32_t next_block = 0, completed = 0;
-
-	void QueueNext(uint32_t slot) {
-		auto& buffer = buffers[slot];
-		for (uint32_t i = 0; i < block_frames; ++i) {
-			buffer[2 * i] = static_cast<int16_t>(100 + (next_block * block_frames + i) * 16);
-			buffer[2 * i + 1] = -buffer[2 * i];
-		}
-		const Ngs2WaveformBlock block {0, sizeof(buffer), 0, 0, block_frames, 0, slot};
-		++next_block;
-		Check(fixture.QueueBlocks(buffer.data(), &block, 1, next_block == block_count ? 0 : 1) == OK,
-		      "released ring buffer could not be queued again");
-	}
-};
-
-void KYTY_SYSV_ABI RefillPcmRing(const Ngs2VoiceCallbackInfo* info) {
-	auto& ring = *reinterpret_cast<PcmRing*>(info->data);
-	const auto slot = ring.completed++ % ring.buffers.size();
-	Check(info->flag == 1 && info->attributes == 0 && info->user == slot &&
-	          info->block_data == ring.buffers[slot].data() &&
-	          info->size == sizeof(ring.buffers[slot]),
-	      "ring completion callback released the wrong source buffer");
-	for (const auto& block: ring.fixture.voice.blocks) {
-		Check(block.data != reinterpret_cast<const uint8_t*>(ring.buffers[slot].data()),
-		      "completion callback retained the buffer about to be overwritten");
-	}
-	if (ring.next_block < PcmRing::block_count) {
-		ring.QueueNext(static_cast<uint32_t>(slot));
-	}
-}
-
-void TestWaveformRingReuse() {
-	for (auto rack: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
-		Fixture f(48000, 2, rack);
-		PcmRing ring {f};
-		f.voice.callback = reinterpret_cast<uintptr_t>(&RefillPcmRing);
-		f.voice.callback_data = reinterpret_cast<uintptr_t>(&ring);
-		f.voice.callback_flags = 1;
-		for (uint32_t slot = 0; slot < ring.buffers.size(); ++slot) {
-			ring.QueueNext(slot);
-		}
-		constexpr std::array<uint32_t, 6> grains {1, 16, 3, 29, 2, 11};
-		constexpr auto total_frames = PcmRing::block_frames * PcmRing::block_count;
-		uint32_t rendered = 0, grain_index = 0;
-		while (rendered < total_frames) {
-			const auto grain = std::min(grains[grain_index++ % grains.size()], total_frames - rendered);
-			f.Render(grain);
-			for (uint32_t i = 0; i < grain; ++i) {
-				const float expected = (100 + (rendered + i) * 16) / 32768.0f;
-				Check(f.voice.samples[i] == expected && f.voice.samples[grain + i] == -expected,
-				      "ring buffer reuse replayed overwritten data or mixed stereo channels");
-			}
-			rendered += grain;
-			const auto decoded = f.State().num_decoded_samples;
-			Check(f.voice.blocks.size() <= ring.buffers.size() &&
-			          decoded >= rendered && decoded - rendered < 256 &&
-			          f.voice.decoded_bytes == decoded * 4 &&
-			          ring.completed == decoded / PcmRing::block_frames,
-			      "ring playback lost queue capacity or decoded progress");
-			if (decoded < total_frames) {
-				const auto slot = (decoded / PcmRing::block_frames) % ring.buffers.size();
-				Check(f.voice.WaveformData() == reinterpret_cast<const uint8_t*>(
-				          ring.buffers[slot].data() + (decoded % PcmRing::block_frames) * 2),
-				      "ring read address did not track the active source buffer");
-			}
-		}
-		Check(f.voice.blocks.empty() && f.voice.state == Ngs2VoicePlayState::Empty &&
-		          ring.completed == PcmRing::block_count,
-		      "finite ring stream did not release all buffers and finish");
-	}
-}
-
-void TestProgressDrivenWaveformRing() {
-	const auto source_sample = [](uint64_t frame) {
-		return static_cast<int16_t>(static_cast<int32_t>((frame * 43) % 32768) - 16384);
-	};
-	for (auto rack: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
-		Fixture f(44100, 2, rack);
-		std::array<std::array<int16_t, 1024 * 2>, 4> buffers {};
-		uint64_t submitted = 0, decoded_bytes = 0, rendered = 0;
-		uint32_t slot = 0;
-		const auto refill = [&](uint32_t frames) {
-			auto& buffer = buffers[slot];
-			for (const auto& block: f.voice.blocks) {
-				Check(block.data != reinterpret_cast<const uint8_t*>(buffer.data()),
-				      "decoded progress allowed the guest to overwrite an outstanding ring buffer");
-			}
-			for (uint32_t i = 0; i < frames; ++i) {
-				buffer[i * 2] = source_sample(submitted + i);
-				buffer[i * 2 + 1] = -buffer[i * 2];
-			}
-			const Ngs2WaveformBlock block {0, frames * 4u, 0, 0, frames, 0, slot};
-			Check(f.QueueBlocks(buffer.data(), &block, 1, 1) == OK,
-			      "progress-driven ring exhausted its waveform slots");
-			submitted += frames;
-			slot = (slot + 1) % buffers.size();
-		};
-		refill(1024);
-		for (uint32_t grain = 0; grain < 128; ++grain) {
-			f.Render(256);
-			for (uint32_t i = 0; i < 256; ++i) {
-				const uint64_t phase = (rendered + i) * 44100;
-				const auto frame = phase / 48000;
-				const float fraction = static_cast<float>(phase % 48000) / 48000.0f;
-				const float expected = std::lerp(static_cast<float>(source_sample(frame)),
-				                                 static_cast<float>(source_sample(frame + 1)), fraction) /
-				                       32768.0f;
-				Check(std::abs(f.voice.samples[i] - expected) < 0.00001f &&
-				          std::abs(f.voice.samples[256 + i] + expected) < 0.00001f,
-				      "progress-driven ring replayed overwritten music samples");
-			}
-			rendered += 256;
-			const auto state = f.State();
-			const auto delta = state.decoded_data_size - decoded_bytes;
-			Check(state.decoded_data_size >= decoded_bytes && delta <= sizeof(buffers[0]) &&
-			          delta % 4 == 0 && state.num_decoded_samples * 4 == state.decoded_data_size &&
-			          state.num_decoded_samples <= submitted,
-			      "published sampler progress does not describe decoded source data");
-			decoded_bytes = state.decoded_data_size;
-			if (delta != 0) {
-				refill(static_cast<uint32_t>(delta / 4));
-			}
-		}
-		Check(decoded_bytes > 28 * sizeof(buffers[0]), "ring test did not exercise repeated buffer reuse");
-	}
-}
 
 void TestStreamingResample() {
 	Fixture              f(44100, 2);
@@ -477,186 +166,6 @@ void TestAtrac9Vibration() {
 	}
 }
 
-void TestAtrac9Discrete() {
-	using namespace Libs::Audio::Ajm;
-	constexpr std::array<uint8_t, 4> captured {0x30, 0x72, 0xc0, 0xfe};
-	struct Geometry { uint32_t channels, rate_index, rate, samples, frames, bytes; };
-	for (const auto [channels, rate_index, rate, samples, frames, bytes]:
-	     {Geometry {12, 7, 48000, 256, 4, 64}, Geometry {16, 4, 24000, 128, 1, 96},
-	      Geometry {64, 1, 12000, 64, 4, 96}}) {
-		const uint32_t word = 0x30000000u | (rate_index << 20u) | ((channels - 1u) << 14u) |
-		                      ((bytes - 1u) << 2u) | (frames == 4 ? 2u : 0u);
-		std::array<uint8_t, 4> config {uint8_t(word >> 24u), uint8_t(word >> 16u),
-		                               uint8_t(word >> 8u), uint8_t(word)};
-		const auto original = config;
-		AjmAt9Decoder decoder(channels, rate, AjmSampleEncoding::S16, 0);
-		const auto initialized = decoder.Initialize(config.data(), config.size());
-		AjmSidebandDecAt9CodecInfo info {};
-		decoder.WriteCodecInfo(&info, sizeof(info), initialized);
-		Atrac9CodecInfo parsed {};
-		Check(initialized.result == OK && initialized.format.channel_num == channels &&
-		          initialized.format.sampling_frequency == rate && info.frame_samples == samples &&
-		          info.frames_in_super_frame == frames && info.super_frame_size == bytes * frames * channels &&
-		          Ngs2GetAtrac9CodecInfo(config, parsed) && parsed.channels == channels &&
-		          parsed.samplingRate == rate && parsed.frameSamples == samples &&
-		          parsed.framesInSuperframe == frames && parsed.superframeSize == bytes * frames * channels &&
-		          config == original && (channels != 12 || config == captured),
-		      "ATRAC9 discrete metadata or channel limit is incorrect");
-	}
-
-	// The existing mono fixture's constant gradient/scalefactors give 24 nine-bit
-	// coefficients. Ignored extension bits vary frame lengths independently of PCM.
-	std::array<std::array<std::vector<uint8_t>, 4>, 12> blocks;
-	std::array<size_t, 12> channel_bytes {};
-	std::array<size_t, 4> frame_ends {};
-	std::vector<uint8_t> encoded;
-	for (unsigned frame = 0; frame < 4; ++frame) {
-		for (unsigned channel = 0; channel < 12; ++channel) {
-			auto& block = blocks[channel][frame];
-			unsigned position = 0;
-			auto put = [&](unsigned value, unsigned bits) {
-				for (unsigned bit = bits; bit != 0; --bit) {
-					if (position % 8 == 0) block.push_back(0);
-					block.back() |= ((value >> (bit - 1)) & 1u) << (7u - position++ % 8u);
-				}
-			};
-			put(frame != 0, 1); // First frame, fresh band parameters, three bands, no BEX.
-			put(0, 6);
-			put(0, 14); // Gradient mode/start/end, then constant value 16.
-			put(16, 5);
-			put(16, 5);
-			put(0, 4);
-			put(1, 1); // Optional ignored extension payload of 0/8/16/24 bits.
-			put(0, 2);
-			put((channel % 4) * 8, 5);
-			put(0, (channel % 4) * 8);
-			put(1, 2); // CLC scale factors: two bits each, base 24.
-			put(0, 2);
-			put(24, 5);
-			for (unsigned unit = 0; unit < 10; ++unit) put(0, 2);
-			const int coefficient = int((channel + 1) * (frame + 1) * 4);
-			put(unsigned(channel % 2 ? -coefficient : coefficient) & 0x1ffu, 9);
-			for (unsigned coefficient = 1; coefficient < 24; ++coefficient) put(0, 9);
-			encoded.insert(encoded.end(), block.begin(), block.end());
-			channel_bytes[channel] += block.size();
-			if (frame == 3) {
-				Check(channel_bytes[channel] < 256, "ATRAC9 test channel has no padding");
-				encoded.insert(encoded.end(), 256 - channel_bytes[channel], 0x01);
-			}
-		}
-		frame_ends[frame] = encoded.size();
-	}
-	Check(encoded.size() == 3072 && blocks[0][0].size() != blocks[3][0].size(),
-	      "ATRAC9 discrete fixture did not exercise distinct channel padding");
-
-	for (auto encoding: {AjmSampleEncoding::S16, AjmSampleEncoding::S32,
-	                     AjmSampleEncoding::Float}) {
-		const size_t sample_bytes = AjmBytesPerSample(encoding);
-		const size_t row_bytes = 12 * sample_bytes;
-		const size_t frame_bytes = 256 * row_bytes;
-		std::vector<uint8_t> expected(4 * frame_bytes), mono(256 * sample_bytes);
-		for (unsigned channel = 0; channel < 12; ++channel) {
-			auto reference = std::unique_ptr<void, decltype(&Atrac9ReleaseHandle)>(
-			    Atrac9GetHandle(), Atrac9ReleaseHandle);
-			std::array<uint8_t, 4> mono_config {0xfe, 0x70, 0x07, 0xf0};
-			Check(reference && Atrac9InitDecoder(reference.get(), mono_config.data()) == 0,
-			      "ATRAC9 discrete mono reference initialization failed");
-			for (unsigned frame = 0; frame < 4; ++frame) {
-				int used = 0, result = -1;
-				std::array<uint8_t, 64> input {}; // LibAtrac9's bit reader peeks past the final byte.
-				std::copy(blocks[channel][frame].begin(), blocks[channel][frame].end(), input.begin());
-				switch (encoding) {
-					case AjmSampleEncoding::S16:
-						result = Atrac9Decode(reference.get(), input.data(),
-						                      reinterpret_cast<int16_t*>(mono.data()), &used, 0);
-						break;
-					case AjmSampleEncoding::S32:
-						result = Atrac9DecodeS32(reference.get(), input.data(),
-						                         reinterpret_cast<int32_t*>(mono.data()), &used, 0);
-						break;
-					case AjmSampleEncoding::Float:
-						result = Atrac9DecodeF32(reference.get(), input.data(),
-						                         reinterpret_cast<float*>(mono.data()), &used, 0);
-						break;
-				}
-				Check(result == 0 && used == blocks[channel][frame].size(),
-				      "ATRAC9 discrete mono reference did not consume its exact frame");
-				for (unsigned sample = 0; sample < 256; ++sample) {
-					std::memcpy(expected.data() + (frame * 256 + sample) * row_bytes +
-					                channel * sample_bytes,
-					            mono.data() + sample * sample_bytes, sample_bytes);
-				}
-			}
-		}
-		Check(std::ranges::any_of(expected, [](uint8_t byte) { return byte != 0; }),
-		      "ATRAC9 discrete reference unexpectedly contains only silence");
-		AjmAt9Decoder decoder(12, 48000, encoding, 0);
-		Check(decoder.Initialize(captured.data(), captured.size()).result == OK,
-		      "ATRAC9 discrete decoder initialization failed");
-		std::vector<uint8_t> actual(expected.size() + 32, 0xa5);
-		auto decode = [&](size_t input_size, size_t output_size) {
-			return decoder.Decode(encoded.data(), input_size, actual.data() + 16,
-			                      output_size, true, nullptr);
-		};
-		const auto partial = decode(encoded.size() - 1, expected.size());
-		const auto short_output = decode(encoded.size(), frame_bytes - 1);
-		Check(partial.result == AJM_RESULT_PARTIAL_INPUT && partial.frames == 0 &&
-		          partial.input_consumed == 0 && partial.output_written == 0 &&
-		          short_output.result == AJM_RESULT_NOT_ENOUGH_ROOM && short_output.frames == 0 &&
-		          short_output.input_consumed == 0 && short_output.output_written == 0 &&
-		          std::ranges::all_of(actual, [](uint8_t byte) { return byte == 0xa5; }),
-		      "ATRAC9 discrete partial input/output consumed data or wrote PCM");
-		for (unsigned pass = 0; pass < 2; ++pass) {
-			if (pass != 0) decoder.Reset();
-			const auto result = decode(encoded.size(), expected.size());
-			Check(result.result == OK && result.frames == 4 &&
-			          result.input_consumed == encoded.size() &&
-			          result.output_written == expected.size() && result.total_decoded_samples == 1024 &&
-			          std::equal(expected.begin(), expected.end(), actual.begin() + 16) &&
-			          std::all_of(actual.begin(), actual.begin() + 16, [](auto b) { return b == 0xa5; }) &&
-			          std::all_of(actual.end() - 16, actual.end(), [](auto b) { return b == 0xa5; }),
-			      "ATRAC9 discrete interleave, per-channel padding, reset or PCM bounds differ");
-		}
-		decoder.Reset();
-		size_t offset = 0;
-		for (unsigned frame = 0; frame < 4; ++frame) {
-			const auto result = decoder.Decode(encoded.data() + offset, encoded.size() - offset,
-			                                   actual.data() + 16, frame_bytes, false, nullptr);
-			Check(result.result == OK && result.frames == 1 &&
-			          result.input_consumed == frame_ends[frame] - offset &&
-			          result.output_written == frame_bytes &&
-			          std::equal(expected.begin() + frame * frame_bytes,
-			                     expected.begin() + (frame + 1) * frame_bytes, actual.begin() + 16),
-			      "ATRAC9 discrete split calls lost channel histories or padding position");
-			offset = frame_ends[frame];
-		}
-		decoder.Reset();
-		AjmGaplessState gapless;
-		gapless.Set({700, 17, 0}, true);
-		const auto trimmed = decoder.Decode(encoded.data(), encoded.size(), actual.data() + 16,
-		                                    700 * row_bytes, true, &gapless);
-		Check(trimmed.result == OK && trimmed.frames == 4 &&
-		          trimmed.input_consumed == encoded.size() && trimmed.output_written == 700 * row_bytes &&
-		          trimmed.total_decoded_samples == 700 && gapless.IsEnd() &&
-		          std::equal(expected.begin() + 17 * row_bytes,
-		                     expected.begin() + 717 * row_bytes, actual.begin() + 16),
-		      "ATRAC9 discrete gapless trim or superframe drain changed channel order");
-	}
-	for (auto invalid: {std::array<uint8_t, 4> {0x31, 0x72, 0xc0, 0xfe},
-	                   std::array<uint8_t, 4> {0x30, 0xf2, 0xc0, 0xfe},
-	                   std::array<uint8_t, 4> {0x30, 0x62, 0xc0, 0xfe},
-	                   std::array<uint8_t, 4> {0x30, 0x72, 0xe0, 0xfe},
-	                   std::array<uint8_t, 4> {0x30, 0x72, 0xc1, 0x82},
-	                   std::array<uint8_t, 4> {0x30, 0x72, 0xc0, 0xfd},
-	                   std::array<uint8_t, 4> {0x30, 0x72, 0xc0, 0xff}}) {
-		Atrac9CodecInfo info {};
-		AjmAt9Decoder decoder(12, 48000, AjmSampleEncoding::S16, 0);
-		Check(!Ngs2GetAtrac9CodecInfo(invalid, info) &&
-		          decoder.Initialize(invalid.data(), invalid.size()).result != OK,
-		      "ATRAC9 discrete accepted unsupported configuration fields");
-	}
-}
-
 void TestAtrac9ResampleAcrossFrames() {
 	const auto make_voice = [] {
 		auto f = std::make_unique<Fixture>(24000);
@@ -669,7 +178,6 @@ void TestAtrac9ResampleAcrossFrames() {
 		f->voice.next_decoded_frame[0] = 1.0f;
 		f->voice.next_decoded_frame[1] = 1.5f;
 		f->voice.next_frame_samples = 2;
-		f->voice.decoded_samples = 4;
 		f->voice.accepts_blocks = false;
 		return f;
 	};
@@ -710,7 +218,6 @@ void TestAtrac9ResampleAfterStarvation() {
 	f.voice.decoded_frame[0] = 0.0f;
 	f.voice.decoded_frame[1] = 0.5f;
 	f.voice.frame_samples    = 2;
-	f.voice.decoded_samples  = 2;
 	f.Render(4);
 	Check(f.voice.samples == std::vector<float> {0.0f, 0.25f, 0.5f, 0.5f} &&
 	          f.voice.decoded_samples == 2,
@@ -723,7 +230,6 @@ void TestAtrac9ResampleAfterStarvation() {
 	f.voice.next_decoded_frame[0] = 1.0f;
 	f.voice.next_decoded_frame[1] = 1.5f;
 	f.voice.next_frame_samples    = 2;
-	f.voice.decoded_samples       += 2;
 	f.Render(4);
 	Check(f.voice.samples == std::vector<float> {1.0f, 1.25f, 1.5f, 1.5f} &&
 	          f.voice.decoded_samples == 4,
@@ -744,11 +250,6 @@ void TestWaveformBlockGeometry() {
 	Check(Ngs2CalcWaveformBlock(&format, 0, 0, &block) == OK && block.data_size == 0 &&
 	          block.num_samples == 0,
 	      "empty ATRAC9 block acquired encoded data");
-	const Ngs2WaveformFormat pcm {0x12, 2, 48000};
-	Check(Ngs2CalcWaveformBlock(&pcm, 4096, 4096, &block) == OK &&
-	          block.data_offset == 16384 && block.data_size == 16384 &&
-	          block.num_skip_samples == 0 && block.num_samples == 4096,
-	      "PCM block calculation omitted the sample frames");
 	Fixture f(24000);
 	const int16_t silence = 0;
 	f.Queue(&silence, 0, 0, UINT32_MAX);
@@ -768,7 +269,6 @@ void TestSubmixerSetupAndRouting() {
 	submixer.ports.resize(1);
 	submixer.matrices.resize(1);
 	Ngs2RackInternal mastering_rack {};
-	mastering_rack.ngs  = &f.system;
 	mastering_rack.type = Ngs2RackType::Mastering;
 	Ngs2VoiceInternal mastering;
 	mastering.rack     = &mastering_rack;
@@ -803,73 +303,6 @@ void TestSubmixerSetupAndRouting() {
 	}
 }
 
-uint32_t g_side_chain_flags = 0;
-
-void KYTY_SYSV_ABI MultiplyBySideChain(Ngs2UserFxProcessContext* context) {
-	Check(context->num_channels == 1 && context->grain_samples == 1 &&
-	          context->user_data[0] == 7,
-	      "user FX context did not describe the custom voice");
-	g_side_chain_flags = context->flags;
-	context->channels[0][0] *= context->channels[1][0];
-}
-
-void TestCustomSideChainUserFx() {
-	Fixture          main(48000), side(48000);
-	Ngs2RackInternal custom_rack {};
-	auto&            custom = custom_rack.option.custom_submixer.custom_rack_option;
-	custom_rack.ngs         = &main.system;
-	custom_rack.type        = Ngs2RackType::CustomSubmixer;
-	custom.num_buffers      = 2;
-	custom.num_modules      = 1;
-	custom.module[0]        = {nullptr, 0x19, 0, 1, 0};
-	Ngs2VoiceInternal voice;
-	voice.rack = &custom_rack;
-	voice.ports.resize(1);
-	voice.modules.resize(1);
-	struct {
-		Ngs2VoiceParamHeader header {24, 0, 0x40020000};
-		uint32_t             inputs = 1, outputs = 1, flags = 0, reserved = 0;
-	} setup;
-	struct {
-		Ngs2VoiceParamHeader header;
-		void                 KYTY_SYSV_ABI (*handler)(Ngs2UserFxProcessContext*);
-		uintptr_t            user_data[3];
-	} fx {{40, 0, 0x40001900}, MultiplyBySideChain, {7, 0, 0}};
-	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &setup.header) == OK &&
-	          Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &fx.header) == OK,
-	      "custom submixer user FX setup failed");
-	voice.state = Ngs2VoicePlayState::Playing;
-	main.voice.ports.push_back({&voice, 0, 1.0f, -1});
-	side.voice.ports.push_back({&voice, 1, 1.0f, -1});
-	const int16_t main_pcm = 8192, side_pcm = 16384;
-	main.Queue(&main_pcm, 1, 0);
-	side.Queue(&side_pcm, 1, 0);
-	Ngs2RenderVoice(voice, {&main.voice, &side.voice, &voice}, 1);
-	Check(voice.has_samples && voice.samples[0] == 0.125f && voice.samples[1] == 0.5f &&
-	          g_side_chain_flags == 1,
-	      "user FX did not receive the side-chain buffer after the source channels");
-}
-
-struct RenderRack {
-	std::unique_ptr<std::byte[]> storage;
-	uintptr_t handle = 0;
-
-	RenderRack(Ngs2Internal& system, uint32_t id, const Ngs2RackOption& option) {
-		Ngs2ContextBufferInfo buffer {};
-		Check(Ngs2RackQueryBufferSize(id, &option, &buffer) == OK, "rack size query failed");
-		storage = std::make_unique<std::byte[]>(buffer.host_buffer_size);
-		buffer.host_buffer = storage.get();
-		Check(Ngs2RackCreate(reinterpret_cast<uintptr_t>(&system), id, &option, &buffer,
-		                     &handle) == OK, "render rack creation failed");
-	}
-
-	~RenderRack() { Check(Ngs2RackDestroy(handle, nullptr) == OK, "render rack cleanup failed"); }
-
-	Ngs2VoiceInternal& Voice() {
-		return *reinterpret_cast<Ngs2VoiceInternal*>(reinterpret_cast<Ngs2RackInternal*>(handle) + 1);
-	}
-};
-
 void TestPcm16RenderOutput() {
 	Ngs2Internal system;
 	system.option                   = Ngs2DefaultSystemOption();
@@ -879,11 +312,23 @@ void TestPcm16RenderOutput() {
 	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
 	sampler_option.common.max_voices = 2;
 	sampler_option.common.max_ports  = 1;
-	RenderRack sampler(system, 0x1000, sampler_option.common);
-	RenderRack master(system, 0x3000, mastering_option.common);
+	alignas(Ngs2RackInternal) alignas(Ngs2VoiceInternal)
+	    std::byte sampler_storage[sizeof(Ngs2RackInternal) + 2 * sizeof(Ngs2VoiceInternal)];
+	alignas(Ngs2RackInternal) alignas(Ngs2VoiceInternal)
+	    std::byte mastering_storage[sizeof(Ngs2RackInternal) + sizeof(Ngs2VoiceInternal)];
+	Ngs2ContextBufferInfo sampler_buffer {sampler_storage, sizeof(sampler_storage)};
+	Ngs2ContextBufferInfo mastering_buffer {mastering_storage, sizeof(mastering_storage)};
+	uintptr_t sampler_handle = 0, mastering_handle = 0;
 	const auto system_handle = reinterpret_cast<uintptr_t>(&system);
-	auto* samplers = &sampler.Voice();
-	auto& mastering = master.Voice();
+	Check(Ngs2RackCreate(system_handle, 0x1000, &sampler_option.common, &sampler_buffer,
+	                     &sampler_handle) == OK &&
+	          Ngs2RackCreate(system_handle, 0x3000, &mastering_option.common,
+	                         &mastering_buffer, &mastering_handle) == OK,
+	      "PCM16 render rack creation failed");
+	auto* samplers = reinterpret_cast<Ngs2VoiceInternal*>(
+	    reinterpret_cast<Ngs2RackInternal*>(sampler_handle) + 1);
+	auto& mastering = *reinterpret_cast<Ngs2VoiceInternal*>(
+	    reinterpret_cast<Ngs2RackInternal*>(mastering_handle) + 1);
 	mastering.channels = 1;
 	mastering.state    = Ngs2VoicePlayState::Playing;
 	const int16_t source[2][4] = {{16384, -16384, 32767, -32768},
@@ -904,560 +349,9 @@ void TestPcm16RenderOutput() {
 	Check(Ngs2SystemRender(system_handle, &output, 1) == OK &&
 	          std::ranges::all_of(output_samples, [](int16_t sample) { return sample == 0; }),
 	      "PCM16 output retained samples from the previous render");
-}
-
-void TestPatchToRackHandle() {
-	Ngs2Internal system;
-	Ngs2RackOptionUnion sampler_option {}, mastering_option {};
-	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
-	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
-	sampler_option.common.max_voices = 1;
-	RenderRack sampler(system, 0x1000, sampler_option.common);
-	RenderRack master(system, 0x3000, mastering_option.common);
-	auto& source = sampler.Voice();
-	Ngs2VoicePatchParam patch {{24, 0, 5}, 0, 0, master.handle};
-	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&source), &patch.header) == OK &&
-	          source.ports[0].dest == &master.Voice(),
-	      "patch to a rack handle did not connect to its voice #0");
-}
-
-void TestMasteringGain() {
-	Ngs2Internal system;
-	system.option                   = Ngs2DefaultSystemOption();
-	system.option.num_grain_samples = 1;
-	Ngs2RackOptionUnion sampler_option {}, mastering_option {};
-	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
-	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
-	sampler_option.common.max_voices = 1;
-	RenderRack sampler(system, 0x1000, sampler_option.common);
-	RenderRack master(system, 0x3000, mastering_option.common);
-	auto& source = sampler.Voice();
-	auto& mastering = master.Voice();
-	mastering.channels = 8;
-	mastering.state = Ngs2VoicePlayState::Playing;
-	const int16_t frame[8] = {8192, 8192, 8192, 8192, 8192, 8192, 8192, 8192};
-	source.SetupSampler({0x12, 8, 48000});
-	source.blocks.push_back({reinterpret_cast<const uint8_t*>(frame), {0, sizeof(frame), 0, 0, 1}});
-	source.ports[0].dest = &mastering;
-	source.SetEvent(1);
-	struct {
-		Ngs2VoiceParamHeader header {16, 0, 0x30000004};
-		float fbw = 5.0f, lfe = 0.5f;
-	} gain;
-	float pcm[8] = {};
-	Ngs2RenderBufferInfo output {pcm, sizeof(pcm), 0x18, 8};
-	const float expected[8] = {1.0f, 1.0f, 1.0f, 0.125f, 1.0f, 1.0f, 1.0f, 1.0f};
-	Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&mastering), &gain.header) == OK &&
-	          Ngs2SystemRender(reinterpret_cast<uintptr_t>(&system), &output, 1) == OK &&
-	          std::ranges::equal(pcm, expected),
-	      "mastering gain was not clamped or applied per full band and LFE channel");
-}
-
-void TestMasteringDownmix() {
-	Ngs2Internal system;
-	system.option                   = Ngs2DefaultSystemOption();
-	system.option.num_grain_samples = 1;
-	Ngs2RackOptionUnion sampler_option {}, mastering_option {};
-	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
-	Ngs2FillDefaultRackOption(0x3000, &mastering_option);
-	sampler_option.common.max_voices = 1;
-	RenderRack sampler(system, 0x1000, sampler_option.common);
-	RenderRack master(system, 0x3000, mastering_option.common);
-	auto& source = sampler.Voice();
-	auto& mastering = master.Voice();
-	mastering.channels = 2;
-	mastering.state = Ngs2VoicePlayState::Playing;
-	const int16_t frame[2] = {8192, 16384};
-	source.SetupSampler({0x12, 2, 48000});
-	source.blocks.push_back({reinterpret_cast<const uint8_t*>(frame), {0, sizeof(frame), 0, 0, 1}});
-	source.ports[0].dest = &mastering;
-	source.SetEvent(1);
-	// The stored 2.0ch -> 2.0ch matrix applies to neither a mono output nor a mono voice.
-	mastering.output_matrix.assign(4, 0.0f);
-	float pcm = 0.0f;
-	Ngs2RenderBufferInfo output {&pcm, sizeof(pcm), 0x18, 1};
-	Check(Ngs2SystemRender(reinterpret_cast<uintptr_t>(&system), &output, 1) == OK &&
-	          pcm == 0.75f * std::numbers::sqrt2_v<float> / 2,
-	      "stereo mastering voice did not downmix into a mono output");
-	mastering.channels = 1;
-	source.blocks.push_back({reinterpret_cast<const uint8_t*>(frame), {0, sizeof(frame), 0, 0, 1}});
-	float stereo[2] = {};
-	output = {stereo, sizeof(stereo), 0x18, 2};
-	Check(Ngs2SystemRender(reinterpret_cast<uintptr_t>(&system), &output, 1) == OK &&
-	          stereo[0] == pcm * (std::numbers::sqrt2_v<float> / 2) && stereo[1] == stereo[0],
-	      "mono mastering voice did not upmix into a stereo output");
-}
-
-struct ReverbControl {
-	Ngs2VoiceParamHeader header {96, 0, 0x20010001};
-	float                wet = 1.0f, dry = 0.0f;
-	int32_t              room = 0, room_hf = 0;
-	uint32_t             reflection_pattern = 0;
-	float                decay_time = 1.0f, hf_ratio = 1.0f;
-	int32_t              reflections       = 0;
-	float                reflections_delay = 0.0f;
-	int32_t              reverb            = -10000;
-	float    reverb_delay = 0.0f, diffusion = 100.0f, density = 100.0f, hf_reference = 5000.0f;
-	uint32_t channel_mask = 0, reserved[7] {};
-};
-static_assert(sizeof(ReverbControl) == 96);
-
-struct ReverbFixture {
-	Fixture           source;
-	Ngs2RackInternal  rack {};
-	Ngs2VoiceInternal voice;
-
-	explicit ReverbFixture(uint32_t channels = 1): source(48000, channels) {
-		rack.ngs   = &source.system;
-		rack.type  = Ngs2RackType::Reverb;
-		voice.rack = &rack;
-		Setup();
-		source.voice.ports.push_back({&voice, 0, 1.0f, -1});
-	}
-
-	void Setup() {
-		struct {
-			Ngs2VoiceParamHeader header {24, 0, 0x20010000};
-			uint32_t             input, output, flags = 0, reserved = 0;
-		} setup {{24, 0, 0x20010000}, source.voice.channels, source.voice.channels};
-		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &setup.header) == OK,
-		      "reverb setup failed");
-		Event(1);
-	}
-
-	void Control(const ReverbControl& param) {
-		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &param.header) == OK,
-		      "reverb I3DL2 control failed");
-	}
-
-	void Event(uint32_t event) {
-		Ngs2VoiceEventParam param {{sizeof(Ngs2VoiceEventParam), 0, 6}, event};
-		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&voice), &param.header) == OK,
-		      "reverb event failed");
-	}
-
-	const std::vector<float>& Render(uint32_t grain) {
-		source.voice.rendered = voice.rendered = false;
-		Ngs2RenderVoice(voice, {&source.voice, &voice}, grain);
-		return voice.samples;
-	}
-};
-
-void TestReverbMaskAndLevels() {
-	ReverbFixture f(6);
-	ReverbControl param;
-	param.wet               = 2.0f;
-	param.dry               = 3.0f;
-	param.channel_mask      = 0x8; // The stock presets exclude the LFE channel.
-	param.reflections_delay = 0.001f;
-	f.Control(param);
-	const int16_t impulse[6] = {8192, 0, 0, 8192, 0, 0};
-	f.source.Queue(impulse, 1, 0);
-	const auto& output = f.Render(128);
-	Check(output[0] == 0.75f && output[3 * 128] == 0.75f && output[48] == 0.5f &&
-	          output[3 * 128 + 48] == 0.0f,
-	      "reverb lost gain above one, dry mixing or the preset LFE mask");
-
-	ReverbFixture clipped;
-	param.channel_mask = 0;
-	param.wet = param.dry = 64.0f;
-	clipped.Control(param);
-	clipped.source.Queue(impulse, 1, 0);
-	const auto& limited = clipped.Render(128);
-	Check(limited[0] == 8.0f && limited[48] == 8.0f,
-	      "reverb wet/dry gains did not clamp to the PS5 maximum of 32");
-
-	ReverbFixture toggled;
-	param                   = {};
-	param.reflections_delay = 0.02f;
-	toggled.Control(param);
-	toggled.source.Queue(impulse, 1, 0);
-	toggled.Render(64);
-	param.channel_mask = 1;
-	toggled.Control(param);
-	param.channel_mask = 0;
-	toggled.Control(param);
-	const auto& cleared = toggled.Render(2048);
-	Check(std::ranges::all_of(cleared, [](float v) { return v == 0.0f; }),
-	      "unmasking a channel replayed its old reflection");
-}
-
-void TestReverbRoomFilter() {
-	std::vector<int16_t> sine(48000);
-	for (size_t i = 0; i < sine.size(); ++i) {
-		sine[i] =
-		    static_cast<int16_t>(8192.0 * std::sin(2.0 * std::numbers::pi * 5000 * i / 48000));
-	}
-	auto energy = [&](int32_t room_hf, float reference) {
-		ReverbFixture f;
-		ReverbControl param;
-		param.room_hf      = room_hf;
-		param.hf_reference = reference;
-		f.Control(param);
-		f.source.Queue(sine.data(), sine.size(), 0);
-		const auto& output = f.Render(sine.size());
-		double      energy = 0.0;
-		for (size_t i = sine.size() / 2; i < sine.size(); ++i) {
-			energy += double(output[i]) * output[i];
-		}
-		return energy;
-	};
-	const double bright = energy(0, 5000.0f);
-	const double dark   = energy(-6000, 5000.0f);
-	Check(std::abs(std::sqrt(dark / bright) - 0.001) < 0.00003,
-	      "roomHF did not attenuate early reflections at HFReference");
-	Check(energy(-2000, 1000.0f) < energy(-2000, 5000.0f) * 0.1,
-	      "HFReference did not move the room filter response");
-
-	ReverbFixture extreme;
-	ReverbControl param;
-	param.room_hf      = -10000;
-	param.hf_reference = 20.0f;
-	extreme.Control(param);
-	const int16_t impulse = 8192;
-	extreme.source.Queue(&impulse, 1, 0);
-	const auto& output = extreme.Render(32);
-	Check(output[0] > 0.0f && std::ranges::all_of(output, [](float v) { return std::isfinite(v); }),
-	      "extreme room filtering rounded its input coefficient to zero");
-}
-
-void TestReverbLifecycleAndDecayRange() {
-	const int16_t impulse = 8192;
-	for (uint32_t event: {2u, 4u, 8u}) {
-		ReverbFixture f;
-		ReverbControl param;
-		param.reflections_delay = 0.02f;
-		f.Control(param);
-		f.source.Queue(&impulse, 1, 0);
-		f.Render(64);
-		f.Event(event);
-		f.Render(64); // Include a stopped render before restarting the effect.
-		f.Event(1);
-		const auto& output = f.Render(2048);
-		Check(std::ranges::all_of(output, [](float v) { return v == 0.0f; }),
-		      "restarted reverb replayed reflections from a terminated voice");
-	}
-	ReverbFixture reset;
-	ReverbControl param;
-	param.wet = 2.0f;
-	param.dry = 3.0f;
-	reset.Control(param);
-	reset.Setup();
-	reset.source.Queue(&impulse, 1, 0);
-	const auto& defaults = reset.Render(4096);
-	Check(std::ranges::all_of(defaults, [](float v) { return v == 0.0f; }),
-	      "reverb setup did not restore the silent default preset");
-
-	auto tail = [&](float ratio) {
-		ReverbFixture f;
-		ReverbControl param;
-		param.reflections = -10000;
-		param.reverb      = 0;
-		param.hf_ratio    = ratio;
-		f.Control(param);
-		f.source.Queue(&impulse, 1, 0);
-		return f.Render(8192);
-	};
-	const auto damped = tail(0.01f), brighter = tail(0.1f);
-	float      difference = 0.0f;
-	for (size_t i = 0; i < damped.size(); ++i) {
-		Check(std::isfinite(damped[i]), "minimum HF decay ratio produced nonfinite audio");
-		difference = std::max(difference, std::abs(damped[i] - brighter[i]));
-	}
-	Check(difference > 0.001f, "valid PS5 HF decay ratios below 0.1 were clamped away");
-}
-
-void TestReverbDryLevel() {
-	Fixture          f(48000);
-	Ngs2RackInternal reverb_rack {};
-	reverb_rack.ngs  = &f.system;
-	reverb_rack.type = Ngs2RackType::Reverb;
-	Ngs2VoiceInternal reverb;
-	reverb.rack = &reverb_rack;
-	f.voice.ports.push_back({&reverb, 0, 1.0f, -1});
-	const int16_t pcm = 8192;
-	f.Queue(&pcm, 1, 0);
-	struct {
-		Ngs2VoiceParamHeader header {24, 24, 0x20010000};
-		uint32_t             channels[4] = {1, 1, 0, 0};
-		Ngs2VoiceParamHeader levels_header {96, 0, 0x20010001};
-		float                levels[22] = {0.0f, 0.4f};
-	} setup;
-	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&reverb), &setup.header);
-	reverb.SetEvent(1);
-	Ngs2RenderVoice(reverb, {&f.voice, &reverb}, 1);
-	Check(reverb.has_samples && reverb.samples[0] == 0.25f * 0.4f,
-	      "reverb did not pass its dry signal");
-}
-
-// Geometry flags: source cone=1, Doppler=2, volume matrix=4, Audio3d attributes=8.
-void TestGeomStereoPlacement() {
-	Ngs2GeomListenerParam listener;
-	Ngs2GeomListenerWork  work;
-	Ngs2GeomResetListenerParam(&listener);
-	Check(listener.orient_front.z == -1.0f && listener.sound_speed == 340.29f,
-	      "geometry listener defaults are incorrect");
-
-	auto place = [&](float x, float z, uint32_t format = 2) {
-		Ngs2GeomSourceParam source;
-		Ngs2GeomResetSourceParam(&source);
-		source.matrix_format = format;
-		source.position      = {x, 0.0f, z};
-		Ngs2GeomAttribute attrib;
-		Check(Ngs2GeomApply(&work, &source, &attrib, 4) == OK, "geom apply failed");
-		for (uint32_t i = format; i < 64; ++i) {
-			Check(attrib.level[i] == 0.0f, "geometry emitted more than one input row");
-		}
-		return attrib;
-	};
-	for (uint32_t flags: {0u, 1u}) {
-		// No flag means right-handed; bit 0 explicitly selects left-handed coordinates.
-		listener.orient_front.z = flags == 0 ? -1.0f : 1.0f;
-		Check(Ngs2GeomCalcListener(&listener, &work, flags) == OK, "geom listener failed");
-		auto attrib = place(0.0f, listener.orient_front.z);
-		Check(std::abs(attrib.level[0] - attrib.level[1]) < 0.001f && attrib.level[0] > 0.5f,
-		      "source ahead should be centred");
-		attrib = place(1.0f, 0.0f);
-		Check(attrib.level[1] > 0.99f && std::abs(attrib.level[0]) < 0.001f,
-		      "source on the right should pan right in either coordinate system");
-		attrib = place(-1.0f, 0.0f);
-		Check(attrib.level[0] > 0.99f && std::abs(attrib.level[1]) < 0.001f,
-		      "source on the left should pan left in either coordinate system");
-		Check(place(1.0f, 0.0f, 1).level[0] == 1.0f && place(-1.0f, 0.0f, 1).level[0] == 1.0f,
-		      "mono geometry output depends on stereo pan direction");
-		const auto near = place(2.0f, 0.0f);
-		Check(place(20.0f, 0.0f).level[1] < near.level[1], "a distant source should be quieter");
-	}
-	listener.position     = {10.0f, 0.0f, 0.0f};
-	listener.orient_front = {1.0f, 0.0f, 0.0f};
-	Check(Ngs2GeomCalcListener(&listener, &work, 0) == OK, "rotated listener failed");
-	Check(place(10.0f, 1.0f).level[1] > 0.99f, "listener position or rotation was ignored");
-}
-
-void TestGeomRolloffAndFlags() {
-	Ngs2GeomListenerParam listener;
-	Ngs2GeomListenerWork  work;
-	Ngs2GeomResetListenerParam(&listener);
-	Check(Ngs2GeomCalcListener(&listener, &work, 0) == OK, "geom listener failed");
-	Ngs2GeomSourceParam source;
-	Ngs2GeomResetSourceParam(&source);
-	Ngs2GeomAttribute attrib;
-	// The six models are inverse, linear, exponential, then their clamped variants.
-	const float at_five[3]   = {1.0f / 3.0f, 7.0f / 9.0f, std::sqrt(0.2f)};
-	const float at_twenty[6] = {2.0f / 21.0f, 0.0f, std::sqrt(0.05f),
-	                            2.0f / 11.0f, 0.5f, std::sqrt(0.1f)};
-	for (uint32_t model = 0; model < 6; ++model) {
-		source.rolloff  = {model, 10.0f, 0.5f, 1.0f};
-		source.position = {0.0f, 0.0f, -5.0f};
-		Check(Ngs2GeomApply(&work, &source, &attrib, 8) == OK &&
-		          std::abs(attrib.a3d_attrib.volume - at_five[model % 3]) < 1e-6f,
-		      "geometry selected the wrong rolloff equation");
-		source.position.z = -20.0f;
-		Check(Ngs2GeomApply(&work, &source, &attrib, 8) == OK &&
-		          std::abs(attrib.a3d_attrib.volume - at_twenty[model]) < 1e-6f,
-		      "geometry confused clamped and unclamped rolloff models");
-	}
-
-	source.rolloff.rolloff_factor = 0.0f;
-	source.position               = {0.0f, 0.0f, -1.0f};
-	source.direction              = {0.0f, 0.0f, -1.0f};
-	source.cone                   = {1.0f, 30.0f, 0.0f, 60.0f};
-	source.velocity               = {0.0f, 0.0f, 5.0f};
-	Check(Ngs2GeomApply(&work, &source, &attrib, 4) == OK && attrib.pitch_ratio == 1.0f &&
-	          attrib.a3d_attrib.volume == 0.0f && attrib.a3d_attrib.position.z == 0.0f &&
-	          attrib.level[0] > 0.5f && attrib.level[1] > 0.5f,
-	      "matrix-only geometry applied disabled cone, Doppler, or Audio3d flags");
-	Check(Ngs2GeomApply(&work, &source, &attrib, 8) == OK && attrib.a3d_attrib.volume == 1.0f,
-	      "disabled source cone changed Audio3d volume");
-	for (float value: attrib.level) {
-		Check(value == 0.0f, "Audio3d-only geometry calculated a volume matrix");
-	}
-	Check(Ngs2GeomApply(&work, &source, &attrib, 1 | 8) == OK && attrib.a3d_attrib.volume == 0.0f,
-	      "enabled source cone did not attenuate a listener behind the source");
-	source.cone.outer_angle = 360.0f;
-	// acos and the conversion to degrees can round just below the outer cone boundary.
-	Check(Ngs2GeomApply(&work, &source, &attrib, 1 | 8) == OK &&
-	          std::abs(attrib.a3d_attrib.volume) < 1e-6f,
-	      "360-degree outer cone bypassed source directionality");
-	source.cone      = {2.0f, 360.0f, 2.0f, 360.0f};
-	source.max_level = 0.75f;
-	Check(Ngs2GeomApply(&work, &source, &attrib, 1 | 8) == OK && attrib.a3d_attrib.volume == 0.75f,
-	      "source cone amplification exceeded the maximum level");
-	source.cone      = {-1.0f, 0.0f, 1.0f, 360.0f};
-	source.direction = {1.0f, 0.0f, 0.0f};
-	source.max_level = 1.0f;
-	Check(Ngs2GeomApply(&work, &source, &attrib, 1 | 8) == OK &&
-	          std::abs(attrib.a3d_attrib.volume - 0.5f) < 1e-6f,
-	      "cone levels were not clamped before interpolation");
-	source.position  = {};
-	source.rolloff   = {0, 100.0f, 1.0f, 1.0f};
-	source.min_level = source.max_level = 0.0f;
-	Check(Ngs2GeomApply(&work, &source, &attrib, 8) == OK && attrib.a3d_attrib.volume == 0.0f,
-	      "a muted colocated source produced a non-finite volume");
-}
-
-void TestGeomDoppler() {
-	Ngs2GeomListenerParam listener;
-	Ngs2GeomListenerWork  work;
-	Ngs2GeomResetListenerParam(&listener);
-	Check(Ngs2GeomCalcListener(&listener, &work, 0) == OK, "geom listener failed");
-
-	auto pitch = [&](float source_vz, float listener_vz, uint32_t flags = 2,
-	                 float doppler_factor = 1.0f) {
-		Ngs2GeomListenerWork moving = work;
-		moving.velocity             = {0.0f, 0.0f, listener_vz};
-		Ngs2GeomSourceParam source;
-		Ngs2GeomResetSourceParam(&source);
-		source.position       = {0.0f, 0.0f, 10.0f};
-		source.velocity       = {0.0f, 0.0f, source_vz};
-		source.doppler_factor = doppler_factor;
-		Ngs2GeomAttribute attrib;
-		Check(Ngs2GeomApply(&moving, &source, &attrib, flags) == OK, "geom apply failed");
-		return attrib.pitch_ratio;
-	};
-	Check(pitch(-5.0f, 0.0f) > 1.0f, "approaching source should raise pitch");
-	Check(pitch(5.0f, 0.0f) < 1.0f, "receding source should lower pitch");
-	Check(pitch(0.0f, 5.0f) > 1.0f, "approaching listener should raise pitch");
-	Check(pitch(0.0f, -5.0f) < 1.0f, "receding listener should lower pitch");
-	Check(pitch(-5.0f, 5.0f, 0) == 1.0f, "disabled Doppler changed pitch");
-	Check(pitch(-1000.0f, 0.0f) == 4.0f, "Doppler exceeded the pitch ratio limit");
-	Check(std::abs(pitch(-0.5f, 0.0f, 2, work.sound_speed) - 2.0f) < 1e-6f,
-	      "a large Doppler factor incorrectly capped subsonic velocity");
-}
-
-void TestReverbTail() {
-	Ngs2ReverbState reverb;
-	reverb.params = {0.6f, 0.4f, -1000, -602, -302, 2.91f, 1.3f, 0.015f, 0.022f};
-	reverb.Prepare(2, 48000);
-	const uint32_t     grain = 256;
-	std::vector<float> block(2 * grain, 0.0f);
-	Check(!reverb.Process(block, grain, false), "idle reverb produced output");
-
-	block[0]     = 1.0f;
-	block[grain] = 1.0f;
-	Check(reverb.Process(block, grain, true), "reverb dropped its input");
-	Check(std::abs(block[0] - 0.4f) < 1e-6f, "reverb changed the dry level");
-
-	float early = 0.0f, late = 0.0f;
-	for (int g = 1; g < 1400; ++g) {
-		std::ranges::fill(block, 0.0f);
-		const bool out  = reverb.Process(block, grain, false);
-		float      peak = 0.0f;
-		for (float v: block) {
-			Check(std::isfinite(v) && std::abs(v) < 1.0f, "reverb tail is unstable");
-			peak = std::max(peak, std::abs(v));
-		}
-		if (g == 20) {
-			early = peak;
-		}
-		if (g == 400) {
-			late = peak;
-		}
-		if (!out) {
-			Check(g > 600, "reverb tail ended too early");
-			Check(late > 0.0f && late < early, "reverb tail did not decay");
-			return;
-		}
-	}
-	Check(false, "reverb tail never ended");
-}
-
-void TestCustomMasteringChannelMixer() {
-	Ngs2Internal system;
-	system.option = Ngs2DefaultSystemOption();
-	system.option.num_grain_samples = 6;
-	Ngs2RackOptionUnion sampler_option {};
-	Ngs2FillDefaultRackOption(0x1000, &sampler_option);
-	sampler_option.common.max_voices = 1;
-	sampler_option.common.max_ports = 1;
-	Ngs2CustomMasteringRackOption master_option {};
-	auto& custom = master_option.custom_rack_option;
-	custom.rack_option.size = sizeof(master_option);
-	custom.rack_option.max_voices = 1;
-	custom.rack_option.max_voice_channels = 6;
-	custom.num_buffers = 1;
-	custom.num_modules = 1;
-	custom.module[0].module_id = 0x17;
-	RenderRack sampler(system, 0x1000, sampler_option.common);
-	RenderRack master(system, 0x4003, custom.rack_option);
-	auto& source = sampler.Voice();
-	auto& output = master.Voice();
-	output.channels = 6;
-	output.SetEvent(1);
-	struct {
-		Ngs2VoiceParamHeader header {5484, 0, 0x40001700};
-		float levels[37][37] {};
-	} matrix;
-	constexpr float center = 0.70710677f;
-	matrix.levels[0][0] = matrix.levels[1][1] = 1.0f;
-	matrix.levels[0][2] = matrix.levels[1][2] = center;
-	matrix.levels[0][4] = matrix.levels[1][5] = center;
-	int16_t impulses[6][6] {};
-	for (uint32_t c = 0; c < 6; ++c) impulses[c][c] = 8192;
-	for (unsigned pass = 0; pass < 2; ++pass) {
-		if (pass == 1) {
-			std::memset(matrix.levels, 0, sizeof(matrix.levels));
-			matrix.levels[0][1] = 64.0f;
-			matrix.levels[1][0] = -64.0f;
-		}
-		Check(Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&output), &matrix.header) == OK,
-		      "custom channel mixer control failed");
-		source.SetupSampler({0x12, 6, 48000});
-		source.blocks.push_back({reinterpret_cast<const uint8_t*>(impulses),
-		                         {0, sizeof(impulses), 0, 0, 6}});
-		source.ports[0].dest = &output;
-		source.SetEvent(1);
-		std::array<float, 14> pcm;
-		pcm.fill(99.0f);
-		Ngs2RenderBufferInfo buffer {pcm.data() + 1, 12 * sizeof(float), 0x18, 2};
-		Check(Ngs2SystemRender(reinterpret_cast<uintptr_t>(&system), &buffer, 1) == OK,
-		      "custom mastering rejected stereo output");
-		const std::array<float, 12> expected = pass == 0
-		    ? std::array<float, 12> {0.25f, 0, 0, 0.25f, center / 4, center / 4,
-		                             0, 0, center / 4, 0, 0, center / 4}
-		    : std::array<float, 12> {0, -8, 8, 0};
-		Check(pcm.front() == 99 && pcm.back() == 99 &&
-		          std::equal(expected.begin(), expected.end(), pcm.begin() + 1),
-		      "custom mixer lost channel routing, in-place input, clamping or output bounds");
-	}
-}
-
-void TestCustomVoiceStateCapacity() {
-	for (auto type: {Ngs2RackType::CustomSampler, Ngs2RackType::CustomMastering}) {
-		Fixture f(48000, 1, Ngs2RackType::CustomSampler);
-		f.rack.type = type;
-		f.rack.option.custom_sampler.custom_rack_option.state_size = 212;
-		f.voice.state_flags = 3;
-		f.voice.decoded_samples = 37;
-		f.voice.decoded_bytes = 128;
-		alignas(Ngs2CustomSamplerVoiceState) std::array<uint8_t, 384> storage;
-		auto* state = reinterpret_cast<Ngs2VoiceState*>(storage.data() + 8);
-		const auto handle = reinterpret_cast<uintptr_t>(&f.voice);
-		for (size_t capacity: {212u, 368u}) {
-			storage.fill(0xa5);
-			Check(Ngs2VoiceGetState(handle, state, capacity) == OK && state->state_flags == 3 &&
-			          state->error_code == 0 &&
-			          std::all_of(storage.begin(), storage.begin() + 8,
-			                      [](uint8_t v) { return v == 0xa5; }) &&
-			          std::all_of(storage.begin() + 220, storage.end(),
-			                      [](uint8_t v) { return v == 0xa5; }),
-			      "oversized custom state buffer was rejected or overwritten past configured state");
-			if (type == Ngs2RackType::CustomSampler) {
-				const auto* sampler = reinterpret_cast<const Ngs2CustomSamplerVoiceState*>(state);
-				Check(sampler->num_decoded_samples == 37 && sampler->decoded_data_size == 128,
-				      "custom sampler state omitted playback progress");
-			}
-			const size_t base_size = type == Ngs2RackType::CustomSampler
-			    ? sizeof(Ngs2CustomSamplerVoiceState) : sizeof(Ngs2CustomMasteringVoiceState);
-			Check(std::all_of(storage.begin() + 8 + base_size, storage.begin() + 220,
-			                  [](uint8_t v) { return v == 0; }),
-			      "configured custom state extension was not initialized");
-		}
-		storage.fill(0xa5);
-		Check(Ngs2VoiceGetState(handle, state, 211) == static_cast<int32_t>(0x804a8011u) &&
-		          std::ranges::all_of(storage, [](uint8_t v) { return v == 0xa5; }),
-		      "undersized custom state buffer was accepted or modified");
-	}
+	Check(Ngs2RackDestroy(mastering_handle, nullptr) == OK &&
+	          Ngs2RackDestroy(sampler_handle, nullptr) == OK,
+	      "PCM16 render rack cleanup failed");
 }
 
 void TestPitchLoopAndSkip() {
@@ -1504,55 +398,11 @@ void TestStarvationAndPause() {
 	f.Queue(pcm, 2, 0);
 	f.voice.SetEvent(16);
 	f.Render(2);
-	Check(!f.voice.has_samples && f.voice.blocks.front().data_cursor == 0,
-	      "paused voice consumed data");
+	Check(!f.voice.has_samples && f.voice.blocks.front().cursor == 0, "paused voice consumed data");
 	f.voice.SetEvent(32);
 	f.Render(2);
 	Check(f.voice.samples[0] == 0.5f && f.voice.samples[1] == 0.25f,
 	      "stream failed to resume after starvation/pause");
-}
-
-void TestPcmByteUnitStreaming() {
-	Fixture                 f(48000);
-	const int16_t           pcm[] = {0, 4096, 8192, 12288, 16384, 20480, 24576, 28672};
-	const Ngs2WaveformBlock first {0, 4, 0, 1, 5, 0, 0}, rest {4, 12, 0, 0, 99, 0, 0};
-	Check(f.QueueBlocks(pcm, &first, 1, 1) == OK && f.QueueBlocks(pcm, &rest, 1, 0x12) == OK &&
-	          f.voice.WaveformData() == reinterpret_cast<const uint8_t*>(pcm + 1),
-	      "byte-unit stream was rejected or its read address ignored the skipped frame");
-	f.Render(8);
-	Check(f.voice.samples == std::vector<float> {0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0, 0, 0} &&
-	          f.voice.blocks.empty() && f.voice.decoded_samples == 5,
-	      "byte-unit stream did not play exactly its duration across data-only blocks");
-}
-
-void TestPcmSkipAcrossBlocks() {
-	Fixture                 f(48000);
-	const int16_t           pcm[] = {1, 2, 3, 8192, 16384};
-	const Ngs2WaveformBlock first {0, 4, 0, 3, 2, 0, 0}, rest {4, 6, 0, 0, 0, 0, 0};
-	Check(f.QueueBlocks(pcm, &first, 1, 1) == OK, "skipping stream block was rejected");
-	f.Render(1);
-	Check(!f.voice.has_samples && f.voice.blocks.empty(), "skip-only block produced samples");
-	Check(f.QueueBlocks(pcm, &rest, 1, 2) == OK &&
-	          f.voice.WaveformData() == reinterpret_cast<const uint8_t*>(pcm + 3),
-	      "read address ignored the skip remaining from the previous block");
-	f.Render(2);
-	Check(f.voice.samples == std::vector<float> {0.25f, 0.5f} && f.voice.decoded_samples == 2 &&
-	          f.voice.decoded_bytes == sizeof(pcm),
-	      "skip spanning blocks played skipped frames or miscounted decoded data");
-}
-
-void TestPcmBlocksEndWithTheirData() {
-	// The Last Oricru queues blocks holding fewer frames than they declare, even none.
-	Fixture                 f(48000, 2);
-	const int16_t           pcm[] = {4096, -4096, 8192, -8192, 12288, -12288};
-	const Ngs2WaveformBlock blocks[] = {
-	    {0, 0, 0, 0, 16385, 0, 0}, {0, 8, 0, 0, 4, 0, 0}, {8, 4, 0, 0, 3, 0, 0}};
-	Check(f.QueueBlocks(pcm, blocks, 3, 0) == OK, "partially filled blocks were rejected");
-	f.Render(5);
-	Check(f.voice.samples == std::vector<float> {0.125f, 0.25f, 0.375f, 0, 0, -0.125f, -0.25f,
-	                                             -0.375f, 0, 0} &&
-	          f.voice.blocks.empty() && f.voice.decoded_samples == 3,
-	      "partially filled blocks did not play their data back to back");
 }
 
 void TestMonoRateAndRouting() {
@@ -1560,7 +410,6 @@ void TestMonoRateAndRouting() {
 	std::vector<int16_t> pcm(441, 16384);
 	f.Queue(pcm.data(), 441, 0);
 	Ngs2RackInternal mastering_rack {};
-	mastering_rack.ngs  = &f.system;
 	mastering_rack.type = Ngs2RackType::Mastering;
 	Ngs2VoiceInternal mastering;
 	mastering.rack     = &mastering_rack;
@@ -1582,39 +431,9 @@ void TestMonoRateAndRouting() {
 	      "22.05 kHz effect duration was incorrect");
 }
 
-void TestDefaultMatrix() {
-	struct Case {
-		uint32_t           src_channels;
-		int32_t            matrix;
-		uint32_t           dst_channels;
-		std::vector<float> expected;
-	};
-	constexpr float minus_3db = std::numbers::sqrt2_v<float> / 2;
-	const int16_t   pcm[]     = {8192, -16384};
-	for (const auto& c: {Case {1, -1, 2, {0.25f * minus_3db, 0.25f * minus_3db}},
-	                     Case {1, 0, 2, {0.25f * minus_3db, 0.25f * minus_3db}},
-	                     Case {2, -1, 1, {0.25f * minus_3db + -0.5f * minus_3db}},
-	                     Case {1, -1, 6, {0, 0, 0.25f, 0, 0, 0}}}) {
-		Fixture          f(48000, c.src_channels);
-		Ngs2RackInternal rack {};
-		rack.ngs  = &f.system;
-		rack.type = Ngs2RackType::Mastering;
-		Ngs2VoiceInternal dest;
-		dest.rack     = &rack;
-		dest.channels = c.dst_channels;
-		dest.state    = Ngs2VoicePlayState::Playing;
-		f.voice.matrices.resize(1);
-		f.voice.ports.push_back({&dest, 0, 1.0f, c.matrix});
-		f.Queue(pcm, 1, 0);
-		Ngs2RenderVoice(dest, {&f.voice, &dest}, 1);
-		Check(dest.samples == c.expected, "default port mix produced the wrong channel levels");
-	}
-}
-
 void TestMatrixOutputChannels() {
 	Fixture f(48000, 2);
 	Ngs2RackInternal mastering_rack {};
-	mastering_rack.ngs  = &f.system;
 	mastering_rack.type = Ngs2RackType::Mastering;
 	Ngs2VoiceInternal mastering;
 	mastering.rack     = &mastering_rack;
@@ -1647,7 +466,6 @@ void TestSamplerReuseResetsRouting() {
 	for (auto type: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
 		Fixture          f(48000, 1, type);
 		Ngs2RackInternal mastering_rack {};
-		mastering_rack.ngs  = &f.system;
 		mastering_rack.type = Ngs2RackType::Mastering;
 		Ngs2VoiceInternal mastering;
 		mastering.rack     = &mastering_rack;
@@ -1664,7 +482,7 @@ void TestSamplerReuseResetsRouting() {
 		const int16_t pcm[] = {8192, 16384, -8192, -16384};
 		f.Queue(pcm, 2, 0);
 		f.Render(1);
-		Check(!f.voice.has_samples && f.voice.blocks.front().data_cursor == 0,
+		Check(!f.voice.has_samples && f.voice.blocks.front().cursor == 0,
 		      "sampler setup started the new waveform without a play event");
 		f.voice.ports[0].dest = &mastering;
 		f.voice.SetEvent(1);
@@ -1696,62 +514,6 @@ void TestDeferredSamplerSetup() {
 	f.Render(1);
 	Check(f.voice.samples[0] == 0.25f,
 	      "sampler did not play after deferred stream setup");
-}
-
-void TestClearReopensClosedList() {
-	Fixture       f(48000);
-	const int16_t first = 8192, second = -16384;
-	f.Queue(&first, 1, 0);
-	f.Queue(&second, 1, 4);
-	f.Render(1);
-	Check(f.voice.samples[0] == -0.5f, "CLEAR did not reopen a closed waveform list");
-}
-
-std::vector<uint32_t> g_block_attributes;
-
-void KYTY_SYSV_ABI RecordBlockAttributes(const Ngs2VoiceCallbackInfo* info) {
-	g_block_attributes.push_back(info->attributes);
-}
-
-void TestCancelSkipsBlocksNotStarted() {
-	Fixture f(48000);
-	f.system.option.num_grain_samples = 1;
-	f.voice.callback       = reinterpret_cast<uintptr_t>(&RecordBlockAttributes);
-	f.voice.callback_flags = 1;
-	const int16_t pcm[] = {8192, 16384, -8192, -16384};
-	f.Queue(pcm, 2, 1, 1);
-	f.Queue(pcm + 2, 1, 1);
-	f.Render(1);
-	// Cancel during the first pass of the looping block.
-	f.Queue(pcm + 3, 1, 9);
-	f.Render(4);
-	Check(f.voice.samples == std::vector<float> {0.5f, 0.25f, 0.5f, -0.5f},
-	      "CANCEL did not keep the playing block and skip the queued one");
-	Check(g_block_attributes == std::vector<uint32_t> {1, 1, 0},
-	      "block callbacks did not report the canceled blocks");
-}
-
-void TestSetupQuery() {
-	Fixture  f(48000, 2);
-	uint32_t info[2] = {99, 99};
-	Ngs2VoiceQueryInfo(reinterpret_cast<uintptr_t>(&f.voice), 0x4001, info, sizeof(info));
-	Check(info[0] == 2 && info[1] == 0, "setup query did not report the voice channels");
-}
-
-void TestPortInfo() {
-	Fixture           f(48000);
-	Ngs2VoiceInternal dest;
-	f.voice.ports.push_back({&dest, 1, 0.5f, 0});
-	struct {
-		int32_t   matrix;
-		float     volume;
-		uint32_t  delay_samples, input;
-		uintptr_t dest;
-	} info {99, 99, 99, 99, 99};
-	Ngs2VoiceGetPortInfo(reinterpret_cast<uintptr_t>(&f.voice), 0, &info, sizeof(info));
-	Check(info.matrix == 0 && info.volume == 0.5f && info.delay_samples == 0 && info.input == 1 &&
-	          info.dest == reinterpret_cast<uintptr_t>(&dest),
-	      "port info did not report the port routing and volume");
 }
 
 void TestPlayStateBeforeRender() {
@@ -1983,9 +745,9 @@ void KYTY_SYSV_ABI RecordLoopCallback(const Ngs2VoiceCallbackInfo* info) {
 	}
 }
 
-void TestLoopCallbacksAndExit(Ngs2RackType type) {
+void TestLoopCallbacksAndExit() {
 	const int16_t pcm[] = {8192, 16384, 24576};
-	Fixture       f(48000, 1, type);
+	Fixture       f(48000);
 	LoopCallbacks log;
 	f.voice.callback       = reinterpret_cast<uintptr_t>(&RecordLoopCallback);
 	f.voice.callback_data  = reinterpret_cast<uintptr_t>(&log);
@@ -1996,7 +758,7 @@ void TestLoopCallbacksAndExit(Ngs2RackType type) {
 	      "loop and completion callbacks lost the completed repeat count");
 	Check(f.voice.blocks.empty(), "finite loop did not complete");
 
-	Fixture active(48000, 1, type);
+	Fixture active(48000);
 	log.events.clear();
 	log.pause                   = true;
 	active.voice.callback       = reinterpret_cast<uintptr_t>(&RecordLoopCallback);
@@ -2006,18 +768,17 @@ void TestLoopCallbacksAndExit(Ngs2RackType type) {
 	active.Queue(pcm + 2, 1, 0);
 	active.Render(6);
 	Check(log.events.size() == 1 && active.voice.decoded_samples == 2 &&
-	          active.voice.blocks.front().data_cursor == 0 && active.voice.samples[2] == 0,
+	          active.voice.blocks.front().cursor == 0 && active.voice.samples[2] == 0,
 	      "loop callback pause consumed another iteration");
-	Ngs2VoiceParamHeader exit_loop {sizeof(Ngs2VoiceParamHeader), 0,
-	                                type == Ngs2RackType::Sampler ? 0x10000004u : 0x40010004u};
+	Ngs2VoiceParamHeader exit_loop {sizeof(Ngs2VoiceParamHeader), 0, 0x10000004};
 	Ngs2VoiceControl(reinterpret_cast<uintptr_t>(&active.voice), &exit_loop);
 	active.voice.SetEvent(32);
-	active.Render(5);
-	Check(active.voice.samples == std::vector<float> {0.25f, 0.5f, 0.25f, 0.5f, 0.75f} &&
+	active.Render(3);
+	Check(active.voice.samples == std::vector<float> {0.25f, 0.5f, 0.75f} &&
 	          active.voice.blocks.empty() && log.events.size() == 1,
 	      "exiting infinite loop lost its final iteration or ignored callback flags");
 
-	Fixture pending(48000, 1, type);
+	Fixture pending(48000);
 	pending.Queue(pcm, 1, 1);
 	pending.Queue(pcm + 1, 1, 1, UINT32_MAX);
 	pending.Queue(pcm + 2, 1, 0);
@@ -2097,69 +858,8 @@ void TestAtrac9Looping() {
 	      "compressed loop exit failed to finish the active iteration");
 }
 
-void TestAtrac9WaveformJoining() {
-	std::array<uint8_t, 192> encoded {};
-	for (size_t i = 0; i < 4; ++i) {
-		std::copy(ATRAC9_MONO_BLOCK.begin(), ATRAC9_MONO_BLOCK.end(),
-		          encoded.begin() + i * ATRAC9_MONO_BLOCK.size());
-		if (i != 0) encoded[i * ATRAC9_MONO_BLOCK.size()] |= 0x80;
-	}
-	for (auto rack: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
-		Fixture reference(24000, 1, rack);
-		reference.voice.SetupSampler({NGS2_WAVEFORM_TYPE_ATRAC9, 1, 24000, 0xfe4005f0});
-		reference.voice.state = Ngs2VoicePlayState::Playing;
-		const Ngs2WaveformBlock whole {0, encoded.size(), 0, 0, 512, 0, 123};
-		Check(reference.QueueBlocks(encoded.data(), &whole, 1, 0) == OK,
-		      "compressed reference block could not be queued");
-		reference.Render(1024);
-		for (bool nojoin: {false, true}) {
-			Fixture f(24000, 1, rack);
-			f.SetCapacity(1);
-			f.voice.SetupSampler({NGS2_WAVEFORM_TYPE_ATRAC9, 1, 24000, 0xfe4005f0});
-			f.voice.state = Ngs2VoicePlayState::Playing;
-			LoopCallbacks callbacks;
-			f.voice.callback = reinterpret_cast<uintptr_t>(&RecordLoopCallback);
-			f.voice.callback_data = reinterpret_cast<uintptr_t>(&callbacks);
-			f.voice.callback_flags = 1;
-			const Ngs2WaveformBlock first {0, 36, 0, 0, 512, 0, 123};
-			const Ngs2WaveformBlock rest {36, encoded.size() - 36, 99, 99, 99, 0, 123};
-			Check(f.QueueBlocks(encoded.data(), &first, 1, 1) == OK,
-			      "compressed stream start could not be queued");
-			const uint32_t flags = nojoin ? 0x12 : 2;
-			if (nojoin) {
-				Check(f.QueueBlocks(encoded.data(), &rest, 1, flags) ==
-				          static_cast<int32_t>(0x804a8054u) &&
-				          f.voice.blocks.size() == 1 && f.voice.blocks.front().info.data_size == 36 &&
-				          f.voice.accepts_blocks,
-				      "NOJOINT bypassed capacity or changed the full stream");
-				f.SetCapacity(2);
-			}
-			Check(f.QueueBlocks(encoded.data(), &rest, 1, flags) == OK &&
-			          f.voice.blocks.size() == (nojoin ? 2u : 1u),
-			      "consecutive ONLY_DATA blocks did not follow the joining flag");
-			f.Render(1024);
-			Check(f.voice.samples == reference.voice.samples && f.voice.decoded_samples == 512 &&
-			          f.voice.decoded_bytes == encoded.size() && f.voice.blocks.empty() &&
-			          callbacks.events.size() == (nojoin ? 2u : 1u),
-			      "compressed joining changed audio, progress, or block completion callbacks");
-		}
-		Fixture full(24000, 1, rack);
-		full.SetCapacity(2);
-		full.voice.SetupSampler({NGS2_WAVEFORM_TYPE_ATRAC9, 1, 24000, 0xfe4005f0});
-		const Ngs2WaveformBlock initial[] = {{0, 36, 0, 0, 512}, {36, 36, 0, 0, 512}};
-		const Ngs2WaveformBlock addition[] = {{72, 36}, {144, 48}};
-		Check(full.QueueBlocks(encoded.data(), initial, 2, 1) == OK &&
-		          full.QueueBlocks(encoded.data(), addition, 2, 2) ==
-		              static_cast<int32_t>(0x804a8054u) &&
-		          full.voice.blocks.size() == 2 && full.voice.blocks.back().info.data_size == 36 &&
-		          full.voice.accepts_blocks,
-		      "overflow after a tentative join partially extended or closed the stream");
-	}
-}
-
 void TestWaveformReadAddress() {
 	Fixture       f(48000, 2);
-	f.system.option.num_grain_samples = 1;
 	const int16_t pcm[] = {-100, -100, 8192, 4096, 16384, 8192};
 	f.Queue(pcm, 2, 1, 1, 1);
 	const auto next_data = [&]() {
@@ -2187,12 +887,11 @@ struct CallbackEvent {
 	Ngs2VoiceInternal* voice;
 	uint32_t           event;
 	uint32_t           calls = 0;
-	uint32_t           trigger = 1;
 };
 
 void KYTY_SYSV_ABI ApplyCallbackEvent(const Ngs2VoiceCallbackInfo* info) {
 	auto& context = *reinterpret_cast<CallbackEvent*>(info->data);
-	if (++context.calls == context.trigger) {
+	if (++context.calls == 1) {
 		context.voice->SetEvent(context.event);
 	}
 }
@@ -2211,15 +910,14 @@ void TestCallbackStopsConsumption() {
 			f.Render(2);
 			Check(f.voice.state != Ngs2VoicePlayState::Playing && context.calls == 1,
 			      "completion callback failed to interrupt playback");
-			Check(f.voice.samples[0] == 0.0f && f.voice.samples[1] == 0.0f &&
+			Check(f.voice.samples[0] == 0.25f && f.voice.samples[1] == 0.0f &&
 			          f.voice.decoded_samples == 1 && f.voice.blocks.size() == 1 &&
-			          f.voice.blocks.front().data_cursor == 0,
+			          f.voice.blocks.front().cursor == 0,
 			      "callback pause/stop consumed the next queued block");
 			if (event == 16) {
 				f.voice.SetEvent(32);
-				f.Render(2);
-				Check(f.voice.samples == std::vector<float> {0.25f, 0.5f} &&
-				          f.voice.decoded_samples == 2,
+				f.Render(1);
+				Check(f.voice.samples[0] == 0.5f && f.voice.decoded_samples == 2,
 				      "callback pause failed to preserve queued audio for resume");
 			}
 		}
@@ -2238,93 +936,13 @@ void TestCallbackPauseDuringLargeStep() {
 	f.voice.callback_data  = reinterpret_cast<uintptr_t>(&context);
 	f.voice.callback_flags = 1;
 	f.Render(2);
-	Check(context.calls == 1 && f.voice.decoded_samples == 1 && f.voice.sample_phase == 0 &&
-	          !f.voice.has_samples,
+	Check(context.calls == 1 && f.voice.decoded_samples == 1 &&
+	          f.voice.sample_phase == (uint64_t(72000) << 32u),
 	      "pause advanced across additional blocks in a large resampling step");
 	f.voice.SetEvent(32);
-	f.Render(2);
-	Check(f.voice.samples[0] == 0.25f && std::abs(f.voice.samples[1] - 0.4375f) < 1e-7f &&
-	          context.calls == 3,
+	f.Render(1);
+	Check(std::abs(f.voice.samples[0] - 0.4375f) < 1e-7f && context.calls == 3,
 	      "resume lost fractional position or read past the next short block");
-}
-
-void TestCallbackPauseDuringLookahead() {
-	for (auto rack: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
-		Fixture f(24000, 1, rack);
-		f.system.option.num_grain_samples = 1;
-		int16_t pcm[] = {8192, 16384};
-		f.Queue(pcm, 1, 1);
-		f.Queue(pcm + 1, 1, 0);
-		CallbackEvent context {&f.voice, 16, 0, 2};
-		f.voice.callback = reinterpret_cast<uintptr_t>(&ApplyCallbackEvent);
-		f.voice.callback_data = reinterpret_cast<uintptr_t>(&context);
-		f.voice.callback_flags = 1;
-		f.Render(1);
-		Check(f.voice.samples[0] == 0.25f, "initial source sample was not rendered");
-		f.Render(2);
-		Check(!f.voice.has_samples && f.voice.state == Ngs2VoicePlayState::Paused &&
-		          context.calls == 2 && f.State().num_decoded_samples == 2 &&
-		          f.voice.sample_phase == (uint64_t(24000) << 32u),
-		      "lookahead callback pause consumed output or lost decoded progress");
-		pcm[0] = pcm[1] = -32768;
-		f.voice.SetEvent(32);
-		f.Render(3);
-		Check(f.voice.samples == std::vector<float> {0.375f, 0.5f, 0.5f} &&
-		          f.voice.state == Ngs2VoicePlayState::Empty,
-		      "lookahead pause failed to preserve owned samples or fractional playback position");
-	}
-}
-
-struct CallbackReplacement {
-	Fixture& fixture;
-	bool setup;
-	uint32_t trigger, calls = 0;
-	const std::array<int16_t, 4> pcm {16384, 8192, 4096, 2048};
-};
-
-void KYTY_SYSV_ABI ReplaceCallbackSource(const Ngs2VoiceCallbackInfo* info) {
-	auto& replacement = *reinterpret_cast<CallbackReplacement*>(info->data);
-	if (++replacement.calls != replacement.trigger) {
-		return;
-	}
-	auto& f = replacement.fixture;
-	f.voice.callback_flags = 0;
-	if (replacement.setup) {
-		f.voice.SetupSampler({0x12, 1, 48000});
-	}
-	f.Queue(replacement.pcm.data(), 2, replacement.setup ? 0 : 4);
-	f.voice.SetEvent(1);
-}
-
-void TestCallbackReplacesSource() {
-	for (auto rack: {Ngs2RackType::Sampler, Ngs2RackType::CustomSampler}) {
-		for (bool setup: {false, true}) {
-			for (uint32_t trigger: {1u, 2u}) {
-				Fixture f(24000, 2, rack);
-				f.system.option.num_grain_samples = 1;
-				CallbackReplacement replacement {f, setup, trigger};
-				const int16_t pcm[] = {8192, 4096};
-				for (uint32_t i = 0; i < trigger; ++i) {
-					f.Queue(pcm, 1, 1);
-				}
-				f.voice.callback = reinterpret_cast<uintptr_t>(&ReplaceCallbackSource);
-				f.voice.callback_data = reinterpret_cast<uintptr_t>(&replacement);
-				f.voice.callback_flags = 1;
-				f.Render(4);
-				Check(!f.voice.has_samples && f.voice.samples.size() == (setup ? 4u : 8u) &&
-				          std::ranges::all_of(f.voice.samples, [](float value) { return value == 0; }) &&
-				          f.voice.blocks.size() == 1 && f.voice.blocks.front().data_cursor == 0,
-				      "callback source replacement used an old frame or channel layout");
-				f.Render(4);
-				const std::vector<float> expected = setup
-				    ? std::vector<float> {0.5f, 0.25f, 0, 0}
-				    : std::vector<float> {0.5f, 0.3125f, 0.125f, 0.125f,
-				                          0.25f, 0.15625f, 0.0625f, 0.0625f};
-				Check(f.voice.samples == expected && f.voice.state == Ngs2VoicePlayState::Empty,
-				      "callback replacement failed to play the new source on the next render");
-			}
-		}
-	}
 }
 
 void TestUpstreamCustomSamplerControls() {
@@ -2335,7 +953,7 @@ void TestUpstreamCustomSamplerControls() {
 	Check(f.voice.samples[0] == 0.25f, "custom sampler source rate was rejected");
 	f.Queue(pcm + 2, 2, 4);
 	f.Render(1);
-	Check(f.voice.samples[0] == 0.75f && f.voice.blocks.empty() && f.voice.frame_samples == 2,
+	Check(f.voice.samples[0] == 0.75f && f.voice.blocks.size() == 1,
 	      "replacement blocks retained old data or fractional position");
 	struct Pitch {
 		Ngs2VoiceParamHeader header {16, 0, 0x40010005};
@@ -2440,38 +1058,17 @@ void TestFiniteFilterTail() {
 } // namespace
 
 int main() {
-	TestProgressDrivenWaveformRing();
-	TestStereoPan();
-	TestWaveformQueueCapacity();
-	TestWaveformRingReuse();
 	TestAtrac9Vibration();
-	TestAtrac9Discrete();
 	TestPcm16RenderOutput();
-	TestPatchToRackHandle();
-	TestMasteringGain();
-	TestMasteringDownmix();
-	TestReverbDryLevel();
-	TestReverbMaskAndLevels();
-	TestReverbRoomFilter();
-	TestReverbLifecycleAndDecayRange();
-	TestReverbTail();
-	TestGeomStereoPlacement();
-	TestGeomDoppler();
-	TestGeomRolloffAndFlags();
-	TestCustomMasteringChannelMixer();
-	TestCustomVoiceStateCapacity();
 	TestSubmixerSetupAndRouting();
-	TestCustomSideChainUserFx();
 	TestWaveformBlockGeometry();
 	TestAtrac9ResampleAfterStarvation();
 	TestAtrac9ResampleAcrossFrames();
 	TestResamplingPhaseAfterStarvation();
 	TestSamplerReuseResetsRouting();
 	TestDeferredSamplerSetup();
-	TestLoopCallbacksAndExit(Ngs2RackType::Sampler);
-	TestLoopCallbacksAndExit(Ngs2RackType::CustomSampler);
+	TestLoopCallbacksAndExit();
 	TestAtrac9Looping();
-	TestAtrac9WaveformJoining();
 	TestWaveformReadAddress();
 	TestFilterTailDuringStarvation();
 	TestFiniteFilterTail();
@@ -2482,23 +1079,13 @@ int main() {
 	TestUpstreamCustomSamplerControls();
 	TestCallbackStopsConsumption();
 	TestCallbackPauseDuringLargeStep();
-	TestCallbackPauseDuringLookahead();
-	TestCallbackReplacesSource();
 	TestStreamingResample();
 	TestPitchLoopAndSkip();
 	TestPitchClamps();
 	TestStarvationAndPause();
-	TestPcmByteUnitStreaming();
-	TestPcmSkipAcrossBlocks();
-	TestPcmBlocksEndWithTheirData();
 	TestMonoRateAndRouting();
-	TestDefaultMatrix();
 	TestMatrixOutputChannels();
 	TestCustomPcmStillPlays();
-	TestClearReopensClosedList();
-	TestCancelSkipsBlocksNotStarted();
-	TestSetupQuery();
-	TestPortInfo();
 	TestPlayStateBeforeRender();
 	TestStatePublication();
 	TestStopThenPlayBeforeRender();

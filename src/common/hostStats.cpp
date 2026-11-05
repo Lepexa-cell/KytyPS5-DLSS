@@ -1,21 +1,30 @@
 #include "common/hostStats.h"
 
 #include "common/config.h"
-#include "common/timer.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
 #include <thread>
 #include <unordered_map>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h> // IWYU pragma: keep
 // clang-format off
 #include <psapi.h>
+#include <pdh.h>
+#include <pdhmsg.h>
+#include <tlhelp32.h>
 // clang-format on
+#include <map>
+#include <string>
+#include <vector>
 #elif defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
-#include <cstring>
 #include <libproc.h>
 #include <mach/mach.h>
 #include <notify.h>
@@ -23,11 +32,12 @@
 #include <sys/sysctl.h>
 #include <unistd.h>
 #else
+#include <sys/resource.h>
+#include <unistd.h>
+
 #include <filesystem>
 #include <fstream>
 #include <sstream>
-#include <sys/resource.h>
-#include <unistd.h>
 #endif
 
 namespace Common {
@@ -36,21 +46,24 @@ namespace {
 
 // Cumulative counters; rates come from the difference between two samples.
 struct Counters {
-	struct Thread {
-		uint64_t    cpu_ns;
-		std::string name;
-	};
-	std::optional<uint64_t>              process_cpu_ns;
-	std::optional<uint64_t>              system_busy;
-	std::optional<uint64_t>              system_total;
-	std::optional<uint64_t>              context_switches;
-	std::optional<uint64_t>              page_faults;
-	std::optional<uint64_t>              page_ins;
-	std::optional<uint64_t>              disk_read;
-	std::optional<uint64_t>              disk_write;
-	std::unordered_map<uint64_t, Thread> threads;
-	uint64_t                             wall_ns = 0;
+	std::optional<uint64_t>                process_cpu_ns;
+	std::optional<uint64_t>                system_busy;
+	std::optional<uint64_t>                system_total;
+	std::optional<uint64_t>                context_switches;
+	std::optional<uint64_t>                page_faults;
+	std::optional<uint64_t>                page_ins;
+	std::optional<uint64_t>                disk_read;
+	std::optional<uint64_t>                disk_write;
+	std::unordered_map<uint64_t, uint64_t> thread_cpu_ns;
+	std::unordered_map<uint64_t, std::string> thread_names;
+	uint64_t                               wall_ns = 0;
 };
+
+uint64_t WallNanoseconds() {
+	return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+	                                 std::chrono::steady_clock::now().time_since_epoch())
+	                                 .count());
+}
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 
@@ -58,9 +71,90 @@ uint64_t FileTimeTo100Ns(const FILETIME& time) {
 	return (static_cast<uint64_t>(time.dwHighDateTime) << 32u) | time.dwLowDateTime;
 }
 
-struct PlatformState {};
+// The "GPU Engine" performance counters (Task Manager's GPU column): per engine of this process,
+// the busy share; the GPU figure is the busiest engine type (3D, Compute, Copy, ...).
+struct PlatformState {
+	PDH_HQUERY   query   = nullptr;
+	PDH_HCOUNTER counter = nullptr;
+	bool         gpu_failed = false;
+	std::vector<uint8_t> buffer;
+	~PlatformState() {
+		if (query != nullptr) PdhCloseQuery(query);
+	}
+};
 
-void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
+void SampleGpu(PlatformState& state, HostStats& stats) {
+	if (state.gpu_failed) return;
+	if (state.query == nullptr) {
+		if (PdhOpenQueryW(nullptr, 0, &state.query) != ERROR_SUCCESS ||
+		    PdhAddEnglishCounterW(state.query, L"\\GPU Engine(*)\\Utilization Percentage", 0, &state.counter) !=
+		        ERROR_SUCCESS) {
+			state.gpu_failed = true;
+			return;
+		}
+		// Rates need two collections; the first one only starts them.
+		(void)PdhCollectQueryData(state.query);
+		return;
+	}
+	if (PdhCollectQueryData(state.query) != ERROR_SUCCESS) return;
+	DWORD size  = 0;
+	DWORD count = 0;
+	auto  status = PdhGetFormattedCounterArrayW(state.counter, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, &size, &count, nullptr);
+	if (status != static_cast<PDH_STATUS>(PDH_MORE_DATA) || size == 0) return;
+	state.buffer.resize(size);
+	auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(state.buffer.data());
+	if (PdhGetFormattedCounterArrayW(state.counter, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, &size, &count, items) !=
+	    ERROR_SUCCESS)
+		return;
+	const auto pid = L"pid_" + std::to_wstring(GetCurrentProcessId()) + L"_";
+	std::map<std::wstring, double> engines; // engine type -> summed busy share
+	for (DWORD i = 0; i < count; i++) {
+		const std::wstring name = items[i].szName != nullptr ? items[i].szName : L"";
+		if (name.find(pid) == std::wstring::npos || items[i].FmtValue.CStatus != ERROR_SUCCESS) continue;
+		const auto type = name.find(L"engtype_");
+		engines[type == std::wstring::npos ? std::wstring {} : name.substr(type)] += items[i].FmtValue.doubleValue;
+	}
+	double busiest = 0.0;
+	for (const auto& [type, percent]: engines) busiest = std::max(busiest, percent);
+	stats.gpu_percent = std::min(100.0, busiest);
+}
+
+// Every thread of the process with its CPU time and its name (SetThreadDescription).
+void SampleThreads(HostStats& stats, Counters& now) {
+	const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) return;
+	const auto    pid   = GetCurrentProcessId();
+	uint32_t      count = 0;
+	THREADENTRY32 entry {};
+	entry.dwSize = sizeof(entry);
+	for (BOOL more = Thread32First(snapshot, &entry); more != 0; more = Thread32Next(snapshot, &entry)) {
+		if (entry.th32OwnerProcessID != pid) continue;
+		count++;
+		const auto thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
+		if (thread == nullptr) continue;
+		FILETIME creation {}, exit {}, kernel {}, user {};
+		if (GetThreadTimes(thread, &creation, &exit, &kernel, &user) != 0) {
+			now.thread_cpu_ns[entry.th32ThreadID] = (FileTimeTo100Ns(kernel) + FileTimeTo100Ns(user)) * 100u;
+		}
+		PWSTR description = nullptr;
+		if (SUCCEEDED(GetThreadDescription(thread, &description)) && description != nullptr) {
+			const auto length = WideCharToMultiByte(CP_UTF8, 0, description, -1, nullptr, 0, nullptr, nullptr);
+			if (length > 1) {
+				std::string name(static_cast<size_t>(length - 1), '\0');
+				WideCharToMultiByte(CP_UTF8, 0, description, -1, name.data(), length, nullptr, nullptr);
+				now.thread_names[entry.th32ThreadID] = std::move(name);
+			}
+			LocalFree(description);
+		}
+		CloseHandle(thread);
+	}
+	CloseHandle(snapshot);
+	stats.thread_count = count;
+}
+
+void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
+	SampleThreads(stats, now);
+	SampleGpu(state, stats);
 	const auto process = GetCurrentProcess();
 	FILETIME   creation {};
 	FILETIME   exit {};
@@ -130,18 +224,12 @@ std::optional<T> SysctlValue(const char* name) {
 }
 
 struct PlatformState {
-	mach_port_t             host          = mach_host_self();
-	int                     thermal_token = -1;
-	bool                    thermal_ready = false;
-	std::string             gpu_model;
+	mach_port_t host          = mach_host_self();
+	int         thermal_token = -1;
+	bool        thermal_ready = false;
+	bool        gpu_info_read = false;
+	std::string gpu_model;
 	std::optional<uint32_t> gpu_cores;
-
-	~PlatformState() {
-		if (thermal_ready) {
-			notify_cancel(thermal_token);
-		}
-		mach_port_deallocate(mach_task_self(), host);
-	}
 };
 
 std::optional<int64_t> DictionaryNumber(CFDictionaryRef dictionary, CFStringRef key) {
@@ -187,7 +275,8 @@ void SampleGpu(PlatformState& state, HostStats& stats) {
 	}
 	const auto take_max = [](std::optional<double>& target, std::optional<int64_t> value) {
 		if (value) {
-			target = std::max(target.value_or(0.0), std::min(100.0, static_cast<double>(*value)));
+			target = std::max(target.value_or(0.0),
+			                  std::min(100.0, static_cast<double>(*value)));
 		}
 	};
 	const auto add = [](std::optional<uint64_t>& target, std::optional<int64_t> value) {
@@ -197,11 +286,11 @@ void SampleGpu(PlatformState& state, HostStats& stats) {
 	};
 	for (io_object_t service = IOIteratorNext(iterator); service != 0;
 	     service             = IOIteratorNext(iterator)) {
-		if (state.gpu_model.empty()) {
+		if (!state.gpu_info_read) {
 			state.gpu_model = RegistryString(service, CFSTR("model"));
-			auto*   cores   = IORegistryEntryCreateCFProperty(service, CFSTR("gpu-core-count"),
-			                                                  kCFAllocatorDefault, 0);
-			int64_t count   = 0;
+			auto* cores = IORegistryEntryCreateCFProperty(service, CFSTR("gpu-core-count"),
+			                                              kCFAllocatorDefault, 0);
+			int64_t count = 0;
 			if (cores != nullptr) {
 				if (CFGetTypeID(cores) == CFNumberGetTypeID() &&
 				    CFNumberGetValue(static_cast<CFNumberRef>(cores), kCFNumberSInt64Type,
@@ -211,6 +300,7 @@ void SampleGpu(PlatformState& state, HostStats& stats) {
 				}
 				CFRelease(cores);
 			}
+			state.gpu_info_read = !state.gpu_model.empty();
 		}
 		auto* statistics = IORegistryEntryCreateCFProperty(service, CFSTR("PerformanceStatistics"),
 		                                                   kCFAllocatorDefault, 0);
@@ -223,8 +313,7 @@ void SampleGpu(PlatformState& state, HostStats& stats) {
 				         DictionaryNumber(values, CFSTR("Renderer Utilization %")));
 				take_max(stats.gpu_tiler_percent,
 				         DictionaryNumber(values, CFSTR("Tiler Utilization %")));
-				add(stats.gpu_memory_in_use,
-				    DictionaryNumber(values, CFSTR("In use system memory")));
+				add(stats.gpu_memory_in_use, DictionaryNumber(values, CFSTR("In use system memory")));
 				add(stats.gpu_memory_allocated,
 				    DictionaryNumber(values, CFSTR("Alloc system memory")));
 				add(stats.gpu_recoveries, DictionaryNumber(values, CFSTR("recoveryCount")));
@@ -259,15 +348,15 @@ void SampleThreads(HostStats& stats, Counters& now) {
 				return static_cast<uint64_t>(time.seconds) * 1000000000u +
 				       static_cast<uint64_t>(time.microseconds) * 1000u;
 			};
-			auto& thread  = now.threads[identifier.thread_id];
-			thread.cpu_ns = to_ns(basic.user_time) + to_ns(basic.system_time);
+			now.thread_cpu_ns[identifier.thread_id] =
+			    to_ns(basic.user_time) + to_ns(basic.system_time);
 			thread_extended_info_data_t extended {};
 			mach_msg_type_number_t      extended_size = THREAD_EXTENDED_INFO_COUNT;
 			if (thread_info(threads[i], THREAD_EXTENDED_INFO,
 			                reinterpret_cast<thread_info_t>(&extended),
 			                &extended_size) == KERN_SUCCESS) {
-				thread.name = std::string(extended.pth_name,
-				                          strnlen(extended.pth_name, sizeof(extended.pth_name)));
+				now.thread_names[identifier.thread_id] =
+				    std::string(extended.pth_name, strnlen(extended.pth_name, sizeof(extended.pth_name)));
 			}
 		}
 		mach_port_deallocate(task, threads[i]);
@@ -284,8 +373,8 @@ void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
 	                    &load_count) == KERN_SUCCESS) {
 		const uint64_t busy = static_cast<uint64_t>(load.cpu_ticks[CPU_STATE_USER]) +
 		                      load.cpu_ticks[CPU_STATE_SYSTEM] + load.cpu_ticks[CPU_STATE_NICE];
-		now.system_busy     = busy;
-		now.system_total    = busy + load.cpu_ticks[CPU_STATE_IDLE];
+		now.system_busy  = busy;
+		now.system_total = busy + load.cpu_ticks[CPU_STATE_IDLE];
 	}
 
 	// Physical footprint is what Activity Monitor shows in its Memory column.
@@ -305,7 +394,7 @@ void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
 		now.disk_write = usage.ri_diskio_byteswritten;
 	}
 
-	stats.system_memory_total   = SysctlValue<uint64_t>("hw.memsize");
+	stats.system_memory_total = SysctlValue<uint64_t>("hw.memsize");
 	vm_size_t              page = 0;
 	vm_statistics64_data_t vm {};
 	mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
@@ -313,9 +402,9 @@ void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
 	    host_statistics64(state.host, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm),
 	                      &count) == KERN_SUCCESS) {
 		// Activity Monitor's "Memory Used": app memory + wired + compressed.
-		const uint64_t app       = vm.internal_page_count > vm.purgeable_count
-		                               ? vm.internal_page_count - vm.purgeable_count
-		                               : 0;
+		const uint64_t app = vm.internal_page_count > vm.purgeable_count
+		                         ? vm.internal_page_count - vm.purgeable_count
+		                         : 0;
 		stats.system_memory_used = (app + vm.wire_count + vm.compressor_page_count) * page;
 		stats.system_wired       = static_cast<uint64_t>(vm.wire_count) * page;
 		stats.system_compressed  = static_cast<uint64_t>(vm.compressor_page_count) * page;
@@ -342,8 +431,7 @@ void SamplePlatform(PlatformState& state, HostStats& stats, Counters& now) {
 		                                            &state.thermal_token) == NOTIFY_STATUS_OK;
 	}
 	uint64_t thermal = 0;
-	if (state.thermal_ready &&
-	    notify_get_state(state.thermal_token, &thermal) == NOTIFY_STATUS_OK) {
+	if (state.thermal_ready && notify_get_state(state.thermal_token, &thermal) == NOTIFY_STATUS_OK) {
 		stats.thermal_pressure = thermal >= 3   ? ThermalPressure::Critical
 		                         : thermal == 2 ? ThermalPressure::Heavy
 		                         : thermal == 1 ? ThermalPressure::Moderate
@@ -387,18 +475,13 @@ std::optional<uint64_t> Find(const ProcValues& values, const char* key) {
 struct PlatformState {};
 
 void SampleThreads(HostStats& stats, Counters& now) {
-	static const double ns_per_tick = 1e9 / static_cast<double>(std::max(sysconf(_SC_CLK_TCK), 1L));
-	std::error_code     error;
-	uint32_t            count = 0;
-	for (std::filesystem::directory_iterator it("/proc/self/task", error), end; !error && it != end;
-	     it.increment(error)) {
+	const double ns_per_tick = 1e9 / static_cast<double>(std::max(sysconf(_SC_CLK_TCK), 1L));
+	std::error_code error;
+	uint32_t        count = 0;
+	for (const auto& entry: std::filesystem::directory_iterator("/proc/self/task", error)) {
 		count++;
-		std::ifstream stat_file(it->path() / "stat");
+		std::ifstream stat_file(entry.path() / "stat");
 		std::string   stat;
-		uint64_t      id = 0;
-		if (!(stat_file >> id)) {
-			continue; // The thread may have exited during enumeration.
-		}
 		std::getline(stat_file, stat);
 		const auto close = stat.rfind(')');
 		if (close == std::string::npos) {
@@ -407,21 +490,22 @@ void SampleThreads(HostStats& stats, Counters& now) {
 		// Fields after the command name start at field 3 (state); utime and stime are 14 and 15.
 		std::istringstream fields(stat.substr(close + 2));
 		std::string        field;
-		for (int index = 3; index < 14 && fields >> field; index++) {
+		uint64_t           user = 0;
+		uint64_t           system = 0;
+		for (int index = 3; index <= 15 && fields >> field; index++) {
+			if (index == 14) {
+				user = std::stoull(field);
+			} else if (index == 15) {
+				system = std::stoull(field);
+			}
 		}
-		uint64_t user   = 0;
-		uint64_t system = 0;
-		if (!(fields >> user >> system)) {
-			continue;
-		}
-		auto& thread  = now.threads[id];
-		thread.cpu_ns = static_cast<uint64_t>(static_cast<double>(user + system) * ns_per_tick);
-		std::ifstream name_file(it->path() / "comm");
-		std::getline(name_file, thread.name);
+		const auto id = std::stoull(entry.path().filename().string());
+		now.thread_cpu_ns[id] =
+		    static_cast<uint64_t>(static_cast<double>(user + system) * ns_per_tick);
+		std::ifstream name_file(entry.path() / "comm");
+		std::getline(name_file, now.thread_names[id]);
 	}
-	if (!error) {
-		stats.thread_count = count;
-	}
+	stats.thread_count = count;
 }
 
 void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
@@ -476,9 +560,8 @@ void SamplePlatform(PlatformState& /*state*/, HostStats& stats, Counters& now) {
 	std::ifstream pressure("/proc/pressure/memory");
 	std::string   kind;
 	std::string   average;
-	double        stalled = 0.0;
-	if (pressure >> kind >> average && kind == "some" && average.rfind("avg10=", 0) == 0 &&
-	    std::istringstream(average.substr(6)) >> stalled) {
+	if (pressure >> kind >> average && kind == "some" && average.rfind("avg10=", 0) == 0) {
+		const double stalled  = std::stod(average.substr(6));
 		stats.memory_pressure = stalled >= 20.0  ? MemoryPressure::Critical
 		                        : stalled >= 5.0 ? MemoryPressure::Warning
 		                                         : MemoryPressure::Normal;
@@ -502,8 +585,7 @@ constexpr size_t BUSIEST_THREADS = 6;
 struct HostStatsSampler::Impl {
 	PlatformState state;
 	Counters      last;
-	uint32_t      logical_cores = std::max(std::thread::hardware_concurrency(), 1u);
-	bool          has_last      = false;
+	bool          has_last = false;
 };
 
 HostStatsSampler::HostStatsSampler(): m_impl(std::make_unique<Impl>()) {}
@@ -512,10 +594,10 @@ HostStatsSampler::~HostStatsSampler() = default;
 
 HostStats HostStatsSampler::Sample() {
 	HostStats stats;
-	stats.logical_cores = m_impl->logical_cores;
+	stats.logical_cores = std::max(std::thread::hardware_concurrency(), 1u);
 
 	Counters now;
-	now.wall_ns = Common::SteadyNs();
+	now.wall_ns = WallNanoseconds();
 	SamplePlatform(m_impl->state, stats, now);
 
 	const auto& last    = m_impl->last;
@@ -545,17 +627,20 @@ HostStats HostStatsSampler::Sample() {
 		stats.disk_read_per_s        = rate(now.disk_read, last.disk_read);
 		stats.disk_write_per_s       = rate(now.disk_write, last.disk_write);
 
-		for (const auto& [id, thread]: now.threads) {
+		for (const auto& [id, cpu_ns]: now.thread_cpu_ns) {
 			// A thread missing from the last sample started during this interval.
-			const auto     previous = last.threads.find(id);
-			const uint64_t before   = previous != last.threads.end() ? previous->second.cpu_ns : 0;
-			if (thread.cpu_ns < before) {
+			const auto     previous = last.thread_cpu_ns.find(id);
+			const uint64_t before = previous != last.thread_cpu_ns.end() ? previous->second : 0;
+			if (cpu_ns < before) {
 				continue;
 			}
-			const double percent =
-			    static_cast<double>(thread.cpu_ns - before) / 1e9 / elapsed * 100.0;
+			const double percent = static_cast<double>(cpu_ns - before) / 1e9 / elapsed * 100.0;
+			const auto   name    = now.thread_names.find(id);
 			stats.busiest_threads.push_back(
-			    {thread.name.empty() ? "thread " + std::to_string(id) : thread.name, percent});
+			    {name != now.thread_names.end() && !name->second.empty()
+			         ? name->second
+			         : "thread " + std::to_string(id),
+			     percent});
 		}
 		std::sort(stats.busiest_threads.begin(), stats.busiest_threads.end(),
 		          [](const auto& a, const auto& b) { return a.cpu_percent > b.cpu_percent; });

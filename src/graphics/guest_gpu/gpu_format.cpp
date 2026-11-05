@@ -10,9 +10,9 @@ namespace {
 
 struct FormatInfo {
 	BufferFormat       format;
-	uint8_t            bytes_per_element;
-	uint8_t            block_compressed_bytes_per_block;
-	uint8_t            render_target_bytes_per_element;
+	uint32_t           bytes_per_element;
+	uint32_t           block_compressed_bytes_per_block;
+	uint32_t           render_target_bytes_per_element;
 	bool               sampled_texture;
 	bool               uint_texture;
 	bool               sint_texture = false;
@@ -42,11 +42,11 @@ constexpr FormatInfo kFormatInfo[] = {
 	{BufferFormat::k16_16UInt, 4, 0, 4, true, true},
 	{BufferFormat::k16_16SInt, 4, 0, 4, true, false, true},
 	{BufferFormat::k16_16Float, 4, 0, 4, true, false},
-	{BufferFormat::k11_11_10UNorm, 4, 0, 4, true, false},
 	{BufferFormat::k11_11_10UInt, 4, 0, 4, true, true},
+	// Approximated by the host B10G11R11 float format (see vulkanCommon.cpp).
+	{BufferFormat::k11_11_10UNorm, 4, 0, 4, true, false},
 	{BufferFormat::k11_11_10Float, 4, 0, 4, true, false},
 	{BufferFormat::k10_11_11Float, 4, 0, 4, true, false},
-	{BufferFormat::k2_10_10_10UNorm, 4, 0, 4, true, false},
 	{BufferFormat::k10_10_10_2UNorm, 4, 0, 4, true, false},
 	{BufferFormat::k10_10_10_2UInt, 4, 0, 4, true, true},
 	{BufferFormat::k8_8_8_8UNorm, 4, 0, 4, true, false},
@@ -225,12 +225,6 @@ bool IsFmaskTextureFormat(BufferFormat format) {
 	return format >= BufferFormat::kFmask8_S2_F1 && format <= BufferFormat::kFmask64_S16_F8;
 }
 
-bool IsSrgbFormat(BufferFormat format) {
-	return (format >= BufferFormat::k8Srgb && format <= BufferFormat::k8_8_8_8Srgb) ||
-	       format == BufferFormat::kBc1Srgb || format == BufferFormat::kBc2Srgb ||
-	       format == BufferFormat::kBc3Srgb || format == BufferFormat::kBc7Srgb;
-}
-
 TextureNumericClass SampledTextureNumericClass(BufferFormat format) {
 	const auto* info = FindFormatInfo(format);
 	if (info == nullptr || !info->sampled_texture) {
@@ -246,7 +240,6 @@ BufferFormat RemapTextureFormat(BufferFormat format) {
 	switch (format) {
 		case BufferFormat::k8UScaled: return BufferFormat::k8UNorm;
 		case BufferFormat::k8_8UScaled: return BufferFormat::k8_8UNorm;
-		case BufferFormat::k11_11_10UNorm:
 		case BufferFormat::k11_11_10UInt: return BufferFormat::k32UInt;
 		default: return format;
 	}

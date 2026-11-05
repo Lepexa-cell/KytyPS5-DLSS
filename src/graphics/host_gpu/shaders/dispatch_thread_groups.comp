@@ -1,0 +1,73 @@
+#version 450
+
+// Turns a guest DISPATCH_INDIRECT argument block in thread dimensions (DISPATCH_INITIATOR
+// USE_THREAD_DIMENSIONS: thread counts per axis) into a VkDispatchIndirectCommand of group counts,
+// so the CPU never reads the GPU-written arguments. As RenderExecutor::DispatchDirect converts
+// them: whole groups, rounded up; no thread count gives no groups. The thread counts themselves
+// go to the dispatch's shader data (its dispatch thread extent, as DispatchDirect fills it), which
+// masks the threads of the last group past them.
+// More groups than the dispatch's LDS binding holds (max_groups): the counts are cut down to fit
+// (the last groups do not run) and the report buffer counts it, so the host says so; uncut, the
+// groups past the binding read and wrote LDS outside it.
+
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly buffer Arguments {
+	uint arguments[];
+};
+
+layout(std430, binding = 1) writeonly buffer Output {
+	uint outputs[];
+};
+
+layout(std430, binding = 2) writeonly buffer Extent {
+	uint extents[];
+};
+
+layout(std430, binding = 3) buffer Report {
+	uint clipped;    // dispatches cut down so far
+	uint shader_low; // the last one's shader hash, low 32 bits
+};
+
+layout(push_constant) uniform Params {
+	uint arguments_word;
+	uint output_word;
+	uint group_size_x;
+	uint group_size_y;
+	uint group_size_z;
+	uint extent_word; // 0xffffffff: the program reads no extent
+	uint max_groups;  // 0xffffffff: no LDS binding to fit
+	uint shader_low;
+} params;
+
+uint Groups(uint threads, uint size) {
+	return threads == 0u ? 0u : (threads + size - 1u) / size;
+}
+
+void main() {
+	const uint x = arguments[params.arguments_word + 0u];
+	const uint y = arguments[params.arguments_word + 1u];
+	const uint z = arguments[params.arguments_word + 2u];
+	uint gx = Groups(x, params.group_size_x);
+	uint gy = Groups(y, params.group_size_y);
+	uint gz = Groups(z, params.group_size_z);
+	const uint m = params.max_groups;
+	// The products only after the divisions show they fit 32 bits.
+	const bool fits = gx == 0u || gy == 0u || gz == 0u ||
+	                  (gx <= m && gy <= m / gx && gz <= m / (gx * gy));
+	if (!fits) {
+		gx = min(gx, m);
+		gy = min(gy, m / gx);
+		gz = min(gz, m / (gx * gy));
+		atomicAdd(clipped, 1u);
+		shader_low = params.shader_low;
+	}
+	outputs[params.output_word + 0u] = gx;
+	outputs[params.output_word + 1u] = gy;
+	outputs[params.output_word + 2u] = gz;
+	if (params.extent_word != 0xffffffffu) {
+		extents[params.extent_word + 0u] = x;
+		extents[params.extent_word + 1u] = y;
+		extents[params.extent_word + 2u] = z;
+	}
+}

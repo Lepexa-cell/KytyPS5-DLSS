@@ -47,6 +47,7 @@ QVariantMap Configuration::GameSettings() const {
 	KYTY_CFG_SET(console_language);
 	KYTY_CFG_SET(vulkan_validation_enabled);
 	KYTY_CFG_SET(shader_validation_enabled);
+	KYTY_CFG_SET(shader_optimization_type);
 	KYTY_CFG_SET(shader_log_direction);
 	KYTY_CFG_SET(shader_log_folder);
 	KYTY_CFG_SET(command_buffer_dump_enabled);
@@ -106,6 +107,7 @@ void Configuration::ReadGameSettingsValues(const Settings& s) {
 	}
 	KYTY_CFG_GET(vulkan_validation_enabled);
 	KYTY_CFG_GET(shader_validation_enabled);
+	KYTY_CFG_GET(shader_optimization_type);
 	KYTY_CFG_GET(shader_log_direction);
 	KYTY_CFG_GET(shader_log_folder);
 	KYTY_CFG_GET(command_buffer_dump_enabled);

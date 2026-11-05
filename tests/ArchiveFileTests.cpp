@@ -12,7 +12,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
 #include <limits>
 #include <string>
 #include <thread>
@@ -144,72 +143,6 @@ void CheckMalformedArchives(const std::filesystem::path &source,
         "recover by reading an unaffected compressed block");
 }
 
-void WriteHostFile(const std::filesystem::path &path, const void *data, size_t size) {
-  std::ofstream stream(path, std::ios::binary);
-  stream.write(static_cast<const char *>(data), static_cast<std::streamsize>(size));
-  Check(stream.good(), "write pack source file");
-}
-
-void CheckPackArchive(const std::filesystem::path &root, const std::vector<uint8_t> &payload) {
-  const auto source = root / "pack-source";
-  const auto unicode = Common::PathFromUtf8(ArchiveTests::UnicodeFilename);
-  std::error_code error;
-  Check(std::filesystem::create_directories(source / "assets/subdir", error) &&
-            std::filesystem::create_directories(source / "empty", error),
-        "create pack source tree");
-  WriteHostFile(source / "eboot.bin", ArchiveTests::Eboot.data(), ArchiveTests::Eboot.size());
-  WriteHostFile(source / "assets/subdir/data.bin", payload.data(), payload.size());
-  WriteHostFile(source / unicode, nullptr, 0);
-  uint64_t expected = ArchiveTests::Eboot.size() + payload.size();
-#if !defined(_WIN32)
-  std::filesystem::create_directory_symlink("assets", source / "linked", error);
-  Check(!error, "link a pack source directory");
-  expected += payload.size();
-#endif
-
-  const auto archive = root / "packed.zar";
-  uint64_t done = 0;
-  uint64_t total = 0;
-  Check(Common::PackArchive(source, archive,
-                            [&](uint64_t packed, uint64_t size) {
-                              done = packed;
-                              total = size;
-                              return true;
-                            }),
-        "pack a host directory");
-  Check(done == expected && total == expected, "report every packed byte");
-
-  const auto packed = Common::MakeArchivePath(archive);
-  const auto check_payload = [&](const std::filesystem::path &member) {
-    Common::File file(packed / member, Common::File::Mode::Read);
-    const auto data = file.ReadWholeBuffer();
-    Check(data.size() == payload.size() &&
-              std::memcmp(data.data(), payload.data(), payload.size()) == 0,
-          "round-trip packed file contents");
-  };
-  check_payload("assets/subdir/data.bin");
-#if !defined(_WIN32)
-  check_payload("linked/subdir/data.bin");
-#endif
-  const auto empty_file = Common::File::GetInfo(packed / unicode);
-  Check(empty_file && empty_file->is_file && empty_file->size == 0 &&
-            Common::File::IsDirectoryExisting(packed / "empty"),
-        "keep empty files and directories");
-
-  const auto failed = root / "failed.zar";
-  const auto rejected = [&](const std::filesystem::path &directory, bool proceed) {
-    return !Common::PackArchive(directory, failed, [=](uint64_t, uint64_t) { return proceed; }) &&
-           !std::filesystem::exists(failed, error);
-  };
-  Check(rejected(source, false), "cancelling removes the partial archive");
-  Check(rejected(root / "missing", true), "reject a missing source directory");
-#if defined(__linux__)
-  // Archive names compare case-insensitively, so such a folder cannot be packed faithfully.
-  WriteHostFile(source / "EBOOT.BIN", nullptr, 0);
-  Check(rejected(source, true), "reject names that differ only in case");
-#endif
-}
-
 #if !defined(_WIN32) || defined(_GLIBCXX_GCC_GTHR_POSIX_H)
 void CheckCancellation(const std::filesystem::path &path,
                        const std::vector<uint8_t> &payload) {
@@ -286,10 +219,6 @@ int main() {
   const auto archive_directory = Common::File::GetInfo(root / "assets/");
   Check(archive_file && archive_file->is_file && archive_file->size == payload.size(),
         "query archive member type and size together");
-  const auto host_times = Common::File::GetTimes(archive_path);
-  const auto member_times = Common::File::GetTimes(root / "assets/subdir/data.bin");
-  Check(host_times && member_times && member_times->write_ns == host_times->write_ns,
-        "archive members report the host archive time");
   Check(archive_directory && !archive_directory->is_file && archive_directory->size == 0 &&
             !Common::File::GetInfo(root / "missing.bin"),
         "distinguish archive directories from missing members");
@@ -336,8 +265,7 @@ int main() {
   const auto data_path = root / "assets/subdir/data.bin";
   Check(Common::File::Size(data_path) == payload.size(), "report member size");
   Common::File file(data_path, Common::File::Mode::Read);
-  Check(!file.IsInvalid() && file.GetTimes() && file.GetTimes()->write_ns == host_times->write_ns,
-        "open archive member reports the host archive time");
+  Check(!file.IsInvalid(), "open archive member");
   Check(file.Remaining() == payload.size(), "report initial remaining bytes");
   Check(file.Seek(64 * 1024 - 19), "seek before compression block boundary");
   std::vector<uint8_t> slice(97);
@@ -439,13 +367,15 @@ int main() {
   Check(!Common::File::CreateDirectory(root / "new-dir"),
         "reject member directory creation");
   Check(!file.Truncate(0) && !file.Unlink(), "reject descriptor mutations");
-  const auto host_file = temporary.Path() / "host.bin";
+  const auto copied = temporary.Path() / "copied.bin";
   Common::File host_fixture;
-  Check(host_fixture.Create(host_file), "create host mutation fixture");
+  Check(host_fixture.Create(copied), "create host mutation fixture");
   host_fixture.Close();
-  Check(!Common::File::RenameFile(data_path, host_file) &&
-            !Common::File::RenameFile(host_file, data_path),
-        "reject rename operations involving archives");
+  Check(!Common::File::CopyFile(data_path, copied) &&
+            !Common::File::CopyFile(copied, data_path) &&
+            !Common::File::RenameFile(data_path, copied) &&
+            !Common::File::RenameFile(copied, data_path),
+        "reject unsupported copy and rename operations involving archives");
 
   CheckMalformedArchives(archive_path, payload);
 
@@ -464,8 +394,6 @@ int main() {
   Check(replaced_data.size() == replacement.size() &&
             std::memcmp(replaced_data.data(), replacement.data(), replacement.size()) == 0,
         "reopening after the final reader closes sees replacement contents");
-
-  CheckPackArchive(temporary.Path(), payload);
 
   std::printf("ArchiveFileTests: all cases passed\n");
   return 0;

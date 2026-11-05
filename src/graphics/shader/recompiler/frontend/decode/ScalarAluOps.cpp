@@ -1,6 +1,9 @@
 #include "graphics/shader/recompiler/frontend/decode/ScalarAluOps.h"
 
+#include "common/switches.h"
 #include "graphics/shader/recompiler/frontend/decode/OpcodeTable.h"
+
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
@@ -58,7 +61,6 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x15u, Opcode::S_FLBIT_I32_B32},
     {0x16u, Opcode::S_FLBIT_I32_B64},
     {0x17u, Opcode::S_FLBIT_I32},
-    {0x18u, Opcode::S_FLBIT_I32_I64},
     {0x19u, Opcode::S_SEXT_I32_I8},
     {0x1au, Opcode::S_SEXT_I32_I16},
     {0x1bu, Opcode::S_BITSET0_B32},
@@ -67,10 +69,8 @@ constexpr OpcodeMap SOP1_OPCODE_LIST[] = {
     {0x1eu, Opcode::S_BITSET1_B64},
     {0x1fu, Opcode::S_GETPC_B64},
     {0x20u, Opcode::S_SETPC_B64},
-    {0x21u, Opcode::S_SWAPPC_B64},
     {0x24u, Opcode::S_AND_SAVEEXEC_B64},
     {0x28u, Opcode::S_ORN2_SAVEEXEC_B64},
-    {0x2cu, Opcode::S_QUADMASK_B32},
     {0x2du, Opcode::S_QUADMASK_B64},
     {0x34u, Opcode::S_ABS_I32},
     {0x37u, Opcode::S_ANDN1_SAVEEXEC_B64},
@@ -96,7 +96,7 @@ constexpr OpcodeMap SOPK_OPCODE_LIST[] = {
     {0x08u, Opcode::S_CMP_LE_I32}, {0x09u, Opcode::S_CMP_EQ_U32}, {0x0au, Opcode::S_CMP_LG_U32},
     {0x0bu, Opcode::S_CMP_GT_U32}, {0x0cu, Opcode::S_CMP_GE_U32}, {0x0du, Opcode::S_CMP_LT_U32},
     {0x0eu, Opcode::S_CMP_LE_U32}, {0x0fu, Opcode::S_ADD_I32},    {0x10u, Opcode::S_MULK_I32},
-    {0x12u, Opcode::S_GETREG_B32}, {0x13u, Opcode::S_SETREG_B32}, {0x17u, Opcode::S_WAITCNT_VSCNT}, {0x18u, Opcode::S_WAITCNT},
+    {0x13u, Opcode::S_SETREG_B32}, {0x17u, Opcode::S_WAITCNT_VSCNT}, {0x18u, Opcode::S_WAITCNT},
     {0x19u, Opcode::S_WAITCNT},    {0x1au, Opcode::S_WAITCNT},
     {0x1bu, Opcode::S_SUBVECTOR_LOOP_BEGIN}, {0x1cu, Opcode::S_SUBVECTOR_LOOP_END},
 };
@@ -124,7 +124,6 @@ constexpr OpcodeMap SOPP_OPCODE_LIST[] = {
     {0x1au, Opcode::S_CBRANCH_CDBGSYS_AND_USER},
     {0x1eu, Opcode::S_ENDPGM}, // s_endpgm_ordered_ps_done
     {0x20u, Opcode::S_INST_PREFETCH},
-    {0x21u, Opcode::S_CLAUSE},
     {0x23u, Opcode::S_WAITCNT_DEPCTR},
 };
 
@@ -158,6 +157,17 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (opcode == 0x21u && sdst == 125u) {
 		// S_SWAPPC_B64 with NULL discards the return PC, so it is a plain jump.
 		inst.opcode = Opcode::S_SETPC_B64;
+	} else if (opcode == 0x21u) {
+		// KYTY_PRO_SWAPPC_SKIP=1 (PS5 Pro experiment 2026-10-29): a real S_SWAPPC_B64 (an indirect
+		// call, e.g. The title's hit functions after IMAGE_BVH8_INTERSECT_RAY) only writes its return
+		// address, as S_GETPC_B64 does: the call is left out, as if the callee returned at once.
+		static const bool skip_calls = [] {
+			const char* text = KYTY_GETENV("KYTY_PRO_SWAPPC_SKIP");
+			return text != nullptr && text[0] == '1';
+		}();
+		if (skip_calls) {
+			inst.opcode = Opcode::S_GETPC_B64;
+		}
 	}
 	SetRawWords(inst, code, word_index, 1);
 
@@ -167,25 +177,7 @@ void DecodeSop1(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 
 	switch (inst.opcode) {
-		case Opcode::S_SWAPPC_B64:
-			inst.branch_target = UINT32_MAX;
-			[[fallthrough]];
-		case Opcode::S_MOV_B64:
-		case Opcode::S_CMOV_B64:
-		case Opcode::S_NOT_B64:
-		case Opcode::S_WQM_B64:
-		case Opcode::S_BREV_B64:
-		case Opcode::S_BITSET0_B64:
-		case Opcode::S_BITSET1_B64:
-		case Opcode::S_AND_SAVEEXEC_B64:
-		case Opcode::S_ORN2_SAVEEXEC_B64:
-		case Opcode::S_QUADMASK_B64:
-		case Opcode::S_ANDN1_SAVEEXEC_B64:
-		case Opcode::S_BITREPLICATE_B64_B32:
-			inst.data_dwords = 2u;
-			break;
 		case Opcode::S_GETPC_B64:
-			inst.data_dwords = 2u;
 			inst.src_count = 0;
 			DecodeScalarDestination(sdst, pc, inst.dst);
 			return;
@@ -225,8 +217,6 @@ void DecodeSop2(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 
 	DecodeScalarDestination(sdst, pc, inst.dst);
 	DecodeBinarySources(pc, code, word_index, inst, ssrc0, ssrc1);
-	if (opcode == 0x0bu || (opcode >= 0x0fu && opcode <= 0x25u && (opcode & 1u)) || opcode == 0x29u)
-		inst.data_dwords = 2u;
 }
 
 void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index,
@@ -234,7 +224,7 @@ void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	const uint32_t word   = code[word_index];
 	const uint32_t opcode = (word >> 23u) & 0x1fu;
 	const uint32_t sdst   = (word >> 16u) & 0x7fu;
-	const auto     imm    = (opcode >= 0x09u && opcode <= 0x0eu) || opcode == 0x12u
+	const auto     imm    = opcode >= 0x09u && opcode <= 0x0eu
 	                           ? static_cast<int32_t>(word & 0xffffu)
 	                           : static_cast<int32_t>(static_cast<int16_t>(word & 0xffffu));
 
@@ -254,7 +244,6 @@ void DecodeSopk(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 
 	switch (inst.opcode) {
-		case Opcode::S_GETREG_B32:
 		case Opcode::S_MOVK_I32: DecodeScalarDestination(sdst, pc, inst.dst); return;
 		case Opcode::S_SUBVECTOR_LOOP_BEGIN:
 		case Opcode::S_SUBVECTOR_LOOP_END:

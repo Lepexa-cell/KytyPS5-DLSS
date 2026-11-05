@@ -5,6 +5,8 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
+#include <algorithm>
+
 namespace Libs::Graphics {
 namespace {
 
@@ -24,60 +26,56 @@ DescriptorHeap::DescriptorHeap(GraphicContext& graphics, MasterSemaphore& master
 }
 
 DescriptorHeap::~DescriptorHeap() {
-	m_graphics.device.destroyDescriptorPool(m_current_pool, nullptr);
-	for (const auto& [pool, tick]: m_pending_pools) {
-		m_master_semaphore.Wait(tick);
+	for (const auto pool: m_pools) {
 		m_graphics.device.destroyDescriptorPool(pool, nullptr);
 	}
 }
 
 vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout layout) {
 	KYTY_PROFILER_FUNCTION();
-	auto& batch = m_sets[layout];
-	if (batch.size != 0) {
-		return batch.sets[--batch.size];
-	}
-	if (Allocate(layout, batch)) {
-		return batch.sets[--batch.size];
-	}
+	EXIT_IF(layout == nullptr);
 
-	m_pending_pools.emplace_back(m_current_pool, m_master_semaphore.CurrentTick());
-	if (const auto& [pool, tick] = m_pending_pools.front(); m_master_semaphore.IsFree(tick)) {
-		m_current_pool = pool;
-		m_pending_pools.pop_front();
-		EXIT_IF(m_graphics.device.resetDescriptorPool(m_current_pool, {}) != vk::Result::eSuccess);
+	auto&             sets = m_sets[layout];
+	const auto        tick = m_master_semaphore.CurrentTick();
+	vk::DescriptorSet set;
+	if (!sets.fresh.empty()) {
+		set = sets.fresh.back();
+		sets.fresh.pop_back();
+	} else if (!sets.used.empty() && sets.used.front().tick < tick &&
+	           m_master_semaphore.IsFree(sets.used.front().tick)) {
+		set = sets.used.front().set;
+		sets.used.pop_front();
 	} else {
-		CreateDescriptorPool();
+		Allocate(layout, sets.fresh);
+		set = sets.fresh.back();
+		sets.fresh.pop_back();
 	}
-
-	m_sets.clear();
-	auto& fresh_batch = m_sets[layout];
-	EXIT_IF(!Allocate(layout, fresh_batch));
-	return fresh_batch.sets[--fresh_batch.size];
+	sets.used.push_back({set, tick});
+	return set;
 }
 
-bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {
+void DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, std::vector<vk::DescriptorSet>& sets) {
 	std::array<vk::DescriptorSetLayout, DescriptorSetBatch> layouts;
 	layouts.fill(layout);
+	std::array<vk::DescriptorSet, DescriptorSetBatch> batch {};
 
 	vk::DescriptorSetAllocateInfo allocate {};
-	allocate.descriptorPool = m_current_pool;
-	allocate.pSetLayouts    = layouts.data();
-
-	for (;;) {
-		allocate.descriptorSetCount = batch.allocation;
-		const auto result = m_graphics.device.allocateDescriptorSets(&allocate, batch.sets.data());
-		if (result == vk::Result::eSuccess) {
-			batch.size = batch.allocation;
-			return true;
+	allocate.pSetLayouts = layouts.data();
+	for (uint32_t attempt = 0; attempt < 2; attempt++) {
+		allocate.descriptorPool = m_pools.back();
+		for (uint32_t count = DescriptorSetBatch; count != 0; count /= 2) {
+			allocate.descriptorSetCount = count;
+			const auto result = m_graphics.device.allocateDescriptorSets(&allocate, batch.data());
+			if (result == vk::Result::eSuccess) {
+				sets.insert(sets.end(), batch.begin(), batch.begin() + count);
+				return;
+			}
+			EXIT_IF(result != vk::Result::eErrorOutOfPoolMemory &&
+			        result != vk::Result::eErrorFragmentedPool);
 		}
-		EXIT_IF(result != vk::Result::eErrorOutOfPoolMemory &&
-		        result != vk::Result::eErrorFragmentedPool);
-		if (batch.allocation == 1) {
-			return false;
-		}
-		batch.allocation /= 2;
+		CreateDescriptorPool();
 	}
+	EXIT("DescriptorHeap: a new descriptor pool cannot hold one set\n");
 }
 
 void DescriptorHeap::CreateDescriptorPool() {
@@ -85,8 +83,9 @@ void DescriptorHeap::CreateDescriptorPool() {
 	create.maxSets       = DescriptorHeapCount;
 	create.poolSizeCount = static_cast<uint32_t>(DescriptorPoolSizes.size());
 	create.pPoolSizes    = DescriptorPoolSizes.data();
-	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &m_current_pool) !=
-	        vk::Result::eSuccess);
+	vk::DescriptorPool pool;
+	EXIT_IF(m_graphics.device.createDescriptorPool(&create, nullptr, &pool) != vk::Result::eSuccess);
+	m_pools.push_back(pool);
 }
 
 } // namespace Libs::Graphics

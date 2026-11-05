@@ -14,7 +14,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/pageManager.h"
-#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
+#include "graphics/host_gpu/renderer/drainStats.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -34,9 +34,13 @@
 #include <fmt/format.h>
 #include <magic_enum.hpp>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
 #else
 #if defined(__APPLE__)
@@ -666,13 +670,26 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			case CoreAccess::Execute: access = GpuAccess::Execute; break;
 			case CoreAccess::Unknown: return false;
 		}
-		if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
+		Libs::Graphics::DrainStats::t_fault_pc = info->exception_address;
+		if (access == GpuAccess::Execute) {
+			// Code that shares a page with watched data: make the page readable for the CPU
+			// first (an access watch hides GPU-written data), then give it execute back. A page
+			// of a non-executable allocation is a real fault and gets the report below; before,
+			// treating this as a read retried it forever.
+			(void)Libs::LibKernel::Memory::HandleGpuFault(GpuAccess::Read, info->access_violation_vaddr);
+			if (Common::VirtualMemory::RestoreExecute(info->access_violation_vaddr)) {
+				static std::atomic<uint64_t> s_restored {0};
+				const auto count = s_restored.fetch_add(1, std::memory_order_relaxed) + 1;
+				if (count <= 16 || (count % 1024) == 0) {
+					std::printf("execute-fault: restored execute on the page of 0x%016" PRIx64
+					            " (pc 0x%016" PRIx64 ", #%" PRIu64 ")\n",
+					            info->access_violation_vaddr, info->exception_address, count);
+					std::fflush(stdout);
+				}
+				return true;
+			}
+		} else if (Libs::LibKernel::Memory::HandleGpuFault(access, info->access_violation_vaddr)) {
 			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
-			return true;
-		}
-		if (const auto length =
-		        Libs::Graphics::ShaderRecompiler::IR::SrtWalkerLoadLength(info->exception_address)) {
-			Loader::X64InstructionEmulator::SkipLoad(info->native_context, length);
 			return true;
 		}
 	}
@@ -687,6 +704,33 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		}
 		std::printf("--- Guest fault context ---\n");
 		std::printf("thread: %s\n", thread_name);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// The host module (DLL) the faulting pc and the code addresses on the stack belong to:
+		// a fault inside a driver, a Vulkan layer or a capture tool names it here.
+		const auto describe_module = [](const char* what, uint64_t address) {
+			HMODULE module = nullptr;
+			if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+			                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+			                       reinterpret_cast<LPCSTR>(address), &module) == 0 ||
+			    module == nullptr) {
+				return false;
+			}
+			char path[MAX_PATH] = {};
+			(void)GetModuleFileNameA(module, path, MAX_PATH);
+			std::printf("%s 0x%016" PRIx64 " = %s+0x%" PRIx64 "\n", what, address, path,
+			            address - reinterpret_cast<uint64_t>(module));
+			return true;
+		};
+		(void)describe_module("pc module:", info->exception_address);
+		if (IsReadableRange(info->rsp, 64 * sizeof(uint64_t))) {
+			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
+			for (int i = 0; i < 64; i++) {
+				if (stack[i] >= 0x10000u && stack[i] < 0x00007fffffff0000ull) {
+					(void)describe_module("stack module:", stack[i]);
+				}
+			}
+		}
+#endif
 		std::printf("rax=%016" PRIx64 " rbx=%016" PRIx64 " rcx=%016" PRIx64 " rdx=%016" PRIx64 "\n"
 		            "rsi=%016" PRIx64 " rdi=%016" PRIx64 " rbp=%016" PRIx64 " rsp=%016" PRIx64 "\n"
 		            "r8 =%016" PRIx64 " r9 =%016" PRIx64 " r10=%016" PRIx64 " r11=%016" PRIx64 "\n"
@@ -694,6 +738,41 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 		            info->rax, info->rbx, info->rcx, info->rdx, info->rsi, info->rdi, info->rbp,
 		            info->rsp, info->r8, info->r9, info->r10, info->r11, info->r12, info->r13,
 		            info->r14, info->r15);
+		// What the registers holding addresses point at, 32 bytes each (idea from usa-ratt's GT7
+		// fork, round 132), and the red zone below rsp: a pointer the game keeps there and reads
+		// back as 0 was overwritten while the thread ran (GT7 2026-10-23, the title job threads).
+		{
+			const std::pair<const char*, uint64_t> registers[] = {
+			    {"rax", info->rax}, {"rbx", info->rbx}, {"rcx", info->rcx}, {"rdx", info->rdx},
+			    {"rsi", info->rsi}, {"rdi", info->rdi}, {"rbp", info->rbp}, {"r8 ", info->r8},
+			    {"r9 ", info->r9},  {"r10", info->r10}, {"r11", info->r11}, {"r12", info->r12},
+			    {"r13", info->r13}, {"r14", info->r14}, {"r15", info->r15}};
+			bool header = false;
+			for (const auto& [name, value]: registers) {
+				const auto at = value & ~uint64_t {7};
+				if (at < 0x100000u || !IsReadableRange(at, 32)) {
+					continue;
+				}
+				if (!header) {
+					std::printf("memory at the registers' addresses:\n");
+					header = true;
+				}
+				const auto* bytes = reinterpret_cast<const uint8_t*>(at);
+				std::printf(" %s %016" PRIx64 ":", name, at);
+				for (int i = 0; i < 32; i++) {
+					std::printf(" %02x", bytes[i]);
+				}
+				std::printf("\n");
+			}
+			if (IsReadableRange(info->rsp - 128, 128)) {
+				const auto* zone = reinterpret_cast<const uint64_t*>(info->rsp - 128);
+				std::printf("red zone (rsp-0x80 .. rsp):");
+				for (int i = 0; i < 16; i++) {
+					std::printf("%s %016" PRIx64, (i % 4 == 0) ? "\n " : "", zone[i]);
+				}
+				std::printf("\n");
+			}
+		}
 		if (IsReadableRange(info->exception_address - 48, 96)) {
 			const auto* code = reinterpret_cast<const uint8_t*>(info->exception_address - 48);
 			std::printf("code (pc-48 .. pc+48, fault at byte 48):");
@@ -1256,7 +1335,8 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 	// initializers execute on the host stack too, so grow it before calling any guest code.
 	size_t expanded_size = 0;
 	while (expanded_size < static_cast<size_t>(768) * 1024) {
-		const auto stack = SysStackUsage();
+		sys_dbg_stack_info_t stack {};
+		SysStackUsage(stack);
 		*reinterpret_cast<uint32_t*>(stack.guard_addr) = 0;
 		expanded_size += stack.guard_size;
 	}
@@ -1273,6 +1353,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 			EXIT("Failed to apply game cheat\n");
 		}
 	}
+	GamePatch::ApplyBuiltIn(m_programs.empty() ? nullptr : m_programs.front());
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}
@@ -1632,8 +1713,6 @@ void RuntimeLinker::DeleteTls(Program* program, int thread_id) {
 	}
 }
 
-constexpr uint64_t GUEST_PAGE_SIZE = 0x4000;
-
 static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 	uint64_t base_size = 0;
 	for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
@@ -1645,20 +1724,6 @@ static uint64_t CalcBaseSize(const Elf64_Ehdr* ehdr, const Elf64_Phdr* phdr) {
 		}
 	}
 	return base_size;
-}
-
-// A module's E, R and RW LOAD segments use flexible memory in 16 KiB pages; GNU_RELRO adds none
-// since it lies inside an RW LOAD.
-uint64_t CalcFlexibleMemorySize(const Elf64_Phdr* phdr, Elf64_Half phnum) {
-	uint64_t size = 0;
-	for (Elf64_Half i = 0; i < phnum; i++) {
-		const auto flags = phdr[i].p_flags;
-		if (phdr[i].p_type == PT_LOAD &&
-		    (flags == PF_X || flags == PF_R || flags == (PF_R | PF_W))) {
-			size += AlignUp(phdr[i].p_memsz, GUEST_PAGE_SIZE);
-		}
-	}
-	return size;
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
@@ -1680,7 +1745,8 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 
 	EXIT_IF(phdr == nullptr || ehdr == nullptr);
 
-	program->base_size = CalcBaseSize(ehdr, phdr);
+	program->base_size                 = CalcBaseSize(ehdr, phdr);
+	constexpr uint64_t GUEST_PAGE_SIZE = 0x4000;
 	EXIT_IF(program->base_size > UINT64_MAX - (GUEST_PAGE_SIZE - 1));
 	program->base_size_aligned = AlignUp(program->base_size, GUEST_PAGE_SIZE);
 
@@ -1693,10 +1759,7 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 #else
 	const bool protect_memory_faults = false;
 #endif
-	const uint64_t tsc_multiplier =
-	    Config::GuestTscEnabled() ? Libs::LibKernel::KernelGuestTscMultiplier() : 0;
-	const bool patch_guest_instructions =
-	    protect_memory_faults || emulate_amd || tsc_multiplier != 0;
+	const bool patch_guest_instructions = protect_memory_faults || emulate_amd;
 
 	constexpr uint64_t INSTRUCTION_TRAMPOLINE_SIZE = 8u * 1024u * 1024u;
 	if (patch_guest_instructions) {
@@ -1708,8 +1771,6 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 	    g_desired_base_addr, program->mapped_size, Common::VirtualMemory::Mode::ExecuteReadWrite,
 	    Common::PathToString(program->file_name.filename()).c_str());
 	EXIT_IF(program->base_vaddr == 0);
-	program->flexible_size = CalcFlexibleMemorySize(phdr, ehdr->e_phnum);
-	Libs::LibKernel::Memory::ChargeFlexibleMemory(program->flexible_size);
 
 	if (patch_guest_instructions) {
 		const auto trampoline_addr           = program->base_vaddr + program->base_size_aligned;
@@ -1814,21 +1875,20 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 		    !function_starts.empty();
 		const auto module_name = Common::PathToString(program->file_name.filename());
 		if (!have_function_starts) {
-			Log::WriteToConsoleAndLog(fmt::format(
-			    "Guest instruction patches: {} not applied (function boundaries unavailable)\n",
-			    module_name));
+			Log::WriteToConsoleAndLog(
+			    fmt::format("{}: {} not patched (function boundaries unavailable)\n",
+			                emulate_amd ? "AMD CPU compatibility" : "Guest red-zone protection",
+			                module_name));
 		}
 		GuestInstructionPatchResult totals {};
 		for (const auto& [segment_addr, segment_size]: executable_segments) {
-			const auto result = PatchGuestInstructions(
-			    segment_addr, segment_size, function_starts, protect_memory_faults, emulate_amd,
-			    GetGuestInstructionHostFeatures(), tsc_multiplier);
+			const auto result = PatchGuestInstructions(segment_addr, segment_size, function_starts,
+			                                           protect_memory_faults, emulate_amd);
 			totals.reciprocal_sqrt += result.reciprocal_sqrt;
 			totals.extrq += result.extrq;
 			totals.insertq += result.insertq;
 			totals.rdpid += result.rdpid;
 			totals.clwb += result.clwb;
-			totals.rdtsc += result.rdtsc;
 			if (protect_memory_faults) {
 				LOGF("Windows guest red-zone patching: %s, functions=%" PRIu64 ", red_zone=%" PRIu64
 				     ", memory=%" PRIu64 ", patched=%" PRIu64 ", short=%" PRIu64 ", stack=%" PRIu64
@@ -1841,11 +1901,6 @@ void RuntimeLinker::LoadProgramToMemory(Program* program) {
 				     result.control_flow_memory_instruction_count,
 				     result.unrelocatable_memory_instruction_count);
 			}
-		}
-		if (totals.rdtsc.found != 0) {
-			Log::WriteToConsoleAndLog(
-			    fmt::format("Guest TSC: {} (RDTSC/RDTSCP: native={}, skipped={})\n", module_name,
-			                totals.rdtsc.native, totals.rdtsc.Skipped()));
 		}
 		if (emulate_amd && have_function_starts) {
 			InstructionPatchCounts combined {};
@@ -1901,7 +1956,6 @@ void RuntimeLinker::DeleteProgram(Program* p) {
 		}
 		EXIT_IF(
 		    !Libs::LibKernel::Memory::FreeGuestMemory(program->base_vaddr, program->mapped_size));
-		Libs::LibKernel::Memory::ReleaseFlexibleMemory(program->flexible_size);
 	}
 }
 

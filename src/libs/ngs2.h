@@ -33,8 +33,6 @@ int KYTY_SYSV_ABI Ngs2SystemCreate(const Ngs2SystemOption*      option,
                                    const Ngs2ContextBufferInfo* buffer_info, uintptr_t* handle);
 int KYTY_SYSV_ABI Ngs2SystemGetInfo(uintptr_t system_handle, Ngs2SystemInfo* info,
                                     size_t info_size);
-int KYTY_SYSV_ABI Ngs2SystemLock(uintptr_t system_handle);
-int KYTY_SYSV_ABI Ngs2SystemUnlock(uintptr_t system_handle);
 int KYTY_SYSV_ABI Ngs2SystemSetGrainSamples(uintptr_t system_handle, uint32_t num_samples);
 int KYTY_SYSV_ABI Ngs2RackQueryBufferSize(uint32_t rack_id, const Ngs2RackOption* option,
                                           Ngs2ContextBufferInfo* buffer_info);
@@ -60,10 +58,6 @@ int KYTY_SYSV_ABI Ngs2VoiceRunCommands(uintptr_t voice_handle, const void* comma
 int KYTY_SYSV_ABI Ngs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* state,
                                     size_t state_size);
 int KYTY_SYSV_ABI Ngs2VoiceGetStateFlags(uintptr_t voice_handle, uint32_t* state_flags);
-int KYTY_SYSV_ABI Ngs2VoiceQueryInfo(uintptr_t voice_handle, uint32_t query_id, void* info,
-                                     size_t info_size);
-int KYTY_SYSV_ABI Ngs2VoiceGetPortInfo(uintptr_t voice_handle, uint32_t port, void* info,
-                                       size_t info_size);
 int KYTY_SYSV_ABI Ngs2SystemRender(uintptr_t system_handle, const Ngs2RenderBufferInfo* buffer_info,
                                    uint32_t num_buffer_info);
 int KYTY_SYSV_ABI Ngs2ParseWaveformData(const void* data, size_t data_size, Ngs2WaveformInfo* info);

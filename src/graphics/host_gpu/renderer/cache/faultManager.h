@@ -11,6 +11,10 @@ namespace Libs::Graphics {
 
 class BufferCache;
 
+// KYTY_DEBUG_BDA_FAULTS=1: Thread_Gpu notes each shader that reads memory through addresses; a
+// fault pass then prints the shaders recorded since the previous pass next to its pages.
+void NoteBdaShader(uint64_t shader_hash);
+
 class FaultManager {
 	static constexpr size_t MaxPendingFaults = 8;
 
@@ -20,6 +24,7 @@ public:
 	KYTY_CLASS_NO_COPY(FaultManager);
 
 	[[nodiscard]] Buffer* GetFaultBuffer() noexcept { return &m_fault_buffer; }
+	[[nodiscard]] const Buffer* GetFaultBuffer() const noexcept { return &m_fault_buffer; }
 	void                  ProcessFaultBuffer();
 
 private:

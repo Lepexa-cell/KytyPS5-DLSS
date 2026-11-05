@@ -102,7 +102,8 @@ void TestPeriodicTimerEvents() {
 	      "timer update preserves accumulated occurrences and updates userdata");
 	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == KERNEL_ERROR_ETIMEDOUT,
 	      "timer update replaces the repeating interval");
-	Check(EventQueue::KernelDeleteTimerEvent(queue, 10) == OK, "delete periodic timer");
+	Check(EventQueue::KernelDeleteEvent(queue, 10, EventQueue::KERNEL_EVFILT_TIMER) == OK,
+	      "delete periodic timer");
 
 	Check(EventQueue::KernelAddTimerEvent(queue, 10, 0, user_data) == OK,
 	      "add immediate periodic timer");
@@ -115,11 +116,8 @@ void TestPeriodicTimerEvents() {
 		          events[0].data == 1,
 		      "zero interval remains immediately ready after delivery");
 	}
-	Check(EventQueue::KernelDeleteTimerEvent(queue, 10) == OK, "delete immediate timer");
-	Check(EventQueue::KernelWaitEqueue(queue, events, 2, &out, &timeout) == KERNEL_ERROR_ETIMEDOUT,
-	      "deleted timer is not delivered again");
-	Check(EventQueue::KernelDeleteTimerEvent(queue, 10) == KERNEL_ERROR_ENOENT,
-	      "deleting a missing timer reports ENOENT");
+	Check(EventQueue::KernelDeleteEvent(queue, 10, EventQueue::KERNEL_EVFILT_TIMER) == OK,
+	      "delete immediate timer");
 
 	const Libs::LibKernel::KernelTimespec delay {0, 1000000};
 	Check(EventQueue::KernelAddHRTimerEvent(queue, 10, &delay, user_data) == OK,

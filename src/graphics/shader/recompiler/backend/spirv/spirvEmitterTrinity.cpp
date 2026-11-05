@@ -89,7 +89,7 @@ uint32_t StackPop(EmitterState& s, const MemoryResourceAccess& memory,
 }
 
 void DefineBvhStack(EmitterState& s) {
-	if (!s.program.info.bvh_stack) return;
+	if (!s.requirements.bvh_stack) return;
 	const auto u = TypeU32(s), b = TypeBool(s), vec4 = TypeU32Vector(s, 4), pair = TypeU32Pair(s);
 	const auto zero = ConstantU32(s, 0), one = ConstantU32(s, 1);
 	const bool local = s.lds_storage_class == spv::StorageClassFunction;

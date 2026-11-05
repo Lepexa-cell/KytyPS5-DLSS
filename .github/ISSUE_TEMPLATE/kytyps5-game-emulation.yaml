@@ -137,7 +137,7 @@ body:
     attributes:
       label: GPU
       description: Include the graphics card model and driver version when available.
-      placeholder: "Example: NVIDIA GeForce RTX 5080, driver 576.80"
+      placeholder: "Example: GPU model and driver version"
     validations:
       required: true
 

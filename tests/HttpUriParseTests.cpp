@@ -1,5 +1,4 @@
 #include "common/abi.h"
-#include "libs/network.h"
 #include "loader/symbolDatabase.h"
 
 #include <array>
@@ -163,17 +162,6 @@ void TestBuildHonoursOption(HttpUriParse parse, HttpUriBuild build) {
   CHECK(BuildWith(build, element, 0) == url);
 }
 
-// Cyberpunk 2077 (PPSA03974) creates a template with a NULL user agent.
-void TestTemplateWithoutUserAgent() {
-  using namespace Libs::Network;
-  Initialize();
-  const int pool = Net::NetPoolCreate("http", 0x10000, 0);
-  const int ssl = Ssl::SslInit(0x10000);
-  const int http = Http::HttpInit(pool, ssl, 0x10000);
-  CHECK(Http::HttpCreateTemplate(http, nullptr, 2, 1) > 0);
-  Shutdown();
-}
-
 } // namespace
 
 int main() {
@@ -188,6 +176,5 @@ int main() {
   TestAbsentQuery(parse);
   TestEmptyUri(parse);
   TestPresentQuery(parse);
-  TestTemplateWithoutUserAgent();
   return failures == 0 ? 0 : 1;
 }

@@ -1,12 +1,12 @@
 #ifndef EMULATOR_SRC_GRAPHICS_PRESENTATION_WINDOW_WINDOWINTERNAL_H_
 #define EMULATOR_SRC_GRAPHICS_PRESENTATION_WINDOW_WINDOWINTERNAL_H_
 
-#include <SDL3/SDL.h>
-
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/frameStatistics.h"
 
+#include <SDL3/SDL.h>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -23,9 +23,59 @@ struct SurfaceCapabilities {
 	std::vector<vk::PresentModeKHR>   present_modes;
 };
 
+// A linear blit reads 2x2 source texels per destination pixel, so a blit that shrinks by more
+// than 2x skips texels and aliases fine guest detail into a static moire (a 4K game's per-pixel
+// dither becomes a diagonal pattern in a 1280x720 window). Prepared frames keep a mip chain: a
+// 2:1 linear blit into the next level is an exact 2x2 box filter, and the blit to the swapchain
+// starts from the first level that is at most twice the target size.
+[[nodiscard]] uint32_t PresentSourceLevel(vk::Extent2D source, vk::Extent2D target,
+                                          uint32_t levels) noexcept;
+// Fills levels 1..level of a 2D color image from level 0, which must be in eTransferSrcOptimal.
+// Levels 1..level are left in eTransferSrcOptimal.
+void RecordPresentDownscale(vk::CommandBuffer command, vk::Image image, vk::Extent2D extent,
+                            uint32_t level);
+
+// A linear blit that shrinks by less than 2x (a 4K frame in a maximized 2560x1369 window) reads
+// texel pairs at uneven phases, so a per-pixel dither survives at up to half strength as a
+// diagonal beat. PresentFilter averages each target pixel over a two-texel box instead, which
+// cancels one-texel patterns at any phase. An exact 2:1 blit already is that box, so it and
+// upscales keep the blit.
+[[nodiscard]] bool PresentNeedsFilter(vk::Extent2D source, vk::Extent2D target) noexcept;
+
+// The largest centred rectangle of `target` with the aspect ratio of `source` (letterbox or
+// pillarbox); the bars around it stay black. KYTY_PRESENT_STRETCH=1 returns all of `target`.
+[[nodiscard]] vk::Rect2D PresentRect(vk::Extent2D source, vk::Extent2D target) noexcept;
+
+class PresentFilter final {
+public:
+	PresentFilter()  = default;
+	~PresentFilter() = default;
+	KYTY_CLASS_NO_COPY(PresentFilter);
+
+	// Draws level `level` (extent `source`, at most twice `target` on each axis) of `source_view`
+	// into `target` of `target_view` (extent `target_extent`); when `target` is smaller, the rest
+	// of the image is cleared to black first. The source view covers every level and is in
+	// eShaderReadOnlyOptimal; the target is in eColorAttachmentOptimal. With `fxaa`, the level
+	// is drawn through FXAA instead (any scale up to 2x down, see gpu_video_out_fxaa.frag).
+	void Record(vk::Device device, vk::CommandBuffer command, vk::ImageView source_view,
+	            uint32_t level, vk::Extent2D source, vk::ImageView target_view,
+	            vk::Format target_format, vk::Extent2D target_extent, vk::Rect2D target,
+	            bool fxaa = false);
+	void Release(vk::Device device);
+
+private:
+	vk::Format              m_format      = vk::Format::eUndefined;
+	vk::Sampler             m_sampler     = nullptr;
+	vk::DescriptorSetLayout m_descriptors = nullptr;
+	vk::PipelineLayout      m_layout      = nullptr;
+	vk::Pipeline            m_pipeline    = nullptr;
+	vk::Pipeline            m_fxaa        = nullptr;
+};
+
 struct WindowLoopState {
-	SDL_Event             event {};
-	bool                  need_exit = false;
+	SDL_Event        event {};
+	bool             need_exit = false;
+	std::atomic_bool paused    = false;
 	std::atomic<uint64_t> presented_frames {0};
 };
 
@@ -42,7 +92,7 @@ struct WindowContext {
 	void                                                    RecreateSurface();
 	void                                                    RefreshSurfaceCapabilities();
 	void                                                    UpdateIcon();
-	void UpdateTitle(uint64_t frame_num, double current_fps);
+	void                                                    UpdateTitle(bool new_frame);
 	void                                                    Resize(int width, int height);
 	void ProcessWindowEvent(const SDL_WindowEvent& event);
 	void ProcessDisplayEvent(const SDL_DisplayEvent& event);
@@ -56,6 +106,7 @@ struct WindowContext {
 	std::unique_ptr<RenderContext> render_context;
 	std::unique_ptr<Presenter>     presenter;
 	WindowLoopState                loop;
+	FrameStatistics                frame_statistics;
 
 	Common::Mutex mutex;
 };

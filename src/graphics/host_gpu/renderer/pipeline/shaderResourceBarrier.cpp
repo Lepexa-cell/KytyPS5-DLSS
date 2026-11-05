@@ -1,10 +1,12 @@
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 
 #include "common/assert.h"
-#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "common/switches.h"
+#include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <cstdlib>
 #include <cstring>
 
 namespace Libs::Graphics {
@@ -43,6 +45,7 @@ vk::PipelineStageFlags ShaderPipelineStages(vk::ShaderStageFlags stages) {
 	if (stages & vk::ShaderStageFlagBits::eCompute) {
 		result |= vk::PipelineStageFlagBits::eComputeShader;
 	}
+	EXIT_IF(!result);
 	return result;
 }
 
@@ -52,14 +55,30 @@ vk::MemoryBarrier MakeShaderWriteDependency() {
 	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite |
 	                        vk::AccessFlagBits::eVertexAttributeRead |
 	                        vk::AccessFlagBits::eIndexRead | vk::AccessFlagBits::eUniformRead |
-	                        vk::AccessFlagBits::eIndirectCommandRead |
 	                        vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eColorAttachmentRead |
 	                        vk::AccessFlagBits::eColorAttachmentWrite;
 	return barrier;
 }
 
+vk::MemoryBarrier MakeShaderAccessDependency() {
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask =
+	    LaterAccessOr(LaterSite::Dispatch, vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite);
+	return barrier;
+}
+
+vk::MemoryBarrier MakeShaderWriteHazardDependency() {
+	vk::MemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+	return barrier;
+}
+
 vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
+	EXIT_IF(buffer == nullptr);
+
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eHostWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
@@ -72,17 +91,35 @@ vk::BufferMemoryBarrier MakeGdsDependency(vk::Buffer buffer) {
 	return barrier;
 }
 
+uint32_t GlobalBarrierLiteLevel() noexcept {
+	static const uint32_t level = [] {
+		const char* text = KYTY_GETENV("KYTY_GLOBAL_BARRIER_LITE");
+		return text != nullptr ? static_cast<uint32_t>(std::strtoul(text, nullptr, 10)) : 0u;
+	}();
+	// KYTY_DEBUG_AB=barrierlite: full barriers again in the ab=off windows (in-run comparison).
+	static const bool ab = AbSelected("barrierlite");
+	return ab && AbFeatureOff() ? 0u : level;
+}
+
+bool GlobalBarrierLiteEnabled() noexcept {
+	return GlobalBarrierLiteLevel() != 0;
+}
+
 bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
-	const auto& program   = runtime.module->info;
+	EXIT_IF(!runtime);
+	const auto& program   = *runtime.program;
 	const auto& resources = *runtime.resources;
 	EXIT_IF(resources.buffers.size() != program.info.buffers.size());
-	// Address writes reach memory outside the bound buffer descriptors.
-	bool has_writes = program.has_address_writes;
+	// Address writes reach memory outside the bound descriptors (upstream 70668fbd9). With
+	// KYTY_GLOBAL_BARRIER_LITE the game's flush events no longer order them with a full barrier,
+	// so such a draw defers its own write barrier like a descriptor-writing one.
+	bool has_writes = GlobalBarrierLiteEnabled() && program.has_address_writes;
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		if (!program.info.buffers[i].written) {
 			continue;
 		}
-		const auto&          value = resources.buffers[i];
+		const auto& value = resources.buffers[i];
+		EXIT_IF(value.dword_count < 4);
 		ShaderBufferResource descriptor;
 		std::memcpy(descriptor.fields, value.dwords.data(), sizeof(descriptor.fields));
 		// A zero stride means byte addressing. For either addressing mode a nonzero record
@@ -93,23 +130,22 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 }
 
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
-	const vk::MemoryBarrier barrier {
-	    .srcAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite,
-	    .dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite};
+	EXIT_IF(vk_buffer == nullptr || !source_stages);
+	const auto barrier = MakeShaderAccessDependency();
 	vk_buffer.pipelineBarrier(source_stages, vk::PipelineStageFlagBits::eAllCommands,
 	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
 void ShaderWriteHazardBarrier(vk::CommandBuffer      vk_buffer,
                               vk::PipelineStageFlags destination_stages) {
-	const vk::MemoryBarrier barrier {
-	    .srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite,
-	    .dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite};
+	EXIT_IF(vk_buffer == nullptr || !destination_stages);
+	const auto barrier = MakeShaderWriteHazardDependency();
 	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, destination_stages,
 	                          vk::DependencyFlags {}, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
 void ShaderWriteBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
+	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderWriteDependency();
 	vk_buffer.pipelineBarrier(source_stages,
 	                          vk::PipelineStageFlagBits::eComputeShader |

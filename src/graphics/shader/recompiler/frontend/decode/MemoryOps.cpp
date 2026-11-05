@@ -6,14 +6,13 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 namespace {
 
 struct MemoryOpcodeInfo {
-	uint32_t encoding        = 0;
-	Opcode   decoded         = Opcode::UNSUPPORTED;
-	uint32_t data_dwords     = 1;
-	uint32_t data_bits       = 32;
-	bool     data_signed     = false;
-	bool     typed           = false;
-	bool     formatted       = false;
-	uint32_t data_components = 0; // D16 formats pack two components per dword
+	uint32_t encoding    = 0;
+	Opcode   decoded     = Opcode::UNSUPPORTED;
+	uint32_t data_dwords = 1;
+	uint32_t data_bits   = 32;
+	bool     data_signed = false;
+	bool     typed       = false;
+	bool     formatted   = false;
 };
 
 constexpr MemoryOpcodeInfo SMEM_OPCODE_LIST[] = {
@@ -22,7 +21,7 @@ constexpr MemoryOpcodeInfo SMEM_OPCODE_LIST[] = {
     {0x04u, Opcode::S_LOAD_DWORDX16, 16, 32},      {0x08u, Opcode::S_BUFFER_LOAD_DWORD, 1, 32},
     {0x09u, Opcode::S_BUFFER_LOAD_DWORDX2, 2, 32}, {0x0au, Opcode::S_BUFFER_LOAD_DWORDX4, 4, 32},
     {0x0bu, Opcode::S_BUFFER_LOAD_DWORDX8, 8, 32}, {0x0cu, Opcode::S_BUFFER_LOAD_DWORDX16, 16, 32},
-    {0x20u, Opcode::S_DCACHE_INV, 0, 0},           {0x25u, Opcode::S_MEMREALTIME, 2, 32},
+    {0x25u, Opcode::S_MEMREALTIME, 2, 32},
 };
 
 constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
@@ -43,21 +42,11 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x0eu, Opcode::BUFFER_LOAD_DWORDX4, 4, 32},
     {0x0fu, Opcode::BUFFER_LOAD_DWORDX3, 3, 32},
     {0x18u, Opcode::BUFFER_STORE_BYTE, 1, 8},
-    {0x19u, Opcode::BUFFER_STORE_BYTE_D16_HI, 1, 8},
     {0x1au, Opcode::BUFFER_STORE_SHORT, 1, 16},
-    {0x1bu, Opcode::BUFFER_STORE_SHORT_D16_HI, 1, 16},
     {0x1cu, Opcode::BUFFER_STORE_DWORD, 1, 32},
     {0x1du, Opcode::BUFFER_STORE_DWORDX2, 2, 32},
     {0x1eu, Opcode::BUFFER_STORE_DWORDX4, 4, 32},
     {0x1fu, Opcode::BUFFER_STORE_DWORDX3, 3, 32},
-    {0x20u, Opcode::BUFFER_LOAD_UBYTE_D16, 1, 8},
-    {0x21u, Opcode::BUFFER_LOAD_UBYTE_D16_HI, 1, 8},
-    {0x22u, Opcode::BUFFER_LOAD_SBYTE_D16, 1, 8, true},
-    {0x23u, Opcode::BUFFER_LOAD_SBYTE_D16_HI, 1, 8, true},
-    {0x24u, Opcode::BUFFER_LOAD_SHORT_D16, 1, 16},
-    {0x25u, Opcode::BUFFER_LOAD_SHORT_D16_HI, 1, 16},
-    {0x26u, Opcode::BUFFER_LOAD_FORMAT_D16_HI_X, 1, 16, false, false, true},
-    {0x27u, Opcode::BUFFER_STORE_FORMAT_D16_HI_X, 1, 16, false, false, true},
     {0x30u, Opcode::BUFFER_ATOMIC_SWAP, 1, 32},
     {0x31u, Opcode::BUFFER_ATOMIC_CMPSWAP, 1, 32},
     {0x32u, Opcode::BUFFER_ATOMIC_ADD, 1, 32},
@@ -72,20 +61,29 @@ constexpr MemoryOpcodeInfo MUBUF_OPCODE_LIST[] = {
     {0x3fu, Opcode::BUFFER_ATOMIC_FMIN, 1, 32},
     {0x40u, Opcode::BUFFER_ATOMIC_FMAX, 1, 32},
     {0x50u, Opcode::BUFFER_ATOMIC_SWAP_X2, 2, 32},
-    {0x52u, Opcode::BUFFER_ATOMIC_ADD_X2, 2, 32},
-    {0x56u, Opcode::BUFFER_ATOMIC_UMIN_X2, 2, 32},
     {0x59u, Opcode::BUFFER_ATOMIC_AND_X2, 2, 32},
     {0x5au, Opcode::BUFFER_ATOMIC_OR_X2, 2, 32},
-    {0x71u, Opcode::BUFFER_GL0_INV, 0, 0},
-    {0x72u, Opcode::BUFFER_GL1_INV, 0, 0},
-    {0x80u, Opcode::BUFFER_LOAD_FORMAT_D16_X, 1, 16, false, false, true},
-    {0x81u, Opcode::BUFFER_LOAD_FORMAT_D16_XY, 1, 16, false, false, true, 2},
-    {0x82u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZ, 2, 16, false, false, true, 3},
-    {0x83u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZW, 2, 16, false, false, true, 4},
-    {0x84u, Opcode::BUFFER_STORE_FORMAT_D16_X, 1, 16, false, false, true},
-    {0x85u, Opcode::BUFFER_STORE_FORMAT_D16_XY, 1, 16, false, false, true, 2},
-    {0x86u, Opcode::BUFFER_STORE_FORMAT_D16_XYZ, 2, 16, false, false, true, 3},
-    {0x87u, Opcode::BUFFER_STORE_FORMAT_D16_XYZW, 2, 16, false, false, true, 4},
+    // D16: the formatted components come back as packed halves, two per register.
+    // D16 sub-dword accesses: loads fill one half of the register, keeping the other; _HI
+    // stores take their data from the high half.
+    {0x19u, Opcode::BUFFER_STORE_BYTE_D16_HI, 1, 8},
+    {0x1bu, Opcode::BUFFER_STORE_SHORT_D16_HI, 1, 16},
+    {0x20u, Opcode::BUFFER_LOAD_UBYTE_D16, 1, 8},
+    {0x21u, Opcode::BUFFER_LOAD_UBYTE_D16_HI, 1, 8},
+    {0x22u, Opcode::BUFFER_LOAD_SBYTE_D16, 1, 8, true},
+    {0x23u, Opcode::BUFFER_LOAD_SBYTE_D16_HI, 1, 8, true},
+    {0x24u, Opcode::BUFFER_LOAD_SHORT_D16, 1, 16},
+    {0x25u, Opcode::BUFFER_LOAD_SHORT_D16_HI, 1, 16},
+    {0x80u, Opcode::BUFFER_LOAD_FORMAT_D16_X, 1, 32, false, false, true},
+    {0x84u, Opcode::BUFFER_STORE_FORMAT_D16_X, 1, 32, false, false, true},
+    {0x27u, Opcode::BUFFER_STORE_FORMAT_D16_HI_X, 1, 32, false, false, true},
+    {0x85u, Opcode::BUFFER_STORE_FORMAT_D16_XY, 2, 32, false, false, true},
+    {0x86u, Opcode::BUFFER_STORE_FORMAT_D16_XYZ, 3, 32, false, false, true},
+    {0x87u, Opcode::BUFFER_STORE_FORMAT_D16_XYZW, 4, 32, false, false, true},
+    {0x81u, Opcode::BUFFER_LOAD_FORMAT_D16_XY, 2, 32, false, false, true},
+    {0x82u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZ, 3, 32, false, false, true},
+    {0x83u, Opcode::BUFFER_LOAD_FORMAT_D16_XYZW, 4, 32, false, false, true},
+    {0x26u, Opcode::BUFFER_LOAD_FORMAT_D16_HI_X, 1, 32, false, false, true},
 };
 
 constexpr MemoryOpcodeInfo MTBUF_OPCODE_LIST[] = {
@@ -100,14 +98,14 @@ constexpr MemoryOpcodeInfo MTBUF_OPCODE_LIST[] = {
 };
 
 constexpr MemoryOpcodeInfo FLAT_OPCODE_LIST[] = {
-    {0x08u, Opcode::FLAT_LOAD_UBYTE, 1, 8},      {0x09u, Opcode::FLAT_LOAD_SBYTE, 1, 8, true},
-    {0x0au, Opcode::FLAT_LOAD_USHORT, 1, 16},    {0x0bu, Opcode::FLAT_LOAD_SSHORT, 1, 16, true},
-    {0x0cu, Opcode::FLAT_LOAD_DWORD, 1, 32},     {0x0du, Opcode::FLAT_LOAD_DWORDX2, 2, 32},
-    {0x0eu, Opcode::FLAT_LOAD_DWORDX4, 4, 32},   {0x0fu, Opcode::FLAT_LOAD_DWORDX3, 3, 32},
-    {0x18u, Opcode::FLAT_STORE_BYTE, 1, 8},      {0x1au, Opcode::FLAT_STORE_SHORT, 1, 16},
-    {0x1cu, Opcode::FLAT_STORE_DWORD, 1, 32},    {0x1du, Opcode::FLAT_STORE_DWORDX2, 2, 32},
-    {0x1eu, Opcode::FLAT_STORE_DWORDX4, 4, 32},  {0x1fu, Opcode::FLAT_STORE_DWORDX3, 3, 32},
-    {0x24u, Opcode::FLAT_LOAD_SHORT_D16, 1, 16}, {0x25u, Opcode::FLAT_LOAD_SHORT_D16_HI, 1, 16},
+    {0x08u, Opcode::FLAT_LOAD_UBYTE, 1, 8},     {0x09u, Opcode::FLAT_LOAD_SBYTE, 1, 8, true},
+    {0x0au, Opcode::FLAT_LOAD_USHORT, 1, 16},   {0x0bu, Opcode::FLAT_LOAD_SSHORT, 1, 16, true},
+    {0x0cu, Opcode::FLAT_LOAD_DWORD, 1, 32},    {0x0du, Opcode::FLAT_LOAD_DWORDX2, 2, 32},
+    {0x0eu, Opcode::FLAT_LOAD_DWORDX4, 4, 32},  {0x0fu, Opcode::FLAT_LOAD_DWORDX3, 3, 32},
+    {0x18u, Opcode::FLAT_STORE_BYTE, 1, 8},     {0x1au, Opcode::FLAT_STORE_SHORT, 1, 16},
+    {0x1cu, Opcode::FLAT_STORE_DWORD, 1, 32},   {0x1du, Opcode::FLAT_STORE_DWORDX2, 2, 32},
+    {0x1eu, Opcode::FLAT_STORE_DWORDX4, 4, 32}, {0x1fu, Opcode::FLAT_STORE_DWORDX3, 3, 32},
+    {0x24u, Opcode::FLAT_LOAD_SHORT_D16, 1, 16},
 };
 
 constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
@@ -127,7 +125,6 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x27u, Opcode::DS_MIN_RTN_U32, 1, 32},      {0x28u, Opcode::DS_MAX_RTN_U32, 1, 32},
     {0x29u, Opcode::DS_AND_RTN_B32, 1, 32},      {0x2au, Opcode::DS_OR_RTN_B32, 1, 32},
     {0x2bu, Opcode::DS_XOR_RTN_B32, 1, 32},      {0x2du, Opcode::DS_WRXCHG_RTN_B32, 1, 32},
-    {0x30u, Opcode::DS_CMPST_RTN_B32, 1, 32},
     {0x35u, Opcode::DS_SWIZZLE_B32, 1, 32},      {0x36u, Opcode::DS_READ_B32, 1, 32},
     {0x37u, Opcode::DS_READ2_B32, 2, 32},        {0x38u, Opcode::DS_READ2ST64_B32, 2, 32},
     {0x39u, Opcode::DS_READ_I8, 1, 8, true},     {0x3au, Opcode::DS_READ_U8, 1, 8},
@@ -136,8 +133,7 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0x3fu, Opcode::DS_ORDERED_COUNT, 1, 32},
     {0x40u, Opcode::DS_ADD_U64, 2, 32},         {0x4au, Opcode::DS_OR_B64, 2, 32},
     {0x4du, Opcode::DS_WRITE_B64, 2, 32},        {0x4eu, Opcode::DS_WRITE2_B64, 4, 32},
-    {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x68u, Opcode::DS_MAX_RTN_U64, 2, 32},
-    {0x70u, Opcode::DS_CMPST_RTN_B64, 2, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
+    {0x4fu, Opcode::DS_WRITE2ST64_B64, 4, 32},   {0x76u, Opcode::DS_READ_B64, 2, 32},
     {0x77u, Opcode::DS_READ2_B64, 4, 32},        {0x78u, Opcode::DS_READ2ST64_B64, 4, 32},
     {0xa0u, Opcode::DS_WRITE_B8_D16_HI, 1, 8},
     {0xa1u, Opcode::DS_WRITE_B16_D16_HI, 1, 16},
@@ -146,7 +142,7 @@ constexpr MemoryOpcodeInfo DS_OPCODE_LIST[] = {
     {0xb0u, Opcode::DS_WRITE_ADDTID_B32, 1, 32}, {0xb1u, Opcode::DS_READ_ADDTID_B32, 1, 32},
     {0xb2u, Opcode::DS_PERMUTE_B32, 1, 32},     {0xb3u, Opcode::DS_BPERMUTE_B32, 1, 32},
     {0xdeu, Opcode::DS_WRITE_B96, 3, 32},        {0xdfu, Opcode::DS_WRITE_B128, 4, 32},
-    {0xe1u, Opcode::DS_BVH_STACK_PUSH8_POP1_RTN_B32, 1, 32},
+    {0xe1u, Opcode::DS_BVH_STACK_PUSH8_POP1_RTN_B32, 1, 32}, // PS5 Pro (RDNA4 BVH8 stack)
     {0xfeu, Opcode::DS_READ_B96, 3, 32},         {0xffu, Opcode::DS_READ_B128, 4, 32},
 };
 
@@ -169,16 +165,13 @@ void ApplyMemoryInfo(Instruction& inst, const MemoryOpcodeInfo* info) {
 		inst.opcode = Opcode::UNSUPPORTED;
 		return;
 	}
-	inst.opcode          = info->decoded;
-	inst.data_dwords     = info->data_dwords;
-	inst.data_bits       = info->data_bits;
-	inst.data_signed     = info->data_signed;
-	inst.typed           = info->typed;
-	inst.formatted       = info->formatted;
-	inst.data_components = info->data_components;
+	inst.opcode      = info->decoded;
+	inst.data_dwords = info->data_dwords;
+	inst.data_bits   = info->data_bits;
+	inst.data_signed = info->data_signed;
+	inst.typed       = info->typed;
+	inst.formatted   = info->formatted;
 }
-
-} // namespace
 
 bool IsDsWriteOpcode(Opcode opcode) {
 	switch (opcode) {
@@ -197,8 +190,6 @@ bool IsDsWriteOpcode(Opcode opcode) {
 		default: return false;
 	}
 }
-
-namespace {
 
 bool IsDsAtomicOpcode(Opcode opcode) {
 	switch (opcode) {
@@ -219,9 +210,6 @@ bool IsDsAtomicOpcode(Opcode opcode) {
 		case Opcode::DS_MIN_RTN_U32:
 		case Opcode::DS_MAX_U32:
 		case Opcode::DS_MAX_RTN_U32:
-		case Opcode::DS_MAX_RTN_U64:
-		case Opcode::DS_CMPST_RTN_B32:
-		case Opcode::DS_CMPST_RTN_B64:
 		case Opcode::DS_AND_B32:
 		case Opcode::DS_AND_RTN_B32:
 		case Opcode::DS_OR_B32:
@@ -242,8 +230,6 @@ uint32_t DsSourceCount(Opcode opcode) {
 		case Opcode::DS_WRITE2ST64_B32:
 		case Opcode::DS_WRITE2_B64:
 		case Opcode::DS_WRITE2ST64_B64:
-		case Opcode::DS_CMPST_RTN_B32:
-		case Opcode::DS_CMPST_RTN_B64:
 		case Opcode::DS_MSKOR_B32: return 3u;
 		case Opcode::DS_MIN_F32:
 		case Opcode::DS_MAX_F32:
@@ -292,9 +278,6 @@ void DecodeSmem(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::SMEM, opcode, "SMEM opcode is not implemented");
 	}
-	if (inst.opcode == Opcode::S_DCACHE_INV) {
-		return;
-	}
 
 	DecodeScalarDestination(sdst, pc, inst.dst);
 	if (inst.opcode == Opcode::S_MEMREALTIME) {
@@ -334,24 +317,8 @@ void DecodeMubuf(uint32_t pc, std::span<const uint32_t> code, uint32_t word_inde
 	if (inst.opcode == Opcode::UNSUPPORTED) {
 		SetUnsupported(inst, Family::MUBUF, opcode, "MUBUF opcode is not implemented");
 	}
-	if (inst.opcode == Opcode::BUFFER_GL0_INV || inst.opcode == Opcode::BUFFER_GL1_INV) {
-		return;
-	}
 
 	DecodeVectorGpr(vdata, inst.dst);
-	switch (inst.opcode) {
-		case Opcode::BUFFER_LOAD_UBYTE_D16:
-		case Opcode::BUFFER_LOAD_SBYTE_D16:
-		case Opcode::BUFFER_LOAD_SHORT_D16: inst.dst.sdwa_sel = 4u; break;
-		case Opcode::BUFFER_LOAD_UBYTE_D16_HI:
-		case Opcode::BUFFER_LOAD_SBYTE_D16_HI:
-		case Opcode::BUFFER_LOAD_SHORT_D16_HI:
-		case Opcode::BUFFER_LOAD_FORMAT_D16_HI_X:
-		case Opcode::BUFFER_STORE_SHORT_D16_HI:
-		case Opcode::BUFFER_STORE_FORMAT_D16_HI_X: inst.dst.sdwa_sel = 5u; break;
-		case Opcode::BUFFER_STORE_BYTE_D16_HI: inst.dst.sdwa_sel = 2u; break;
-		default: break;
-	}
 	DecodeVectorGpr(vaddr, inst.src0);
 	DecodeScalarSource(srsrc * 4u, pc, inst.src1);
 	DecodeScalarSource(soffset, pc, inst.src2);
@@ -432,10 +399,9 @@ void DecodeFlat(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index
 	}
 
 	DecodeVectorGpr(IsFlatStoreOpcode(inst.opcode) ? data : vdst, inst.dst);
-	if (inst.opcode == Opcode::FLAT_LOAD_SHORT_D16 ||
-	    inst.opcode == Opcode::FLAT_LOAD_SHORT_D16_HI) {
-		// D16 loads reuse partial destinations to preserve the untouched half.
-		inst.dst.sdwa_sel = inst.opcode == Opcode::FLAT_LOAD_SHORT_D16_HI ? 5u : 4u;
+	if (inst.opcode == Opcode::FLAT_LOAD_SHORT_D16) {
+		// D16 loads reuse partial destinations to preserve the untouched high half.
+		inst.dst.sdwa_sel = 4u;
 	}
 	DecodeVectorGpr(addr, inst.src0);
 	inst.src_count = 1;
@@ -482,15 +448,13 @@ void DecodeDs(uint32_t pc, std::span<const uint32_t> code, uint32_t word_index, 
 	if (inst.opcode == Opcode::DS_SWIZZLE_B32 && inst.offset >= 0xe000u) {
 		SetUnsupported(inst, Family::DS, opcode, "DS swizzle FFT mode is not implemented");
 	}
+	// Upstream bfd4c34b8: the stack capacity is the offset; data1 holds 8 children.
 	if (inst.opcode == Opcode::DS_BVH_STACK_PUSH8_POP1_RTN_B32 &&
 	    (inst.gds || inst.offset < 8u || inst.offset > 31u || data1 > 248u)) {
 		SetUnsupported(inst, Family::DS, opcode, "invalid BVH stack operands or capacity");
 	}
 	if (inst.opcode == Opcode::DS_BVH_STACK_PUSH8_POP1_RTN_B32 && vdst == addr) {
 		SetUnsupported(inst, Family::DS, opcode, "overlapping BVH stack outputs are not implemented");
-	}
-	if (inst.gds && inst.opcode == Opcode::DS_CMPST_RTN_B32) {
-		SetUnsupported(inst, Family::DS, opcode, "DS compare-store return B32 GDS variant is not implemented");
 	}
 	if (inst.gds &&
 	    (inst.opcode == Opcode::DS_SWIZZLE_B32 || inst.opcode == Opcode::DS_PERMUTE_B32 ||
